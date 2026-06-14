@@ -429,3 +429,440 @@ type IAuthorisation interface {
 | `server/common/types.go` | 32-41 | IAuthorisation 接口定义 |
 | `server/common/constants.go` | 72-78 | 密钥派生 |
 | `server/plugin/index.go` | 1-49 | 插件导入汇总 |
+
+---
+
+## 十一、鉴权失败的错误处理与日志审计
+
+### 11.1 错误类型体系
+
+所有鉴权相关的错误都实现了 `AppError` 接口（携带 message + HTTP 状态码），定义于 `server/common/error.go:15-31`：
+
+| 常量 | 状态码 | 含义 | 触发场景 |
+|------|--------|------|----------|
+| `ErrNotAuthorized` | 401 | 未授权 | Authorization 解密失败、Cookie 篡改 |
+| `ErrAuthenticationFailed` | 400 | 凭据校验失败 | 插件 Callback 返回失败 |
+| `ErrPermissionDenied` | 403 | 权限不足 | LoggedInOnly / AdminOnly 拦截 |
+| `ErrNotAllowed` | 403 | 操作被禁止 | SecureOrigin / 后端连接白名单不匹配 |
+| `ErrInvalidPassword` | 403 | 密码错误 | 管理员登录、共享密码校验 |
+| `ErrNotValid` | 405 | 参数非法 | Body 解析失败、IdP 配置错误 |
+| `ErrNotReachable` | 502 | 后端不可达 | LDAP/Wordpress/SFTP 等远端超时 |
+
+`SendErrorResult()` (`server/common/response.go:85-102`) 将错误包装为 `{status:"error", message:"..."}` JSON 响应，并根据 `err.Status()` 自动设置 HTTP 状态码。
+
+### 11.2 各失败节点的日志输出路径
+
+登录过程中每个关键失败点都有明确的日志埋点：
+
+#### 路径 A（直连登录）失败埋点
+
+```
+SessionAuthenticate (/server/ctrl/session.go:52)
+  ├─ model.NewBackend 失败
+  │   ├─ Log.Debug("[auth] action=authenticate::newBackend err=%s")
+  │   └─ Log.Stdout("AUDIT action[fail] backend[%s] user[%s] target[%s]") ← 审计日志
+  ├─ OAuthToken 失败
+  │   └─ Log.Debug("[auth] action=authenticate::oauthtoken err=%s")
+  ├─ OAuth 后 NewBackend 再次失败
+  │   ├─ Log.Debug("[auth] action=authenticate::oauth::newBackend err=%s")
+  │   └─ Log.Stdout("AUDIT action[fail] backend[%s] user[%s] target[%s]") ← 审计日志
+  └─ GetHome 失败
+      └─ Log.Debug("[auth] action=authenticate::getHome err=%s")
+```
+
+#### 路径 B（插件登录）失败埋点
+
+```
+SessionAuthMiddleware (/server/ctrl/session.go:220)
+  ├─ 插件未找到 / IdP 参数解析错误
+  │   └─ 302 重定向到 /?error=...&trace=...
+  ├─ plugin.EntryPoint 失败
+  │   └─ Log.Error("entrypoint - %s")
+  ├─ plugin.Callback 失败 (ErrAuthenticationFailed)
+  │   ├─ Log.Warning("failed authentication - %s")
+  │   └─ 303 重定向回登录页，通过 flash Cookie 回传错误
+  ├─ plugin.Callback 其他失败
+  │   └─ Log.Error("session::authMiddleware 'callback error - %s'")
+  ├─ 属性映射模板渲染失败
+  │   └─ Log.Warning("session::authMiddlware 'attribute mapping error' %s")
+  ├─ State 签名校验失败
+  │   └─ Log.Debug("callback signature is required, signature=%s")
+  ├─ Backend 连接失败
+  │   ├─ Log.Debug("session::authMiddleware 'backend connection failed %s'")
+  │   └─ Log.Info("[auth] status=failed user=%s backend=%s::%s ip=%s err=%s") ← 审计日志
+  └─ Session JSON 序列化失败
+      └─ Log.Debug("session::authMiddleware 'session marshal error %+v'")
+```
+
+#### 成功审计日志
+
+两条路径的成功场景都有审计输出：
+
+- **路径 A 成功**：`Log.Stdout("AUDIT action[login] backend[%s] user[%s] target[%s]")` (`ctrl/session.go:128`)
+- **路径 B 成功**：`Log.Info("[auth] status=success user=%s backend=%s::%s ip=%s")` (`ctrl/session.go:485`)
+- **登出**：`Log.Stdout("AUDIT action[logout] ...")` (`ctrl/session.go:179`)
+
+### 11.3 日志存储位置与级别
+
+**日志初始化**：`server/common/log.go:16-24`，写入文件 `state/log/access.log`（路径由 `FILESTASH_PATH` 根目录决定）。
+
+**日志级别控制**：通过 `log.level` 配置项切换，`Log.SetVisibility()` (`log.go:90-118`) 实现：
+
+| 级别 | DEBUG | INFO | WARN | ERROR |
+|------|-------|------|------|-------|
+| `DEBUG` | ✓ | ✓ | ✓ | ✓ |
+| `INFO` (默认) | ✗ | ✓ | ✓ | ✓ |
+| `WARNING` | ✗ | ✗ | ✓ | ✓ |
+| `ERROR` | ✗ | ✗ | ✗ | ✓ |
+
+**Telemetry 遥测**：`server/middleware/telemetry.go:39-93` 每个请求结束时异步调用 `logger()` 记录：
+- 当 `log.enable=true`：输出 `HTTP <status> <method> <duration>ms <path>` 格式的访问日志到 stdout + 文件
+- 当 `log.telemetry=true`：将结构化的 LogEntry（含 IP、UA、Backend、Session、Share 等字段）每 10 秒批量 POST 到 `https://downloads.filestash.app/event`
+
+### 11.4 审计插件扩展点
+
+`IAuditPlugin` 接口 (`server/common/types.go:65-71`) 提供审计查询能力：
+
+```go
+type IAuditPlugin interface {
+    Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error)
+}
+```
+
+- 注册方式：`Hooks.Register.AuditEngine(impl)` (`server/common/plugin.go:187-192`)
+- 管理台入口：`Admin → Audit` 页面通过 `FetchAuditHandler` (`server/ctrl/admin.go:138-158`) 调用
+- 默认实现：`SimpleAudit` (`server/model/audit.go:58-75`) 仅提示"需要安装审计插件"，无实际功能
+- AuditQueryResult 返回一个搜索表单（按日期/操作类型/路径/后端/用户/IP 等维度）+ 自定义渲染 HTML
+
+### 11.5 插件内失败的用户反馈机制
+
+认证插件通过两种机制把错误信息传递给用户：
+
+1. **flash Cookie**：设置一个 1 秒过期的 `flash` Cookie，登录页 HTML 中读取并渲染红色提示。例如 `admin` 插件 (`plg_authenticate_admin/index.go:75-80`)、`local` 插件 (`plg_authenticate_local/auth.go:186-192`)、`htpasswd` 插件 (`plg_authenticate_htpasswd/index.go:117-122`) 都使用此模式。
+2. **URL Query 参数**：路径 B 中较重的错误通过 302 重定向附带 `?error=<msg>&trace=<detail>` 返回，由前端页面解析展示。
+
+---
+
+## 十二、Session 持久化：Cookie 与服务端协同
+
+### 12.1 Session 的完整结构
+
+登录成功后加密写入 Cookie 的明文内容是一个 JSON 对象，典型字段：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `type` | 属性映射 | 后端驱动名 (s3 / sftp / local 等) |
+| `hostname` | 属性映射 | 远端主机地址 |
+| `port` | 属性映射 | 远端端口 |
+| `username` / `user` | 插件 Callback 返回 | 认证用户名 |
+| `password` | 插件 Callback 返回 | 明文密码 (⚠️ 加密后存储) |
+| `access_key_id` / `secret_access_key` | 属性映射 | S3 类凭据 |
+| `path` | 系统强制补齐 | chroot 根路径，始终以 `/` 结尾 |
+| `timestamp` | 登录时写入 | RFC3339 格式，用于判断过期 |
+| `role` | local 插件 | 用户角色 |
+| `bcrypt` | local 插件 | 密码哈希值 |
+| `session` | 扩展会话字段 | 当 `general.extended_session=true` 时，将插件 Callback 原始 JSON 整个序列化存入 |
+
+### 12.2 Cookie 写入流程（加密 → 分片 → 写入）
+
+`SessionAuthenticate` (`server/ctrl/session.go:90-124`) 中的完整链路：
+
+```
+session map[string]string
+  │
+  ├─ json.Marshal → 原始 JSON 字节
+  │
+  ├─ EncryptString(SECRET_KEY_DERIVATE_FOR_USER, string)
+  │   ├─ zlib 压缩                     ← 节省 Cookie 体积
+  │   ├─ AES-256-GCM 加密              ← NonceGenerator 生成 12 字节 nonce
+  │   └─ base64 URL 安全编码            ← 适合 Cookie 值
+  │   → obfuscate string
+  │
+  └─ 分片循环 (每片 3800 字节)
+      ├─ 第 0 片 → Cookie Name: "auth"
+      ├─ 第 1 片 → Cookie Name: "auth1"
+      ├─ 第 2 片 → Cookie Name: "auth2"
+      └─ ...
+         每条 Cookie 属性:
+         ├─ HttpOnly: true
+         ├─ SameSite: Strict (若 iframe 模式则为 None+Secure+Partitioned)
+         ├─ MaxAge: 60 * general.cookie_timeout (分钟)
+         └─ Path: /api/
+```
+
+**分片命名规则** (`server/common/utils.go:97-102`)：
+
+```go
+func CookieName(idx int) string {
+    if idx == 0 { return COOKIE_NAME_AUTH /* "auth" */ }
+    return COOKIE_NAME_AUTH + strconv.Itoa(idx) // "auth1", "auth2", ...
+}
+```
+
+### 12.3 Cookie 读取流程（4 种策略 → 拼接 → 解密）
+
+`_extractAuthorization()` (`server/middleware/session.go:160-188`) 按优先级尝试四种来源：
+
+| 优先级 | 策略 | 说明 |
+|--------|------|------|
+| 1 | Cookie 分片拼接 | 循环读取 `auth`, `auth0`, `auth1`, ... 直到不存在，Value 首尾相接 |
+| 2 | Authorization: Bearer | 截取 `Bearer ` 前缀之后的部分 |
+| 3 | Query: `?authorization=` | URL 查询参数 |
+| 4 | Basic Auth | 当用户名硬编码为 `"authorization"` 时，密码字段即 token |
+
+拿到 `ctx.Authorization` 字符串后，`_extractSession()` (`session.go:262-315`) 进行：
+
+1. **Base64 URL 解码** → 原始密文
+2. **AES-GCM 解密** (key=`SECRET_KEY_DERIVATE_FOR_USER`) → 压缩数据
+3. **zlib 解压** → JSON 明文
+4. **JSON 反序列化** → `ctx.Session map[string]string`
+5. **有效期校验**：`timestamp + 365 天 < 当前时间` → 返回 `ErrNotAuthorized`（过期 Cookie）
+
+### 12.4 Cookie Max-Age 与服务端硬过期的双层控制
+
+存在两层过期机制：
+
+| 层 | 实现 | 位置 | 过期时间 | 作用域 |
+|----|------|------|----------|--------|
+| 浏览器层 | Cookie `Max-Age` 属性 | `ctrl/session.go:115` | `general.cookie_timeout` 分钟（配置项） | 浏览器自动删除 Cookie |
+| 服务端层 | `timestamp` 字段硬校验 | `middleware/session.go:306-313` | 固定 365 天（24 * 365 小时） | 即使 Cookie 被篡改延长 Max-Age 也会被拒绝 |
+
+> 注意：两者是**或**的关系。先到先失效。`cookie_timeout` 控制用户多久需重新登录，而 365 天硬上限兜底防止长期泄露的 Cookie 被利用。
+
+### 12.5 服务端状态存储（SQLite）
+
+除了 Cookie（客户端状态），服务端还在 `state/db/share.sql` SQLite 数据库中维护以下与鉴权相关的表：
+
+#### Share 表（共享链接）
+
+```sql
+-- 由 model/index.go:24-25 创建
+CREATE TABLE IF NOT EXISTS Share(
+    id VARCHAR(64) PRIMARY KEY,
+    related_backend VARCHAR(16),
+    related_path VARCHAR(512),
+    params JSON,                     -- 密码哈希、用户邮箱、过期时间、权限位
+    auth VARCHAR(4093) NOT NULL,     -- 用 SECRET_KEY_DERIVATE_FOR_USER 加密的完整 session
+    FOREIGN KEY (related_backend, related_path) REFERENCES Location ...
+)
+```
+
+共享链接的 `auth` 字段其实就是一个持久化的 session，在 `_extractShare()` 中被解密后替代 Cookie 来源。
+
+#### Verification 表（邮箱验证码）
+
+```sql
+CREATE TABLE IF NOT EXISTS Verification(
+    key VARCHAR(512),                 -- "email::" + 用户邮箱
+    code VARCHAR(4),                  -- 4 位随机验证码
+    expire DATETIME DEFAULT datetime('now', '+10 minutes')
+)
+-- 自动清理: model/index.go:41-44, 每 6 小时执行一次 DELETE 过期记录
+```
+
+用于共享链接的"邮件证明"流程，`ShareProofVerifier` (`server/model/share.go:166-228`) 创建验证码、发送邮件并校验。
+
+#### Location 表（路径索引）
+
+```sql
+CREATE TABLE IF NOT EXISTS Location(
+    backend VARCHAR(16),
+    path VARCHAR(512),
+    PRIMARY KEY(backend, path)        -- 被 Share 表外键引用，用于级联清理
+)
+```
+
+### 12.6 登出时的资源释放
+
+`SessionLogout` (`server/ctrl/session.go:137-181`) 的完整清理流程：
+
+```
+DELETE /api/session
+  │
+  ├─ [goroutine 异步] 关闭后端连接 (释放 SFTP/SMB 等长连接)
+  │   └─ if backend has Close() method → obj.Close()
+  │
+  ├─ 循环删除分片 Cookie: auth, auth1, auth2, ... (MaxAge=-1)
+  ├─ 删除 Cookie: admin (MaxAge=-1)
+  ├─ 删除 Cookie: proof (共享链接证明 Cookie, MaxAge=-1)
+  │
+  └─ 审计日志: AUDIT action[logout] ...
+```
+
+登出返回 200 成功响应是**同步**的，而后端连接 Close 是**异步 goroutine** 执行（`ctrl/session.go:138-152`）——原因是某些后端连接建立后需要再次鉴权才能 Close，可能耗时数秒，阻塞将导致登出体验差。
+
+---
+
+## 十三、多因素认证 (MFA/OTP) 的扩展点
+
+### 13.1 现有实现：local 插件的 TOTP
+
+`plg_authenticate_local` 是唯一内置 MFA 的认证插件。完整流程 (`server/plugin/plg_authenticate_local/auth.go`)：
+
+```
+用户访问 /api/session/auth/?action=redirect
+  │
+  ├─ EntryPoint()
+  │   ├─ 检查 Cookie: mfa 是否已设？
+  │   │   ├─ 有 → 渲染 TOTP 输入页
+  │   │   │   ├─ 首次绑定用户：生成 TOTP Key → QR 码 PNG (200x200)
+  │   │   │   └─ 老用户：仅显示验证码输入框
+  │   │   └─ 无 → 渲染邮箱+密码登录页
+  │   └─ 页面包含 <input type="hidden" name="session" value="加密的用户凭据">
+  │
+  ▼  用户提交密码 (POST)
+  │
+  ├─ Callback() — 第一阶段：密码校验
+  │   ├─ bcrypt 比对密码哈希
+  │   ├─ 检查 Disabled 标记
+  │   │
+  │   ├─ 若 IdP 配置 idpParams["mfa"] == "TOTP"
+  │   │   ├─ 用户未绑定 MFA (users[i].MFA == "")
+  │   │   │   └─ 暂存 formData["mfa"] 明文密钥 + formData["code"]
+  │   │   └─ totp.Validate(requestedUser.Code, users[i].MFA)
+  │   │       ├─ 成功 → 继续
+  │   │       └─ 失败 → 设置 Cookie: mfa=<加密的User对象>
+  │   │                 返回 ErrAuthenticationFailed
+  │   │                 (EntryPoint 将从 mfa Cookie 还原用户状态并再次展示验证码)
+  │   │
+  │   └─ 首次绑定成功则 saveUsers() 持久化 MFA 密钥
+  │
+  └─ 返回 session: {user, password, bcrypt, role}
+```
+
+**关键设计 —— 两阶段 MFA 的状态传递**：
+- 密码校验通过但 MFA 未通过时，不直接丢弃状态，而是把 `{Email, Password}` 加密后写入 `mfa` Cookie（1 秒有效期）
+- 下次 EntryPoint 渲染时读取 `mfa` Cookie，用 `withMFA()` 解密还原出用户名，用户只需输入动态码，无需重输密码
+- `User.EncryptedString()` (`auth.go:257-267`) 负责序列化 → 用 `SECRET_KEY_DERIVATE_FOR_USER` 加密
+
+### 13.2 MFA 配置在鉴权链中的位置
+
+MFA 开关不在全局配置中，而是作为 **IdP 参数** 存在：
+
+```json
+// middleware.identity_provider.params 配置
+{
+  "type": "local",
+  "mfa": "TOTP",           // 空串 = 禁用；"TOTP" = 启用
+  "notification_subject": "...",
+  "notification_body": "...",
+  "db": "JSON序列化的用户列表，含 MFA 字段"
+}
+```
+
+用户的 MFA 密钥存储在 `local` 插件的内部数据结构中，每个 `User` 有 `MFA string` 字段（存储 TOTP Secret 的明文），被序列化后加密存入 `middleware.identity_provider.params.db`。
+
+### 13.3 通用 MFA 扩展方案
+
+其他认证插件要接入 MFA，可参考 local 插件的**三要素模式**：
+
+| 要素 | 实现位置 | 作用 |
+|------|----------|------|
+| **配置开关** | `Setup() Form` 返回的配置表单中加入 select/checkbox | 管理员在后台选择 MFA 策略 |
+| **状态暂存** | `Callback` 中校验第一因素失败时 → 写 Cookie 加密暂存 | 用户不用重输密码 |
+| **多轮验证** | `EntryPoint` 根据 Cookie 判断当前处于哪个阶段 → 渲染对应页面 | 支持 2 轮以上的多因素流程 |
+| **密钥持久化** | 利用插件自身配置结构或外部存储 | 存放用户级 MFA Secret |
+
+通用的两因素实现模板：
+
+```go
+// EntryPoint 分支判断
+func (this MyAuth) EntryPoint(idpParams, req, res) error {
+    // 阶段 2: 从暂存 Cookie 恢复上下文，展示第二因素输入
+    if stage2Cookie, err := req.Cookie("mfa_stage2"); err == nil {
+        ctx := decryptStage2(stage2Cookie.Value)
+        renderMFAPage(res, ctx)
+        return nil
+    }
+    // 阶段 1: 展示用户名密码
+    renderLoginPage(res)
+    return nil
+}
+
+// Callback 分支判断
+func (this MyAuth) Callback(formData, idpParams, res) (map[string]string, error) {
+    // 第一因素验证
+    if !verifyPrimary(formData) {
+        return nil, ErrAuthenticationFailed
+    }
+    // 若需 MFA 且尚未通过第二阶段
+    if idpParams["mfa"] != "" && !verifyMFA(formData) {
+        setEncryptedCookie(res, "mfa_stage2", formData["user"]) // 暂存
+        return nil, ErrAuthenticationFailed                    // 触发重新 EntryPoint
+    }
+    return userAttrs, nil
+}
+```
+
+### 13.4 共享链接的 MFA 替代方案：Email 验证码
+
+虽然共享链接本身不走 `IAuthentication` 插件链，但其证明机制 (`ShareProof`) 实现了另一种 MFA —— 邮箱验证码流程 (`server/model/share.go:150-260`)：
+
+```
+用户访问共享链接，要求提供邮箱证明
+  │
+  ├─ ShareProofVerifier(proof.Key="email")
+  │   ├─ 校验邮箱在白名单内
+  │   ├─ 生成 4 位随机验证码 → 写入 Verification 表 (10 分钟过期)
+  │   ├─ 通过邮件配置 SMTP 发送 HTML 邮件
+  │   └─ 返回 proof.Key="code" 提示前端展示输入框
+  │
+  ▼  用户提交 4 位验证码
+  │
+  ├─ ShareProofVerifier(proof.Key="code")
+  │   ├─ 查询 Verification 表 WHERE code=? AND expire > now
+  │   ├─ 匹配成功 → DELETE 该验证码（一次性使用）
+  │   └─ 还原为 proof.Key="email", proof.Value=用户邮箱
+  │
+  └─ 将已验证的 Proof 加密写入 proof Cookie
+```
+
+邮件 SMTP 配置项：`email.server / email.port / email.username / email.password / email.from`。
+
+### 13.5 State 签名与 MFA/SSO 的防篡改
+
+OAuth/OIDC 等外部 IdP 回调的 `state` 参数（包含 label、next 跳转地址、签名属性）在 `SessionAuthMiddleware` 中进行了防篡改校验：
+
+```go
+// server/ctrl/session.go:368-391
+for k, v := range stateStruct {
+    if k == "signature" {
+        signature = v
+    }
+    if slices.Contains(fields, k) { // features.protection.signature 配置列出的字段
+        attributes += fmt.Sprintf("%s[%s] ", k, v)
+    }
+}
+// attributes 字符串用 SECRET_KEY_DERIVATE_FOR_SIGNATURE 加密后必须等于 signature
+v, err := DecryptString(SECRET_KEY_DERIVATE_FOR_SIGNATURE, signature)
+if err != nil || attributes != v {
+    // 302 重定向回首页，提示 Invalid Signature
+}
+```
+
+该机制确保：即使用户拦截了回调请求并修改 state 中的敏感字段（如 `next` 跳转地址或 `nav` 路径），签名校验也会拒绝请求。
+
+---
+
+## 十四、补充代码索引
+
+| 文件 | 行号 | 职责 |
+|------|------|------|
+| `server/common/error.go` | 8-94 | 错误体系 (AppError) 与预定义错误常量 |
+| `server/common/response.go` | 85-102 | 错误响应序列化 `SendErrorResult` |
+| `server/common/log.go` | 11-121 | 日志实现 (文件写入 + 级别控制) |
+| `server/middleware/telemetry.go` | 13-133 | 访问日志 + 遥测数据收集与上报 |
+| `server/ctrl/admin.go` | 138-158 | 审计插件查询入口 |
+| `server/model/audit.go` | 1-75 | 默认审计引擎 (空实现) |
+| `server/common/crypto.go` | 27-53 | `EncryptString` / `DecryptString` (zlib + AES-GCM + base64) |
+| `server/common/crypto.go` | 128-164 | AES-256-GCM 加解密底层实现 |
+| `server/common/crypto.go` | 240-266 | `NonceGenerator` — 计数器型 nonce |
+| `server/common/utils.go` | 97-102 | Cookie 分片命名函数 |
+| `server/common/recovery.go` | 7-21 | 坏 Cookie 恢复机制 (RecoverFromBadCookie) |
+| `server/model/files.go` | 9-51 | `NewBackend` — 白名单校验 + 驱动初始化 |
+| `server/model/index.go` | 12-44 | SQLite 表结构 (Share / Verification / Location) |
+| `server/model/share.go` | 150-260 | 共享链接 Proof 验证（邮箱验证码） |
+| `server/model/share.go` | 291-354 | Proof Cookie 读取与对比 |
+| `server/plugin/plg_authenticate_local/auth.go` | 83-238 | local 插件 MFA 完整流程 (EntryPoint + Callback) |
+| `server/plugin/plg_authenticate_local/auth.go` | 240-267 | `withMFA` / `EncryptedString` — MFA 暂存加解密 |
+| `server/ctrl/session.go` | 361-391 | SSO State 签名校验 |
