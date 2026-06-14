@@ -1359,7 +1359,658 @@ ChrootCache.OnEvict(func(key string, value interface{}) {
 - 跨后端传输需要前端分别调用 `Cat` 下载 + `Save` 上传
 - 因此不会出现跨后端文件名冲突问题
 
-## 12. 完整调用链示例
+## 12. 插件操作的审计日志与权限链路
+
+### 12.1 三层权限检查链路
+
+每个文件操作经过**三层**权限检查，层层递进：
+
+```
+HTTP 请求
+    ↓
+Layer 1: 粗粒度权限 (CanRead / CanEdit / CanUpload / CanShare)
+    ↓ 基于 Share 链接属性或默认 true
+Layer 2: 授权中间件链 (AuthorisationMiddleware)
+    ↓ 按注册顺序逐个调用 auth.Ls()/auth.Cat()/...
+    ↓ 任意一个返回 error 即拒绝
+Layer 3: 后端级 ACL (IBackend 内部实现)
+    ↓
+实际执行操作
+```
+
+#### Layer 1：粗粒度权限
+
+定义于 [server/model/permissions.go:7-33](server/model/permissions.go#L7-L33)：
+
+```go
+func CanRead(ctx *App) bool {
+    if ctx.Share.Id != "" {
+        return ctx.Share.CanRead  // 共享链接有显式权限则遵循
+    }
+    return true  // 已登录用户默认可读
+}
+
+func CanEdit(ctx *App) bool {
+    if ctx.Share.Id != "" {
+        return ctx.Share.CanWrite
+    }
+    return true
+}
+```
+
+**调用时机**：在控制器最开始检查，如 [server/ctrl/files.go:80](server/ctrl/files.go#L80)：
+```go
+func FileLs(ctx *App, res http.ResponseWriter, req *http.Request) {
+    if model.CanRead(ctx) == false {
+        SendErrorResult(res, ErrPermissionDenied)
+        return
+    }
+    // ...
+}
+```
+
+#### Layer 2：授权中间件链
+
+`IAuthorisation` 接口支持按方法级细粒度控制，定义于 [server/common/types.go:36-45](server/common/types.go#L36-L45)：
+
+```go
+type IAuthorisation interface {
+    Ls(ctx *App, path string) error
+    Cat(ctx *App, path string) error
+    Mkdir(ctx *App, path string) error
+    Rm(ctx *App, path string) error
+    Mv(ctx *App, from string, to string) error
+    Save(ctx *App, path string) error
+    Touch(ctx *App, path string) error
+}
+```
+
+**调用链**（以 `FileLs` 为例，[server/ctrl/files.go:99-103](server/ctrl/files.go#L99-L103)）：
+```go
+for _, auth := range Hooks.Get.AuthorisationMiddleware() {
+    if err = auth.Ls(ctx, path); err != nil {
+        SendErrorResult(res, err)
+        return
+    }
+}
+```
+
+**注册顺序 = 执行顺序**：
+- 插件通过 `Hooks.Register.AuthorisationMiddleware(impl)` 注册
+- 按 `init()` 执行顺序（即 `server/plugin/index.go` 中的 import 顺序）添加到 slice
+- 执行时按 slice 顺序遍历，**短路语义**：第一个返回 error 的中间件终止整条链
+
+**示例：plg_authorisation_example**（[server/plugin/plg_authorisation_example/index.go:13-45](server/plugin/plg_authorisation_example/index.go#L13-L45)）：
+```go
+func (this AuthM) Ls(ctx *App, path string) error {
+    Log.Stdout("LS %+v", ctx.Session)  // 审计日志
+    return nil                          // 放行
+}
+func (this AuthM) Mkdir(ctx *App, path string) error {
+    Log.Stdout("MKDIR %+v", ctx.Session)
+    return ErrNotAllowed  // 拒绝所有 Mkdir 操作
+}
+```
+
+#### Layer 3：后端级 ACL
+
+部分后端（如 NFS4、S3）在 `Init()` 或操作内部进行额外的 ACL 检查：
+- NFS4：支持 `ACL4_SUPPORT_AUDIT_ACL` 和 `ACE4_SYSTEM_AUDIT_ACE_TYPE` 系统级审计
+- S3：IAM 权限由 AWS SDK 在 API 调用时检查，失败以 error 形式返回
+- Local：依赖操作系统文件权限
+
+### 12.2 审计日志的三类埋点
+
+Filestash 有三类审计日志输出，覆盖不同场景：
+
+#### 1) 认证/登出审计日志
+
+在 `SessionAuthenticate` 和 `SessionLogout` 中通过 `Log.Stdout` 输出，定义于 [server/ctrl/session.go:60-179](server/ctrl/session.go#L60-L179)：
+
+```go
+// 认证失败
+Log.Stdout("AUDIT action[fail] backend[%s] user[%s] target[%s]", 
+    session["type"], backendID(session), ip(req))
+
+// 认证成功
+Log.Stdout("AUDIT action[login] backend[%s] user[%s] target[%s]", 
+    session["type"], username(session), ip(req))
+
+// 登出
+Log.Stdout("AUDIT action[logout] backend[%s] user[%s] target[%s]", 
+    ctx.Session["type"], username(ctx.Session), ip(req))
+```
+
+#### 2) 授权中间件审计
+
+授权中间件可以自行输出审计日志，如 `plg_authorisation_example`：
+```go
+func (this AuthM) Ls(ctx *App, path string) error {
+    Log.Stdout("LS %+v", ctx.Session)
+    return nil
+}
+```
+
+#### 3) 可插拔审计引擎
+
+通过 `IAuditPlugin` 接口支持完整审计查询，定义于 [server/common/types.go:65-67](server/common/types.go#L65-L67)：
+
+```go
+type IAuditPlugin interface {
+    Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error)
+}
+```
+
+**默认实现 `SimpleAudit`**（[server/model/audit.go:58-75](server/model/audit.go#L58-L75)）：
+```go
+type SimpleAudit struct{}
+
+func (this SimpleAudit) Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error) {
+    return AuditQueryResult{
+        Form: &AuditForm,
+        RenderHTML: `<div id="alert-audit-missing">
+            You need to install an audit plugin to use this
+        </div>`,
+    }, nil
+}
+```
+
+**审计查询表单字段**（[server/model/audit.go:11-56](server/model/audit.go#L11-L56)）：
+- `date from` / `date to`：时间范围过滤
+- `action`：操作类型（rename、list、download、create_folder、remove、move、save_file、create_file）
+- `path`：文件路径
+- `backend`：后端类型
+- `session`：会话 ID
+- `share`：共享链接 ID
+- `user`：用户名
+- `target`：操作目标
+
+**查询端点**（[server/routes.go:48](server/routes.go#L48)）：
+```go
+admin.HandleFunc("/audit", NewMiddlewareChain(FetchAuditHandler, middlewares)).Methods("GET")
+```
+
+### 12.3 AUDIT Context 标记与旁路
+
+`ctx.Context` 中的 `AUDIT` key 用于标记某些操作是否需要审计：
+
+```go
+// 禁用审计（如内部递归调用）
+ctx.Context = context.WithValue(ctx.Context, "AUDIT", false)
+
+// 恢复审计
+ctx.Context = context.WithValue(ctx.Context, "AUDIT", nil)
+```
+
+**使用场景**（[server/ctrl/files.go:105-125](server/ctrl/files.go#L105-L125)）：
+```go
+// 读取父目录元数据时禁用审计，避免产生大量 noise
+ctx.Context = context.WithValue(ctx.Context, "AUDIT", false)
+parent, err := ctx.Backend.Stat(abspath)
+ctx.Context = context.WithValue(ctx.Context, "AUDIT", nil)
+```
+
+**检查点**：
+- 搜索爬虫（`plg_search_sqlitefts`）：索引文件时跳过审计
+- Workflow 触发器（`pkg/workflow/trigger/fileaction.go`）：自动化操作跳过审计
+
+### 12.4 权限链路的短路语义
+
+| 层级 | 失败行为 | 错误返回 |
+|------|---------|---------|
+| CanRead/CanEdit | 立即终止 | `ErrPermissionDenied` (403) |
+| AuthorisationMiddleware | 按顺序，第一个失败即终止 | 中间件返回的 error（可自定义） |
+| 后端 ACL | 操作失败返回 error | 后端 SDK 或系统返回的 error |
+
+**示例：FileCat 完整权限检查**（[server/ctrl/files.go:208-225](server/ctrl/files.go#L208-L225)）：
+```go
+func FileCat(ctx *App, res http.ResponseWriter, req *http.Request) {
+    // Layer 1: 粗粒度
+    if model.CanRead(ctx) == false {
+        SendErrorResult(res, ErrPermissionDenied)
+        return
+    }
+    // ... 路径处理 ...
+    
+    // Layer 2: 授权中间件链
+    for _, auth := range Hooks.Get.AuthorisationMiddleware() {
+        if err = auth.Cat(ctx, path); err != nil {
+            SendErrorResult(res, err)
+            return
+        }
+    }
+    
+    // Layer 3: 后端实际操作（可能触发后端 ACL）
+    file, err = ctx.Backend.Cat(path)
+}
+```
+
+## 13. 插件间的级联依赖问题处理
+
+### 13.1 插件初始化的两个阶段
+
+Filestash 的插件初始化分为**两个独立阶段**，解决不同类型的依赖：
+
+```
+编译/启动阶段 1: init() 函数执行
+    顺序 = server/plugin/index.go 中的 import 顺序
+    职责：接口注册（Backend.Register、Hooks.Register.Xxx）
+    禁止：网络调用、文件 IO、依赖其他插件的初始化结果
+    
+启动阶段 2: Onload 回调执行（main.go:34-36）
+    顺序 = Hooks.Register.Onload() 的注册顺序
+    职责：数据库初始化、表创建、配置加载
+    可以：访问其他插件的注册结果
+```
+
+### 13.2 阶段 1：init() 的顺序依赖
+
+所有存储后端和大多数插件通过 `init()` 注册，执行顺序由 **Go import 顺序**决定。
+
+`server/plugin/index.go` 中的 import 顺序即执行顺序（[server/plugin/index.go:3-46](server/plugin/index.go#L3-L46)）：
+
+```go
+import (
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_backend_local"   // 1
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_backend_s3"      // 2
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_backend_sftp"    // 3
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_backend_ftp"     // 4
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_backend_dav"     // 5
+    // ...
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_search_sqlitefts" // 较后
+    _ "github.com/mickael-kerjean/filestash/server/plugin/plg_authorisation_example" // 最后
+)
+```
+
+**依赖保障**：
+- **存储后端插件之间无依赖**：每个后端独立注册到 `Driver.ds` map，互不影响
+- **功能插件可以依赖后端接口**：在 `init()` 中只能注册，不能调用后端 `Init()`
+- **基础插件排在前**：后端、认证、授权排在 import 列表前面
+- **扩展插件排在后**：搜索、缩略图、工作流等排在后面
+
+**循环依赖风险**：
+- 由于 `init()` 只能做注册，不能互相调用，因此**不存在循环依赖问题**
+- 如果 A 和 B 互相需要对方在 `init()` 中注册，Go 的 import 机制会先完成所有 import 再执行 init()，因此注册是全局可见的
+
+### 13.3 阶段 2：Onload 回调与顺序控制
+
+`Onload` 回调在所有 `init()` 完成后、HTTP 服务启动前执行，定义于 [cmd/main.go:34-36](cmd/main.go#L34-L36)：
+
+```go
+// main.go 启动流程
+check(extension.Discovery(), "Plugin Discovery failed")  // 先发现外部插件
+check(workflow.Init(), "Workflow init failed")           // 工作流初始化
+for _, fn := range Hooks.Get.Onload() {                  // 执行所有 Onload 回调
+    fn()
+}
+for _, obj := range Hooks.Get.HttpEndpoint() {           // 注册 HTTP 端点
+    obj(router)
+}
+Hooks.Get.Starter()(withSignal(), router)                // 启动 HTTP 服务
+```
+
+**Onload 注册机制**（[server/common/plugin.go:268-275](server/common/plugin.go#L268-L275)）：
+```go
+var afterload []func()
+
+func (this Register) Onload(fn func()) {
+    afterload = append(afterload, fn)  // 按调用顺序 append
+}
+
+func (this Get) Onload() []func() {
+    return afterload  // 返回整个 slice 顺序执行
+}
+```
+
+**典型 Onload 用例**：
+
+1. **数据库表初始化**（[server/plugin/plg_widget_recent/db.go:13](server/plugin/plg_widget_recent/db.go#L13)）：
+```go
+Hooks.Register.Onload(func() {
+    db := GetDB()
+    db.Exec(`CREATE TABLE IF NOT EXISTS "recent" (
+        "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+        "path" TEXT, "user_id" TEXT, "created_at" DATETIME
+    )`)
+})
+```
+
+2. **配置校验**（[server/plugin/plg_starter_http2/index.go:34](server/plugin/plg_starter_http2/index.go#L34)）：
+```go
+Hooks.Register.Onload(func() {
+    if Config.Get("general.force_ssl").Bool() {
+        // 检查证书配置
+    }
+})
+```
+
+3. **依赖其他插件**（[server/plugin/plg_search_sqlitefts/index.go:13](server/plugin/plg_search_sqlitefts/index.go#L13)）：
+```go
+Hooks.Register.Onload(register)  // 确保 SearchEngine 注册完成后再启动爬虫
+
+func register() {
+    // 此时可以安全调用 Hooks.Get.SearchEngine()
+    daemon := &CrawlerDaemon{}
+    Hooks.Register.AuthorisationMiddleware(crawler.FileHook{Daemon: daemon})
+    daemon.Start()
+}
+```
+
+### 13.4 特殊依赖场景的处理
+
+#### Starter 插件：强制依赖检查
+
+Starter（HTTP 服务器）是唯一有强制依赖检查的插件，定义于 [cmd/main.go:31-33](cmd/main.go#L31-L33)：
+
+```go
+if Hooks.Get.Starter() == nil {
+    check(ErrNotFound, "Missing starter plugin. err=%s")  // 直接退出程序
+}
+```
+
+如果没有任何插件调用 `Hooks.Register.Starter(fn)`，程序无法启动。
+
+#### Workflow 排序：Order 字段
+
+Workflow Trigger 和 Action 支持显式 `Order` 字段控制执行顺序，定义于 [server/common/plugin.go:341-343](server/common/plugin.go#L341-L343)：
+
+```go
+func (this Register) WorkflowTrigger(t ITrigger) {
+    workflow_triggers = append(workflow_triggers, t)
+    sort.Slice(workflow_triggers, func(i, j int) bool {
+        return workflow_triggers[i].Manifest().Order < workflow_triggers[j].Manifest().Order
+    })
+}
+```
+
+插件在 `Manifest()` 中返回 Order 整数：
+```go
+func (this FileActionTrigger) Manifest() Manifest {
+    return Manifest{
+        Order: 10,  // 数字越小越先执行
+        ID:    "file_action",
+    }
+}
+```
+
+#### 目录服务：单例覆盖
+
+`DirectoryService` 采用**后注册覆盖先注册**策略，定义于 [server/common/plugin.go:363-369](server/common/plugin.go#L363-L369)：
+
+```go
+var directory IDirectoryService
+
+func (this Register) DirectoryService(d IDirectoryService) {
+    directory = d  // 直接赋值，后注册覆盖先注册
+}
+```
+
+如果有多个 LDAP/AD 插件，最后 import 的生效。
+
+### 13.5 级联失败的处理策略
+
+| 依赖类型 | 失败处理 | 影响范围 |
+|---------|---------|---------|
+| **存储后端 init() panic** | Go 运行时直接崩溃 | 程序无法启动 |
+| **存储后端 init() 正常注册** | 无失败（仅 map 赋值） | 无影响 |
+| **外部 Wasm 插件加载失败** | 记录日志 + `continue` | 仅该插件不可用 |
+| **Onload 回调 panic** | Go 运行时崩溃 | 程序无法启动 |
+| **Onload 回调返回 error** | 无（Onload 无返回值，需自行捕获） | 取决于具体逻辑 |
+| **缺失 Starter 插件** | 显式 `check(ErrNotFound)` | 程序无法启动 |
+| **Workflow Init 失败** | `check(err)` 退出 | 程序无法启动 |
+
+**最佳实践**：
+- `init()` 中只做 `Hooks.Register.Xxx()` 等无副作用操作
+- 可能失败的操作（网络、文件 IO）放在 `Onload` 中，自行捕获 panic
+- 依赖顺序通过 `import` 顺序和 `Order` 字段显式控制
+- 避免在 `init()` 中创建 goroutine 或打开资源
+
+## 14. 插件运行时的性能监控与慢请求追踪
+
+### 14.1 HTTP 层性能监控
+
+`telemetry` 中间件在每个 HTTP 请求结束时记录性能指标，定义于 [server/middleware/telemetry.go:15-106](server/middleware/telemetry.go#L15-L106)：
+
+**日志条目结构**：
+```go
+type LogEntry struct {
+    Host       string  `json:"host"`
+    Method     string  `json:"method"`
+    RequestURI string  `json:"pathname"`
+    Status     int     `json:"status"`
+    Duration   float64 `json:"responseTime"`  // 毫秒
+    Backend    string  `json:"backend"`       // s3, sftp, local...
+    Share      string  `json:"share"`         // 共享链接 ID
+    Session    string  `json:"session"`       // 会话哈希
+    RequestID  string  `json:"requestID"`     // X-Request-ID
+    Ip         string  `json:"ip"`
+    UserAgent  string  `json:"userAgent"`
+    Version    string  `json:"version"`       // 应用版本
+}
+```
+
+**输出控制**（[server/middleware/telemetry.go:82-91](server/middleware/telemetry.go#L82-L91)）：
+```go
+if Config.Get("log.telemetry").Bool() {
+    telemetry.Record(point)  // 保存到内存，定期批量上报
+}
+if Config.Get("log.enable").Bool() {
+    tid := ""
+    if point.RequestID != "" && Config.Get("log.level").String() == "DEBUG" {
+        tid = "trace=" + point.RequestID  // DEBUG 级别输出 trace ID
+    }
+    Log.Stdout("HTTP %3d %3s %6.1fms %s %s", 
+        point.Status, point.Method, point.Duration, limit(point.RequestURI, 200), tid)
+}
+```
+
+**批量遥测上报**（[server/middleware/telemetry.go:108-132](server/middleware/telemetry.go#L108-L132)）：
+```go
+func (this *Telemetry) Flush() {
+    // 批量 POST 到 https://downloads.filestash.app/event
+    // 用于统计使用情况，可通过 log.telemetry = false 关闭
+}
+```
+
+### 14.2 OpenTracing 兼容的分布式追踪
+
+Filestash 实现了轻量级 OpenTracing 兼容的追踪框架，核心在 `server/pkg/tracer/`。
+
+#### 追踪核心接口
+
+定义于 [server/pkg/tracer/types.go:1-20](server/pkg/tracer/types.go#L1-L20)：
+
+```go
+type ITracer = func(TraceContext, string, SpanOptions) ISpan
+
+type ISpan interface {
+    SetError(error)    // 标记错误
+    Close()            // 结束 span
+    TraceContext() TraceContext
+}
+
+type SpanOptions struct {
+    Kind       string            // "SERVER" / "CLIENT"
+    Service    string            // "sftp", "s3", "http"
+    Attributes map[string]string // 自定义标签
+}
+```
+
+**注册机制**（[server/common/plugin.go:198-199](server/common/plugin.go#L198-L199)）：
+```go
+func (this Register) Tracer(t ITracer) {
+    tracer.Register(t)
+}
+```
+
+默认实现是 `Nop()` 空操作，不产生任何开销：
+```go
+func StartSpan(parent TraceContext, name string, opts SpanOptions) ISpan {
+    if tracer == nil {
+        return Nop()  // 无插件注册时，零开销
+    }
+    return tracer(parent, name, opts)
+}
+```
+
+#### SFTP 后端的追踪埋点
+
+SFTP 后端通过装饰器模式完整追踪每个协议操作，定义于 [server/plugin/plg_backend_sftp/tracing.go:13-124](server/plugin/plg_backend_sftp/tracing.go#L13-L124)：
+
+```go
+type tracedClient struct {
+    *sftp.Client
+    app      *App
+    hostname string
+    username string
+}
+
+func (t *tracedClient) ReadDir(path string) ([]os.FileInfo, error) {
+    span := NewSpan(t.app, "ReadDir", connAttrs(t, map[string]string{
+        "sftp.path":   path,
+        "sftp.packet": "SSH_FXP_READDIR",
+    }))
+    defer span.Close()
+    
+    files, err := t.Client.ReadDir(path)  // 实际调用
+    span.SetError(err)                    // 标记错误
+    return files, err
+}
+```
+
+**文件级追踪**（[server/plugin/plg_backend_sftp/tracing.go:48-62](server/plugin/plg_backend_sftp/tracing.go#L48-L62)）：
+```go
+type tracedFile struct {
+    *sftp.File
+    client *tracedClient
+    path   string
+    span   tracer.ISpan  // 整个文件生命周期的 span
+}
+
+func (t *tracedFile) Close() error {
+    t.span.Close()  // 结束文件读写 span
+    // 额外创建 Close 操作 span
+    closeSpan := NewSpan(t.client.app, "Close", ...)
+    err := t.File.Close()
+    closeSpan.SetError(err)
+    closeSpan.Close()
+    return err
+}
+```
+
+**追踪上下文传递**：
+```go
+func NewSpan(app *App, name string, attrs map[string]string) tracer.ISpan {
+    // 从 HTTP 请求 context 中提取 TraceContext
+    return tracer.StartSpan(tracer.TraceFromContext(app.Context), name, ...)
+}
+```
+
+#### S3 后端的追踪埋点
+
+S3 通过 HTTP `RoundTripper` 拦截器实现追踪，定义于 [server/plugin/plg_backend_s3/utils.go:8-45](server/plugin/plg_backend_s3/utils.go#L8-L45)：
+
+```go
+type S3Transport struct {
+    Transport http.RoundTripper
+}
+
+func (t S3Transport) RoundTrip(r *http.Request) (*http.Response, error) {
+    var span tracer.ISpan
+    if r.Context() != nil {
+        opts := tracer.SpanOptions{
+            Kind:    tracer.KindClient,
+            Service: "s3",
+            Attributes: map[string]string{
+                "s3.operation": r.Operation.Name,  // ListObjects, PutObject...
+                "s3.bucket":    r.URL.Host,
+                "s3.key":       r.URL.Path,
+            },
+        }
+        span = tracer.StartSpan(tracer.TraceFromContext(r.Context()), 
+            r.Operation.Name, opts)
+    }
+    
+    resp, err := t.Transport.RoundTrip(r)
+    if span != nil {
+        span.SetError(err)
+        span.Close()
+    }
+    return resp, err
+}
+```
+
+#### HTTP 客户端统一追踪
+
+所有后端共享的 `HTTPClient` 自动集成追踪，定义于 [server/common/default.go:57-59](server/common/default.go#L57-L59)：
+
+```go
+return &http.Client{
+    Transport: tracer.NewTransport(cfg.traceService, 
+        NewTransformedTransport(cfg.transport)),
+    Timeout: 5 * time.Hour,
+}
+```
+
+`tracer.NewTransport` 为所有 HTTP 请求自动创建 span。
+
+### 14.3 慢请求识别与排查
+
+#### 超时配置分层
+
+| 层级 | 超时设置 | 作用 |
+|------|---------|------|
+| **TCP 连接** | 10s | [server/common/default.go:45](server/common/default.go#L45) |
+| **TLS 握手** | 5s | [server/common/default.go:48](server/common/default.go#L48) |
+| **响应头** | 60s | [server/common/default.go:50](server/common/default.go#L50) |
+| **空闲连接** | 60s | [server/common/default.go:49](server/common/default.go#L49) |
+| **总请求** | 5 小时 | [server/common/default.go:58](server/common/default.go#L58) |
+| **SFTP 操作** | 依赖 TCP 超时 | 无应用层超时，通过 context 取消 |
+
+#### 慢请求排查路径
+
+当用户报告慢操作时，按以下路径排查：
+
+```
+1. 检查 HTTP 日志 → 找到 Duration > 阈值的请求
+   grep "HTTP.* [0-9]{4,}\.ms" app.log
+   
+2. 启用 DEBUG 日志 → 获取 X-Request-ID
+   log.level = DEBUG
+   
+3. 启用 Tracer 插件 → 查看分布式追踪详情
+   - 注册 tracer 到 Jaeger/Zipkin
+   - 分析各子 span 耗时（ReadDir vs Open vs Read 等）
+   
+4. 后端特定排查：
+   SFTP: 查看各 SSH_FXP_* 操作耗时
+   S3:   查看 S3 API 调用耗时 + 重试次数
+   FTP:  查看连接建立 + 数据通道耗时
+```
+
+#### 上下文取消机制
+
+每个请求的 `ctx.Context` 会在连接断开时自动取消，所有阻塞操作应该监听 `Done()`：
+
+```go
+// SFTP 缓存引用计数示例
+go func() {
+    <-app.Context.Done()  // 客户端断开或超时
+    d.wg.Done()            // 释放连接引用
+}()
+```
+
+### 14.4 性能监控的可扩展性
+
+| 监控维度 | 实现方式 | 扩展点 |
+|---------|---------|--------|
+| **HTTP 请求指标** | Telemetry 中间件 | 通过 `log.telemetry` 配置关闭/开启 |
+| **分布式追踪** | OpenTracing 兼容框架 | 注册自定义 `Tracer` 到 Jaeger/Zipkin |
+| **后端操作指标** | 各后端插件自行埋点 | SFTP/S3 已完整埋点，其他后端可参考实现 |
+| **自定义指标** | 插件自行实现 | 通过 `Hooks.Register.Middleware()` 添加 |
+| **告警** | 无内置 | 基于日志/追踪数据在外部系统配置 |
+
+## 15. 完整调用链示例
 
 以列出目录请求为例：
 
@@ -1375,38 +2026,53 @@ SessionStart 中间件
     └→ ctx.Backend = *S3Backend
     ↓
 FileLs 控制器
-    ├→ 权限检查 model.CanRead(ctx)
+    ├→ Layer 1: model.CanRead(ctx) → true
     ├→ PathBuilder(ctx, "/documents") → "/bucket/documents"
-    ├→ 授权中间件检查 auth.Ls(ctx, path)
-    ├→ ctx.Backend.Ls("/bucket/documents") → 调用 S3Backend.Ls()
-    │   └→ S3 客户端调用 s3.ListObjectsV2(...)
+    ├→ Layer 2: auth[0].Ls(ctx, path) → nil
+    │   Layer 2: auth[1].Ls(ctx, path) → nil (遍历所有授权中间件)
+    ├→ Layer 3: ctx.Backend.Ls("/bucket/documents")
+    │   └→ S3Transport.RoundTrip()
+    │       ├→ NewSpan("ListObjectsV2", {s3.bucket, s3.key})
+    │       ├→ AWS SDK 实际调用
+    │       └→ span.Close()
     ├→ 结果转换为 FileInfo 数组
     └→ SendSuccessResultsWithMetadata(...)
+    ↓
+Telemetry 中间件
+    └→ Log.Stdout("HTTP 200 GET 123.4ms /api/ls?path=/documents")
 ```
 
-## 13. 相关文件速查表
+## 16. 相关文件速查表
 
 | 文件 | 职责 |
 |------|------|
-| [server/common/types.go](server/common/types.go) | `IBackend` 接口定义 |
+| [server/common/types.go](server/common/types.go) | `IBackend`、`IAuthorisation`、`IAuditPlugin` 接口定义 |
 | [server/common/backend.go](server/common/backend.go) | `Driver` 注册中心、`Nothing` 空实现、降级回退 |
-| [server/common/plugin.go](server/common/plugin.go) | `Hooks` 扩展机制 |
+| [server/common/plugin.go](server/common/plugin.go) | `Hooks` 扩展机制、Onload/OnQuit/Workflow 排序 |
 | [server/common/crypto.go](server/common/crypto.go) | AES-GCM 加密、zlib 压缩、会话 ID、Nonce 生成器 |
 | [server/common/constants.go](server/common/constants.go) | 密钥分层派生、Cookie 路径配置 |
 | [server/common/config.go](server/common/config.go) | Configuration.Initialise() 主密钥初始化 |
 | [server/common/config_state.go](server/common/config_state.go) | 配置文件加解密、configKeysToEncrypt |
 | [server/common/cache.go](server/common/cache.go) | 会话绑定缓存、并发安全 |
-| [server/common/default.go](server/common/default.go) | HTTP 客户端、TLS 标准化配置 |
-| [server/plugin/index.go](server/plugin/index.go) | 所有插件导入入口（编译时链接） |
+| [server/common/default.go](server/common/default.go) | HTTP 客户端、TLS 标准化配置、超时设置 |
+| [server/plugin/index.go](server/plugin/index.go) | 所有插件导入入口（编译时链接，决定 init 顺序） |
 | [server/model/files.go](server/model/files.go) | `NewBackend()` 工厂、isAllowed 配置校验 |
+| [server/model/permissions.go](server/model/permissions.go) | CanRead/CanEdit/CanUpload 粗粒度权限 |
+| [server/model/audit.go](server/model/audit.go) | SimpleAudit 默认实现、AuditForm 查询表单 |
 | [server/middleware/session.go](server/middleware/session.go) | 中间件注入 `ctx.Backend`、会话解密 |
-| [server/ctrl/session.go](server/ctrl/session.go) | 会话认证、Cookie 分片、OAuthToken 处理 |
-| [server/ctrl/admin.go](server/ctrl/admin.go) | 管理员 Cookie 加密、Backend.Drivers() 列表 |
-| [server/ctrl/files.go](server/ctrl/files.go) | 控制器方法分发、PathBuilder 前缀约束 |
-| [server/pkg/extension/discovery.go](server/pkg/extension/discovery.go) | 外部 Wasm 插件发现与加载 |
+| [server/middleware/telemetry.go](server/middleware/telemetry.go) | HTTP 请求性能监控、日志输出、遥测上报 |
+| [server/pkg/tracer/](server/pkg/tracer/) | 分布式追踪框架（OpenTracing 兼容） |
+| [server/ctrl/session.go](server/ctrl/session.go) | 会话认证、Cookie 分片、OAuthToken、登录登出审计 |
+| [server/ctrl/admin.go](server/ctrl/admin.go) | 管理员 Cookie 加密、Backend.Drivers()、/audit 端点 |
+| [server/ctrl/files.go](server/ctrl/files.go) | 控制器方法分发、授权中间件调用、PathBuilder |
+| [server/plugin/plg_backend_sftp/tracing.go](server/plugin/plg_backend_sftp/tracing.go) | SFTP 全操作追踪埋点（装饰器模式） |
+| [server/plugin/plg_backend_s3/utils.go](server/plugin/plg_backend_s3/utils.go) | S3 HTTP RoundTripper 追踪埋点 |
+| [server/plugin/plg_authorisation_example/](server/plugin/plg_authorisation_example/) | 授权中间件示例（审计日志+权限控制） |
+| [server/pkg/extension/discovery.go](server/pkg/extension/discovery.go) | 外部 Wasm 插件发现与加载、失败隔离 |
 | [server/pkg/extension/adapter/runtime/](server/pkg/extension/adapter/runtime/) | Wasm 沙箱运行时、互斥锁保护 |
 | [server/plugin/plg_backend_local/](server/plugin/plg_backend_local/) | Local 后端实现（Admin 密码认证） |
 | [server/plugin/plg_backend_tmp/](server/plugin/plg_backend_tmp/) | TmpStorage 用户 Chroot 目录隔离 |
 | [server/plugin/plg_backend_samba/](server/plugin/plg_backend_samba/) | Samba 多共享虚拟命名空间 |
 | [server/plugin/plg_backend_*/index.go](server/plugin/) | 各后端具体实现 |
+| [cmd/main.go](cmd/main.go) | 主程序启动流程、Onload 执行顺序、Starter 依赖检查 |
 | [go.mod](go.mod) | 外部依赖版本锁定 |
