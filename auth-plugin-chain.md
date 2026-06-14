@@ -1318,3 +1318,634 @@ local 插件的所有用户数据（包括 Disabled 状态）存储在**配置�
 | `server/plugin/plg_authenticate_local/service.go` | 12-67 | 用户 CRUD (createUser/updateUser/removeUser) |
 | `server/plugin/plg_authenticate_local/data.go` | 18-52 | 插件配置读写 + isEnabled 检查 |
 | `server/plugin/plg_authenticate_local/notify.go` | 32-71 | 邀请邮件发送 (sendInvitateMail) |
+
+---
+
+## 十九、第三方 SSO OAuth / SAML 回调失败处理
+
+### 19.1 两套独立的 OAuth 链路
+
+Filestash 中存在两条完全独立的 OAuth 流程，它们的回调失败处理路径完全不同：
+
+| 链路 | 路由 | 场景 | 认证层级 |
+|------|------|------|----------|
+| **OAuth 后端驱动** | `GET /api/session/auth/{service}` | 用户选择 Google Drive / Dropbox 等后端时，使用 OAuth 授权该后端 | 后端级（存储系统授权） |
+| **OAuth IdP 插件** | `GET/POST /api/session/auth/` | 配置了 `plg_authentication_openid` / `plg_authentication_saml` 等企业级 IdP | 身份级（用户是谁） |
+| **MCP OAuth 服务器** | `GET /mcp/authorize` + `POST /mcp/token` | 作为 OAuth 授权服务器为 MCP 客户端发放令牌 | 服务端级（Filestash 是 IdP） |
+
+### 19.2 OAuth 后端驱动的回调失败处理
+
+**入口路由**：`GET /api/session/auth/{service}` → `SessionOAuthBackend` (`ctrl/session.go:183-218`)
+
+**典型后端**：`gdrive`（Google Drive，标准 OAuth2 authorization code）、`dropbox`（Implicit Grant Flow）
+
+**`SessionOAuthBackend` 的失败点**：
+
+```
+SessionOAuthBackend
+  │
+  ├─ [FAIL 1] NewBackend 失败
+  │   场景: 缺少 ClientID / ClientSecret 配置
+  │   处理: Log.Debug + SendErrorResult(res, err) → JSON 错误
+  │   示例: GDrive "Missing Client Secret: Contact your admin" (502)
+  │
+  ├─ [FAIL 2] 后端不支持 OAuth
+  │   场景: 调用非 OAuth 后端（如 S3/SFTP）的 OAuth 路由
+  │   处理: Log.Debug + SendErrorResult(res, ErrNotSupported) → JSON 405
+  │
+  └─ [FAIL 3] OAuthURL 解析失败
+      场景: 后端返回的授权 URL 格式异常
+      处理: Log.Debug + SendErrorResult(res, ErrNotValid) → JSON 405
+```
+
+**成功时的跳转**：Accept 头包含 `text/html`（浏览器）→ 303 重定向到 IdP；API 调用 → 200 JSON 返回 URL。
+
+**`state` 参数透传**：SessionOAuthBackend 将 `service::{next}` 拼接后写入 `state` 参数，`::` 作为分隔符（dropbox 不支持，另见下述）。
+
+**`SessionAuthenticate` 中的 OAuth 令牌交换（路径 A）**：
+
+```go
+// ctrl/session.go:65-81
+if obj, ok := backend.(interface{ OAuthToken(*map[string]interface{}) error }); ok {
+    if err := obj.OAuthToken(&ctx.Body); err != nil {
+        Log.Debug("[auth] action=authenticate::oauthtoken err=%s", ferror(err))
+        SendErrorResult(res, NewError("Can't authenticate (OAuth error)", 401))
+        return
+    }
+    // 再次 NewBackend：这次拿到了真正的 AccessToken
+    backend, _ = model.NewBackend(ctx, ctx.Body)
+    if backend == nil {
+        Log.Debug("[auth] action=authenticate::oauth::newBackend err=%s", ...)
+        Log.Stdout("AUDIT action[fail] ...") ← 审计日志
+        SendErrorResult(res, ErrAuthenticationFailed)
+        return
+    }
+}
+```
+
+#### GDrive 的 OAuthToken 失败点 (`plg_backend_gdrive/index.go:97-112`)：
+
+```
+OAuthToken
+  │
+  ├─ code 缺失 (ctx["code"] 不存在) → oauth2.Exchange 失败 → 返回错误
+  ├─ code 无效 / 过期 / 被重放 → Google 返回 invalid_grant → 返回错误
+  └─ scope 不足 → Google 返回 insufficient_scope → 返回错误
+```
+
+#### Dropbox 的特殊实现：
+
+Dropbox 使用 `response_type=token`（**Implicit Grant Flow**），令牌直接通过 URL fragment 返回前端，后端完全不参与回调。因此：
+- 不走 `OAuthToken` 流程
+- 前端拿到 `access_token` 后自己组装 `POST /api/session` body
+- 后端仅在 `Init` 中验证令牌有效性（第一次 API 调用失败才暴露）
+
+### 19.3 IdP 插件 OAuth / SAML 的回调失败处理
+
+**入口**：`GET/POST /api/session/auth/` → `SessionAuthMiddleware` (`ctrl/session.go:220-487`)
+
+> **重要**：开源版中 `plg_authentication_saml` 和 `plg_authentication_openid` 仅在注释中提及 (`plugin.go:122-123`)，无实际实现。以下流程基于通用 `IAuthentication` 接口和 `SessionAuthMiddleware` 编排逻辑，适用于企业版接入这两个插件时的行为。
+
+**SessionAuthMiddleware 的失败全景图（11 个失败节点）**：
+
+```
+SessionAuthMiddleware
+  │
+  ├─ [FAIL P0-1] 插件未找到 (identity_provider.type 为空/不匹配)
+  │   → 307 重定向 /?error=Not%20Found&trace=middleware not found
+  │
+  ├─ [FAIL P0-2] POST Body 解析失败
+  │   → 307 重定向 /?error=Not%20Valid&trace=parsing body - <err>
+  │
+  ├─ [FAIL P0-3] IdP 配置 JSON 反序列化失败
+  │   → 307 重定向 /?error=Not%20Valid&trace=unpacking idp - <err>
+  │
+  ├─ [FAIL P0-4] IdP 参数模板渲染失败
+  │   → 307 重定向 /?error=Not%20Valid&trace=idp - <err>
+  │
+  ├─ [FAIL P1-1] plugin.EntryPoint() 报错
+  │   场景: 外部 IdP 不可达 (OAuth 授权端点超时) / SAML Metadata 拉取失败
+  │   → Log.Error("entrypoint - %s")
+  │   → 返回 200 OK + HTML 错误页 (Page(err.Error()))
+  │
+  ├─ [FAIL P2-1] plugin.Callback() 返回 ErrAuthenticationFailed
+  │   场景: 用户拒绝授权 / 密码错误 / SAML Assertion 过期 / JWT 签名不匹配
+  │   → Log.Warning("failed authentication - %s")
+  │   → 303 重定向回 ?action=redirect（再次显示登录页，flash Cookie 提示）
+  │
+  ├─ [FAIL P2-2] plugin.Callback() 返回其他错误 且 未设置 Content-Type=text/html
+  │   场景: IdP 返回 5xx / 网络中断 / 证书校验失败
+  │   → Log.Error("callback error - %s")
+  │   → 303 重定向 /?error=Not%20Allowed&trace=redirect request failed - <err>
+  │
+  ├─ [FAIL P2-3] plugin.Callback() 返回错误 但已写 response
+  │   (插件内部处理了响应，如 SAML 的 POST Binding 表单自动提交)
+  │   → 直接 return，不再后续处理
+  │
+  ├─ [FAIL P2-4] label/state 缺失 (ssoref Cookie 过期，且 URL 中无 label=)
+  │   场景: 用户停留在登录页超过 10 分钟后提交
+  │   → Log.Warning("callback_error err=missing_label url=%s")
+  │   → 不拦截，但后续 attribute_mapping 找不到对应 label 将导致空 session
+  │
+  ├─ [FAIL P2-5] State 签名校验失败
+  │   场景: 攻击者篡改 state 中的 next / nav / label 字段
+  │   → Log.Debug("callback signature is required, signature=%s")
+  │   → 307 重定向 /?error=Invalid%20Signature&trace=signature is not correct
+  │
+  ├─ [FAIL P3-1] Attribute Mapping 模板渲染失败
+  │   场景: Callback 返回字段与 Go template 变量不匹配
+  │   → Log.Warning("attribute mapping error %s")
+  │   → 307 重定向 /?error=Not%20Valid&trace=mapping_error - <err>
+  │
+  ├─ [FAIL P3-2] model.NewBackend 失败 (凭据合法但后端不可达 / 白名单不匹配)
+  │   场景: LDAP 验证通过但 SFTP 服务器宕机；属性映射字段缺失
+  │   → Log.Debug("backend connection failed %s")
+  │   → Log.Info("[auth] status=failed user=%s backend=%s::%s ip=%s err=%s") ← 审计日志
+  │   → 307 重定向 /?error=<msg>&trace=backend error - <err>
+  │       (若 err 是翻译错误则用 err.Error()，否则用 ErrNotValid)
+  │
+  ├─ [FAIL P4-1] session JSON Marshal 失败
+  │   → Log.Debug("session marshal error %+v")
+  │   → SendErrorResult(res, ErrNotValid) → JSON 405
+  │
+  └─ [FAIL P4-2] EncryptString 加密失败
+      → Log.Debug("encryption error - %s")
+      → SendErrorResult(res, ErrNotValid) → JSON 405
+```
+
+#### 错误分级与用户反馈策略
+
+| 错误级别 | 错误类型 | 日志级别 | HTTP 响应 | 用户可见 |
+|----------|----------|----------|-----------|----------|
+| 用户误操作 | `ErrAuthenticationFailed` | Warning | 303 重定向回登录页 | 是 |
+| 配置错误 | IdP JSON / 模板 / Mapping 错误 | Warning | 307 重定向首页 | 是（error query） |
+| 安全事件 | State 签名失败 / 篡改 | Debug | 307 重定向首页 | 是（不提供细节） |
+| 系统故障 | EntryPoint error / Callback 其他错误 | Error | 200 HTML 错误页 / 303 重定向 | 是 |
+| 安全审计 | 后端连接失败 | Info + Debug | 307 重定向首页 | 是 |
+| 内部异常 | JSON Marshal / Encrypt 失败 | Debug | JSON 405 | 否（前端未处理） |
+
+#### ssoref Cookie 的 10 分钟过期机制
+
+```go
+// Step1: 在 EntryPoint 时写入，MaxAge 60*10 = 10 分钟
+http.SetCookie(res, &http.Cookie{
+    Name:   SSOCookieName /* "ssoref" */,
+    Value:  label + "::" + state,
+    MaxAge: 60 * 10,
+    Path:   COOKIE_PATH,
+})
+
+// Step2: 在 Callback 阶段读取，提取 label + state
+refCookie, _ := req.Cookie(SSOCookieName)
+s := strings.SplitN(refCookie.Value, "::", 2)
+```
+
+**过期后果**：10 分钟内未完成 OAuth 回调 → ssoref Cookie 过期 → label/state 缺失 → 依赖 URL query 中的 label/state 作为回退；若两者都缺失则触发 `FAIL P2-4`，最终可能导致 attribute_mapping 找不到后端类型。
+
+#### SAML 场景特有失败模式（预期）
+
+基于 SAML 协议惯例和 `IAuthentication` 接口，企业版 `plg_authentication_saml` 可能的失败：
+
+| 失败场景 | Callback 行为 | 对应用户感知 |
+|----------|---------------|-------------|
+| SAML Response 签名验证失败 | 返回 error + 自行设置 text/html | 插件内部渲染错误页 |
+| Assertion 过期（NotOnOrAfter） | 返回 `ErrAuthenticationFailed` | 重定向登录页 + flash |
+| Audience 不匹配（Recipient 错误） | 返回 error | 303 重定向首页 error query |
+| InResponseTo 不匹配（重放攻击） | 返回 `ErrAuthenticationFailed` | 重定向登录页 + flash |
+| IdP 证书过期 / 指纹不匹配 | 返回 error + Log.Error | 200 HTML 错误页 |
+
+### 19.4 MCP OAuth 授权服务器的失败处理
+
+MCP (`plg_handler_mcp`) 作为 OAuth 授权服务器，有独立的失败处理：
+
+| 路由 | 失败点 | 处理 |
+|------|--------|------|
+| `GET /mcp/authorize` | response_type != code / client_id 空 / redirect_uri 空 | `http.Error` 400 纯文本 |
+| `POST /mcp/token` | grant_type != authorization_code | `http.Error` 400 纯文本 |
+| `POST /mcp/token` | authorization_code 解密失败 (被篡改/过期) | `http.Error` 400 "Invalid authorization code" |
+| `GET /api/mcp` (`CallbackHandler`) | redirect_uri 缺失 | `SendErrorResult` JSON 错误 |
+| `GET /api/mcp` | Authorization 加密失败 | `SendErrorResult` JSON 错误 |
+
+---
+
+## 二十、跨节点 Session 共享：存储选择与一致性策略
+
+### 20.1 架构现状：无状态 + 客户端存储
+
+**核心结论**：Filestash 默认是**纯无状态单节点设计**，不存在原生的跨节点 Session 共享机制。所有用户会话完全存储在**客户端 Cookie** 中，服务端不维护任何活跃 Session 列表。
+
+| 组件 | 存储位置 | 跨节点可用 |
+|------|----------|-----------|
+| **用户认证 Session** | 客户端 Cookie (`auth` / `auth1` / ...) | ✓（任何节点都能解密，只要 SECRET_KEY 相同） |
+| **Admin Token** | 客户端 Cookie (`admin`) + Authorization 头 | ✓（同上，加密依赖 SECRET_KEY） |
+| **共享链接 Session** | 服务端 SQLite `Share.auth` 字段 | ✗（本地文件，不共享） |
+| **邮箱验证码** | 服务端 SQLite `Verification` 表 | ✗（本地文件，不共享） |
+| **SECRET_KEY** | `state/config/config.json` | ✓（需人工同步所有节点） |
+| **IdP 用户 DB (local 插件)** | `middleware.identity_provider.params.db` (配置文件) | ✗（单节点修改后需配置同步） |
+| **配置文件** | `state/config/config.json` | ✗（各节点独立，除非用共享存储） |
+
+### 20.2 Session 数据在多节点场景下的天然一致性
+
+由于 Session 是**客户端持有 + 服务端对称加密**的设计，不需要分布式 Session 存储：
+
+```
+            ┌─────────────────────────────────┐
+            │   客户端 Cookie (auth, auth1..) │
+            └────┬──────────────┬─────────────┘
+                 │              │
+      SECRET_KEY一致         SECRET_KEY一致
+                 ▼              ▼
+         ┌────────────┐  ┌────────────┐
+         │  Node A    │  │  Node B    │
+         │  Decrypt() │  │  Decrypt() │
+         │  + 业务    │  │  + 业务    │
+         └────┬───────┘  └────┬───────┘
+              │               │
+              └───────┬───────┘
+                      ▼
+           同一份明文 Session JSON
+```
+
+**解密依赖的全局共享要素**（所有节点必须完全一致）：
+
+```
+1. SECRET_KEY（根密钥）
+   ├─ SECRET_KEY_DERIVATE_FOR_USER    ← Session 加密/解密
+   ├─ SECRET_KEY_DERIVATE_FOR_ADMIN   ← Admin Token 加密/解密
+   ├─ SECRET_KEY_DERIVATE_FOR_SIGNATURE ← State 签名校验
+   └─ SECRET_KEY_DERIVATE_FOR_HASH    ← 用户 ID 哈希
+   派生函数: Hash("USER_" + SECRET_KEY) 等 (common/constants.go:72-78)
+
+2. general.cookie_timeout 配置       ← Cookie MaxAge 一致性
+
+3. general.extended_session 配置      ← 是否附加扩展 session 字段
+```
+
+**配置不一致的后果**：
+
+| 不一致项 | 现象 | 影响 |
+|----------|------|------|
+| SECRET_KEY 不同 | 节点 A 登录的用户请求节点 B → Decrypt 失败 → 401 | 节点间登录态不互通 |
+| cookie_timeout 不同 | 节点 A 设 60 分钟，节点 B 设 1440 分钟 → Cookie MaxAge 不固定 | 用户体验异常，偶发掉线 |
+| extended_session 不同 | 节点 A 生成的 session 含扩展字段，节点 B 生成的不含 | 插件可能读取不到扩展信息 |
+
+### 20.3 多节点部署的关键约束与实践方案
+
+#### 方案一：无状态水平扩展（推荐，完全客户端 Session）
+
+```
+        ┌─────────────┐
+        │   Nginx/ALB │   (Session Affinity: None)
+        └──────┬──────┘
+               │  Round-Robin
+     ┌─────────┼─────────┐
+     ▼         ▼         ▼
+  Node A    Node B    Node C
+  (SECRET_KEY 完全一致)
+  (config.json 同步)
+```
+
+**必须同步的文件/配置**：
+
+| 文件 | 同步方式 | 变更频率 |
+|------|----------|----------|
+| `SECRET_KEY` (general.secret_key) | 启动时通过环境变量注入 `FILESTASH_SECRET_KEY`，或部署前预写 config.json | 永不（变更=所有用户掉线） |
+| `state/config/config.json` | 共享存储挂载 (NFS/EFS) / ConfigMap + 热加载 / GitOps | 低（管理员操作变更） |
+| `general.host` / SSL 证书 | 环境变量 / 配置管理工具 | 低 |
+| `auth.admin` 密码哈希 | 同上 | 低 |
+
+**仍不支持的场景**：
+- ✗ 管理员主动吊销某个用户的 Session（只能等 Cookie 过期）
+- ✗ 活跃 Session 列表查询（无法统计在线用户）
+- ✗ 共享链接跨节点访问（Share 表存本地 SQLite）
+- ✗ 邮箱验证码跨节点校验（Verification 表存本地 SQLite）
+
+#### 方案二：共享 SQLite（简单共享场景）
+
+将 `state/db/share.sql` 挂载到共享存储（NFS/EFS）：
+
+```
+        ┌──────────────────────────────────┐
+        │        Load Balancer             │
+        └────┬────────────┬────────────────┘
+             │            │
+        ┌────┴───┐   ┌────┴───┐
+        │ Node A │   │ Node B │
+        └────┬───┘   └────┬───┘
+             │            │
+             └──────┬─────┘
+                    ▼
+        ┌─────────────────────┐
+        │  NFS: state/db/     │
+        │  └ share.sql        │
+        └─────────────────────┘
+```
+
+**注意**：SQLite 不支持多节点并发写，实际并发下可能出现 `database is locked` 错误。仅适用于共享链接创建/访问低并发场景。
+
+#### 方案三：外部化 Session 存储（需要代码改造）
+
+当前代码结构下，可通过**插件化改造**实现 Redis 集中式 Session 存储：
+
+**改造点 1**：Session 持久化改为写入 Redis 而非 Cookie
+
+```go
+// 现有实现: SessionAuthenticate / SessionAuthMiddleware 末尾
+obfuscate, _ := EncryptString(SECRET_KEY_DERIVATE_FOR_USER, string(s))
+http.SetCookie(res, &http.Cookie{Name: "auth", Value: obfuscate, ...})
+
+// 改造后:
+sessionID := GenerateRandomID(32)
+redisClient.Set(ctx, "session:"+sessionID, string(s), cookie_timeout)
+http.SetCookie(res, &http.Cookie{Name: "sid", Value: sessionID, ...})
+```
+
+**改造点 2**：SessionStart 中间件改为 Redis 查询
+
+```go
+// 现有实现: _extractSession()
+authorization := _extractAuthorization(req)
+s, _ := DecryptString(SECRET_KEY_DERIVATE_FOR_USER, authorization)
+
+// 改造后:
+sid, _ := req.Cookie("sid")
+s, _ := redisClient.Get(ctx, "session:"+sid.Value).Result()
+```
+
+**改造点 3**：增加 IStorage 接口 + Redis 插件实现
+
+```go
+type ISessionStore interface {
+    Set(sessionID string, session []byte, ttl time.Duration) error
+    Get(sessionID string) ([]byte, error)
+    Delete(sessionID string) error          // 登出 / 吊销
+    List() ([]SessionMeta, error)           // 在线列表
+}
+```
+
+### 20.4 SECRET_KEY 轮换的一致性挑战
+
+**问题**：SECRET_KEY 一旦更换，所有现有 Session Cookie 立即失效（解密失败 → ErrNotAuthorized）。
+
+**影响范围**：
+- 用户登录态（全部掉线）
+- 共享链接（Share.auth 字段解密失败）
+- Admin Token（管理员被登出）
+- State 签名（SSO 回调全部校验失败）
+- Proof Cookie（邮箱验证码的证明失效）
+
+**无停机轮换策略（需代码支持）**：
+
+当前代码未实现 Key ID 机制，轮换必须停机。可改造方案：
+
+```
+1. 所有加密输出前缀增加 <key_id>:<ciphertext>
+2. 维护 <SECRET_KEY, KEY_ID> 映射表（如 Redis / 配置）
+3. 解密时根据 key_id 选择旧密钥或新密钥
+4. 部署双密钥版本 → 新 Cookie 用新密钥加密，旧 Cookie 用旧密钥解密后立即用新密钥重新加密
+5. 确认所有用户都已刷新会话后，移除旧密钥
+```
+
+### 20.5 服务端数据的一致性：Share / Verification
+
+即使 Session 本身无状态，服务端仍有两类需要跨节点的**共享状态**：
+
+| 数据 | 单节点位置 | 跨节点一致性策略 |
+|------|------------|-----------------|
+| 共享链接元数据 | SQLite `Share` 表 | 方案 A: NFS 共享 SQLite (低并发)<br>方案 B: 改为 PostgreSQL/MySQL 外部 DB<br>方案 C: 仅使用相同节点 (LB sticky session) |
+| 邮箱验证码 | SQLite `Verification` 表 | 同上 + 验证码有效期短 (10min)，不一致窗口较小 |
+| IdP 用户列表 (local) | config.json | 配置同步（Zookeeper / Consul / 文件同步） |
+| 审计日志 | state/log/access.log | 采集到集中式 ELK / Loki / ClickHouse |
+
+---
+
+## 二十一、密码重置与忘记密码端到端流程
+
+### 21.1 现状概览：无自助式忘记密码
+
+**核心结论**：Filestash（开源版）**不存在用户自助的"忘记密码"流程**。所有密码变更完全依赖管理员后台操作。
+
+| 能力 | 是否存在 | 实现位置 |
+|------|----------|----------|
+| 用户自助申请重置链接 | ✗ | — |
+| 邮箱验证码重置密码 | ✗ | — |
+| 安全问题重置 | ✗ | — |
+| 管理员后台重置密码 | ✓ | `UserManagementHandler` (`plg_authenticate_local/handler.go:47-72`) |
+| 新用户创建时发送邀请邮件（含明文密码） | ✓ | `sendInvitateMail` (`notify.go:32-54`) |
+| 管理员强制用户下次登录改密 | ✗ | — |
+| 密码定期过期 | ✗ | — |
+
+### 21.2 管理员重置密码的完整链路
+
+#### 触发入口
+
+管理员通过两种方式进入用户管理：
+
+```
+方式 1 (Web UI):
+  GET /admin/simple-user-management
+    → 走 UserManagementHandler GET 分支
+    → 渲染用户列表 HTML 页面 (handler.html 模板)
+    → 管理员点击某个用户的"编辑"
+    → 显示该用户的 Email / Role / Disabled / 新密码 表单
+
+方式 2 (API):
+  GET /admin/api/simple-user-management (Accept: application/json)
+    → SendSuccessResults(res, users) 返回所有用户的 JSON 数组
+```
+
+#### 密码重置操作流程
+
+```
+管理员提交表单 POST /admin/api/simple-user-management?email=<user@xxx>
+  │
+  ├─ 中间件: AdminOnly 校验管理员身份 (middleware/session.go:28-55)
+  │   └─ 失败 → 403 Forbidden
+  │
+  ├─ UserManagementHandler 执行 updateUser()
+  │   ├─ 参数提取:
+  │   │   ├─ email    = URL query email (已存在用户)
+  │   │   ├─ password = req.FormValue("password") (明文新密码)
+  │   │   ├─ role     = req.FormValue("role")
+  │   │   └─ disabled = req.FormValue("disabled") == "on"
+  │   │
+  │   ├─ formatPassword() 校验密码格式
+  │   │   └─ 8 ≤ len ≤ 72，正则匹配
+  │   │
+  │   ├─ bcrypt.GenerateFromPassword(password, BCRYPT_DEFAULT_COST)
+  │   │   └─ 成本因子 BCRYPT_DEFAULT_COST = 12
+  │   │
+  │   ├─ saveUsers() 写回配置
+  │   │   └─ Config.Get("middleware.identity_provider.params").Set(serializedDB)
+  │   │
+  │   └─ 成功
+  │
+  ├─ 不发送通知邮件（只有 createUser 才触发 go sendInvitateMail）
+  │   └─ 密码被重置后，用户不会收到任何邮件
+  │
+  └─ isAPI 判断:
+      ├─ Accept: application/json → SendSuccessResult JSON 200
+      └─ 否则 → 303 See Other 重定向回用户列表页
+```
+
+**关键代码**：
+- 密码格式校验：`formatPassword` (`utils.go:20-37`)
+- bcrypt 哈希：`formatPassword` 内部 `bcrypt.GenerateFromPassword(...)`
+- 持久化：`savePluginData` (`data.go:31-42`)
+
+### 21.3 新用户创建流程的密码下发（唯一自动发邮件的场景）
+
+```
+管理员 POST /admin/api/simple-user-management (不带 email query)
+  │
+  ├─ createUser() 判断: currentUser.Email == ""
+  │   ├─ 验证邮箱唯一性 (重复邮箱报错)
+  │   ├─ bcrypt 哈希密码
+  │   └─ 追加到 users 数组
+  │
+  ├─ 异步 goroutine: sendInvitateMail(newUser)
+  │   │
+  │   ├─ isEmailSetup() 检查 SMTP 配置
+  │   │   └─ email.from / server / port / username / password 必须全部配置
+  │   │       不完整 → 静默失败 (return nil)
+  │   │
+  │   ├─ 检查邮件模板
+  │   │   ├─ notification_subject 非空
+  │   │   └─ notification_body 非空
+  │   │       任一为空 → 静默失败 (return nil)
+  │   │
+  │   ├─ 模板渲染 withTemplate()
+  │   │   ├─ 可用变量: {{.instance_url}} {{.user}} {{.password}} {{.role}}
+  │   │   └─ ⚠️ 注意: {{.password}} 是**明文密码**！
+  │   │       管理员在表单中填什么，邮件里就是什么
+  │   │
+  │   ├─ gomail SMTP 发送
+  │   │   └─ TLS / STARTTLS 根据端口自动判断
+  │   │
+  │   ├─ 成功 → Log.Info("action=sent email=%s")
+  │   └─ 失败 → return fmt.Errorf("cannot send mail - reason=%s")
+  │            (goroutine 中的错误无人接收，仅能通过日志发现)
+  │
+  └─ 管理员页面同步返回成功 (不等待邮件发送结果)
+```
+
+> **安全注意**：邀请邮件中包含明文密码。如果 SMTP 通道使用 STARTTLS 端口 587 则加密传输；若使用 25 端口可能明文传输。企业使用前需确认邮件基础设施安全。
+
+### 21.4 登录时的 bcrypt 密码验证
+
+```
+用户 POST /api/session/auth/?action=redirect 提交表单
+  │
+  └─ plg_authenticate_local Callback()
+      │
+      ├─ 遍历 users[i] 按 Email 匹配
+      │
+      ├─ bcrypt.CompareHashAndPassword(users[i].Password, []byte(formData["password"]))
+      │   ├─ 成功 → 继续 (MFA 检查)
+      │   └─ 失败 → flash Cookie "Invalid username or password" + ErrAuthenticationFailed
+      │
+      ├─ Disabled 检查 → 禁用账号 flash "Account is disabled"
+      │
+      └─ MFA 检查 (TOTP) → 失败则加密暂存 formData["mfa"] Cookie 回退
+```
+
+**bcrypt 成本因子**：`BCRYPT_DEFAULT_COST = 12`，**创建用户时固定**，后续修改密码时也使用同一常量。无法按用户/租户差异化成本。
+
+### 21.5 密码验证失败的处理（与忘记密码的联系）
+
+当 bcrypt 失败时，local 插件 auth.go 的处理：
+
+```go
+// auth.go:186-194
+http.SetCookie(res, &http.Cookie{
+    Name:   "flash",
+    Value:  url.QueryEscape("Invalid username or password"),
+    MaxAge: 1,
+    Path:   "/",
+})
+Log.Warning("plg_authentication_simple::auth action=authenticate email=%s err=invalid", users[i].Email)
+return nil, ErrAuthenticationFailed
+```
+
+**用户体验**：
+- 不区分"用户不存在"和"密码错误"，统一提示 "Invalid username or password"（防用户名枚举）
+- 不展示"忘记密码"链接（前端 UI 没有该入口）
+- 不提示"请联系管理员"（用户无自助路径）
+
+### 21.6 其他认证插件的密码重置能力对比
+
+| 插件 | 用户自助改密 | 管理员重置 | 实现方式 |
+|------|-------------|-----------|----------|
+| `local` | ✗ | ✓ | 用户管理后台 /admin/simple-user-management |
+| `admin` | ✗ | 需改配置 | 修改 `auth.admin` 配置值 (bcrypt 哈希) |
+| `passthrough` | N/A | N/A | 不保存密码，直接透传后端 |
+| `htpasswd` | ✗ | ✗ | 只读 htpasswd 格式，无写回能力 |
+| `wordpress` | ✗ | ✗ | 委托 WordPress，密码不存本地 |
+| `ldap` (企业版) | ✗ | ✗ | 委托 LDAP 服务器 |
+| `openid` (企业版) | ✗ | ✗ | 委托 OpenID Provider |
+| `saml` (企业版) | ✗ | ✗ | 委托 SAML IdP |
+
+### 21.7 自助式"忘记密码"的可行实现方案（需扩展代码）
+
+基于现有基础设施（邮件配置 + Verification 表 + share 证明机制），可按以下路径扩展：
+
+```
+Phase 1: 申请重置
+  1. 用户登录页点击"忘记密码" → 输入邮箱
+  2. 后端:
+     a. 查询 local 插件 users 是否存在该邮箱
+     b. 生成 4 位/6 位随机码
+     c. 写入 Verification 表 (key="reset::<email>", code=xxx, expire=+30min)
+     d. 调用 sendInvitateMail 发送模板邮件 (复用 SMTP 配置)
+     e. 响应统一："如邮箱存在，重置邮件已发送"（防枚举）
+
+Phase 2: 验证 + 改密
+  1. 用户打开邮件链接，输入验证码 + 新密码
+  2. 后端:
+     a. SELECT * FROM Verification WHERE key="reset::<email>" AND code=? AND expire > NOW
+     b. 匹配成功 → DELETE 该记录 (一次性)
+     c. updateUser() → bcrypt 新密码哈希
+     d. 清除所有分片 Cookie: auth, auth1, ... (强制所有设备登出)
+     e. return 200 → 前端跳转登录页
+
+Phase 3: 安全加固
+  1. 频率限制：每邮箱每 30 分钟最多 3 次申请
+  2. 验证码有效期：30 分钟
+  3. 验证码错误次数上限：5 次后失效
+  4. 强制改密后所有设备登出（清除 Session）
+     → 通过轮换 SECRET_KEY 无法细粒度实现，需引入 Session ID 机制
+  5. 同步审计日志：AUDIT action[password_reset] email=<x> ip=<y>
+```
+
+**可复用的现有组件**：
+- 邮件发送：`sendInvitateMail` / `gomail` (`notify.go:32-54`)
+- 临时验证码：`Verification` 表 + 自动清理任务 (`model/index.go:41-44`)
+- 密码格式校验 + bcrypt：`formatPassword` (`utils.go:20-37`)
+- 模板引擎：`withTemplate` (`notify.go:57-71`)
+- 强制登出：`SessionLogout` 中的 Cookie 分片删除逻辑 (`ctrl/session.go:153-165`)
+
+---
+
+## 二十二、补充代码索引（三）
+
+| 文件 | 行号 | 职责 |
+|------|------|------|
+| `server/ctrl/session.go` | 183-218 | `SessionOAuthBackend` — OAuth 后端驱动入口 |
+| `server/ctrl/session.go` | 65-81 | `OAuthToken` 调用与错误处理（路径 A） |
+| `server/ctrl/session.go` | 220-318 | `SessionAuthMiddleware` Step 0-1（初始化 + EntryPoint 错误处理） |
+| `server/ctrl/session.go` | 319-455 | `SessionAuthMiddleware` Step 2-3（Callback 错误 + State 校验 + Backend 验证） |
+| `server/ctrl/session.go` | 457-487 | `SessionAuthMiddleware` Step 4（序列化 + 加密失败处理） |
+| `server/plugin/plg_backend_gdrive/index.go` | 93-112 | `GDrive.OAuthURL` / `OAuthToken` — 标准 Authorization Code |
+| `server/plugin/plg_backend_dropbox/index.go` | 67-73 | `Dropbox.OAuthURL` — Implicit Grant Flow (response_type=token) |
+| `server/plugin/plg_handler_mcp/handler_auth.go` | 66-107 | MCP 授权服务器 Authorize / Token 端点错误处理 |
+| `server/plugin/plg_handler_mcp/handler_auth.go` | 138-155 | MCP `CallbackHandler` — Authorization Code 发放 |
+| `server/plugin/plg_authenticate_local/utils.go` | 20-37 | `formatPassword` — 密码格式校验 + bcrypt 哈希 |
+| `server/plugin/plg_authenticate_local/handler.go` | 47-73 | `UserManagementHandler` POST 分支（密码重置/创建） |
+| `server/plugin/plg_authenticate_local/notify.go` | 13-30 | `isEmailSetup` — SMTP 配置完整性检查 |
+| `server/plugin/plg_authenticate_local/notify.go` | 32-55 | `sendInvitateMail` — 邀请邮件发送（含明文密码） |
+| `server/plugin/plg_authenticate_local/notify.go` | 57-71 | `withTemplate` — 邮件模板渲染 |
+| `server/plugin/plg_authenticate_local/auth.go` | 186-194 | bcrypt 校验失败处理（错误提示模糊化） |
+| `server/plugin/plg_authenticate_local/service.go` | 37-55 | `updateUser` / `createUser` — 持久化用户数据 |
+| `server/model/index.go` | 33-44 | `Verification` 表定义 + 每 6 小时过期清理任务 |
+| `server/common/config.go` | 71 | `secret_key` 配置定义（轮换影响所有 Session） |
+| `server/common/constants.go` | 72-78 | SECRET_KEY 派生链（跨节点一致性核心） |
