@@ -870,7 +870,496 @@ var DefaultTLSConfig = tls.Config{
 4. **间接依赖隔离**：使用 `go mod tidy` 确保仅保留必要依赖
 5. **CVE 监控**：依赖 `go list -m -json all` 配合安全扫描工具监控漏洞
 
-## 9. 完整调用链示例
+## 9. 插件加载失败时的备选逻辑与回退机制
+
+### 9.1 多级回退链设计
+
+Filestash 的回退机制不是"自动切换到本地存储"，而是**分层降级**，从特定后端 → 空实现 → 前端报错。完整回退链如下：
+
+```
+后端认证/加载失败
+    ↓
+┌─────────────────────────────────────────────┐
+│ Level 1: isAllowed() 配置检查失败          │
+│   → 返回 Nothing{} + ErrNotAllowed         │
+├─────────────────────────────────────────────┤
+│ Level 2: Driver.Get(type) 找不到后端类型   │
+│   → 返回 Nothing{} （静默降级）            │
+├─────────────────────────────────────────────┤
+│ Level 3: Init() 认证失败/连接超时          │
+│   → 返回 nil + err （SessionAuthenticate  │
+│     返回 401 给前端，前端提示"认证失败"）   │
+├─────────────────────────────────────────────┤
+│ Level 4: 运行时操作失败（Ls/Cat/Save...）  │
+│   → Nothing 实现返回 ErrNotImplemented    │
+│     或空数组，前端显示空目录/报错           │
+└─────────────────────────────────────────────┘
+```
+
+### 9.2 Level 1 & 2：Driver 层的静默降级
+
+`Driver.Get()` 在后端类型不存在或被显式禁用时，不报错而是返回 `Nothing{}` 空实现，定义于 [server/common/backend.go:28-34](server/common/backend.go#L28-L34)：
+
+```go
+const BACKEND_NIL = "_nothing_"
+
+func (d *Driver) Get(name string) IBackend {
+    b := d.ds[name]
+    if b == nil || name == BACKEND_NIL {
+        // 关键：不返回 error，返回空实现实现静默降级
+        return Nothing{}
+    }
+    return b
+}
+```
+
+**触发场景**：
+- 用户请求的后端类型未被编译进程序（未在 `server/plugin/index.go` 导入）
+- 管理员在 `isAllowed()` 检查中显式返回 `BACKEND_NIL`
+- 后端插件 `init()` 注册因 panic 失败（Go 的 init panic 会导致程序直接退出，无回退）
+
+### 9.3 Level 3：Init() 失败时的前端提示
+
+`model.NewBackend()` 在 `isAllowed()` 检查失败时显式使用 `BACKEND_NIL`，定义于 [server/model/files.go:44-49](server/model/files.go#L44-L49)：
+
+```go
+func NewBackend(ctx *App, conn map[string]string) (IBackend, error) {
+    isAllowed := func() bool { /* 配置检查 */ }
+    
+    if isAllowed() == false {
+        // 显式降级到 Nothing，同时返回 ErrNotAllowed 供上层处理
+        return Backend.Get(BACKEND_NIL), ErrNotAllowed
+    }
+    
+    return Backend.Get(conn["type"]).Init(conn, ctx)
+}
+```
+
+**SessionAuthenticate 控制器处理**（[server/ctrl/session.go:52-62](server/ctrl/session.go#L52-L62)）：
+```go
+func SessionAuthenticate(ctx *App, res http.ResponseWriter, req *http.Request) {
+    backend, err := model.NewBackend(ctx, session)
+    if err != nil {
+        // 将错误直接返回给前端，前端展示"认证失败"
+        SendErrorResult(res, err)
+        return
+    }
+    // 认证成功，下发加密 Cookie
+}
+```
+
+**运营注意**：
+- **无自动切换到本地存储的逻辑**。后端加载/认证失败时，用户停留在登录页，提示具体错误信息。
+- 若需"默认本地存储"行为，需通过配置 `connections` 预设 local 后端作为唯一可用选项，或修改前端逻辑在认证失败时跳转到 local 登录表单。
+
+### 9.4 Level 4：Nothing 空实现的运行时语义
+
+`Nothing` 结构体的各方法返回值设计确保了前端不会崩溃，定义于 [server/common/backend.go:40-79](server/common/backend.go#L40-L79)：
+
+```go
+type Nothing struct{}
+
+func (b Nothing) Ls(path string) ([]os.FileInfo, error) {
+    return []os.FileInfo{}, nil     // 返回空数组，前端显示空目录
+}
+func (b Nothing) Stat(path string) (os.FileInfo, error) {
+    return nil, ErrNotFound         // 返回 404，前端提示不存在
+}
+func (b Nothing) Cat(path string) (io.ReadCloser, error) {
+    return NewReadCloserFromReader(strings.NewReader("")), ErrNotImplemented
+}
+func (b Nothing) Mkdir(path string) error { return ErrNotImplemented }
+func (b Nothing) Rm(path string) error    { return ErrNotImplemented }
+func (b Nothing) Mv(from, to string) error { return ErrNotImplemented }
+func (b Nothing) Save(path string, file io.Reader) error { return ErrNotImplemented }
+func (b Nothing) Touch(path string) error  { return ErrNotImplemented }
+```
+
+**运营含义**：
+- `Ls` 返回空数组 → 用户看到一个看似正常的空目录，可能误认为后端无文件（需配合日志排查）
+- 写操作统一返回 `ErrNotImplemented` → 用户操作被拒绝
+- 没有数据写入本地存储作为"暂存区"的逻辑，所有失败都是显式报错或空结果
+
+### 9.5 插件 import 失败的极端场景
+
+由于存储后端通过 Go 空白导入 `_ "plg_backend_*"` 在编译时链接：
+- **编译时缺失**：如果 `server/plugin/index.go` 中注释掉某后端 import，该后端从注册表里消失，用户请求时触发 Level 2 降级到 `Nothing{}`
+- **init() 中 panic**：Go 的 `init()` 函数 panic 会导致整个程序退出，不会跳过该插件继续加载其他。因此各后端 `init()` 仅做 `Backend.Register()`（无法 panic 的操作），不做网络调用或文件 IO
+- **外部 Wasm 插件**：仅影响 middleware/workflow 等扩展点，不影响存储后端的可用性
+
+## 10. 插件间共享凭证的加密实现及密钥更新流程
+
+### 10.1 凭证的存储位置与加密范围
+
+Filestash 的凭证分散在三个位置，使用不同密钥加密：
+
+| 凭证类型 | 存储位置 | 加密密钥 | 定义位置 |
+|---------|---------|---------|---------|
+| **用户会话凭证** | 浏览器 Cookie（`auth`, `auth1`...） | `SECRET_KEY_DERIVATE_FOR_USER` | [server/ctrl/session.go:96](server/ctrl/session.go#L96) |
+| **管理员会话凭证** | 浏览器 Cookie（`admin`） | `SECRET_KEY_DERIVATE_FOR_ADMIN` | [server/ctrl/admin.go:67](server/ctrl/admin.go#L67) |
+| **中间件配置凭证** | `state/config/config.json` | `SECRET_KEY_DERIVATE_FOR_PROOF` | [server/common/config_state.go:24-27](server/common/config_state.go#L24-L27) |
+| **共享链接证明** | 浏览器 Cookie（`proof`） | `SECRET_KEY_DERIVATE_FOR_PROOF` | [server/model/share.go:303](server/model/share.go#L303) |
+| **会话签名** | HTTP Header | `SECRET_KEY_DERIVATE_FOR_SIGNATURE` | [server/ctrl/session.go:380](server/ctrl/session.go#L380) |
+
+### 10.2 配置文件中的凭证加密
+
+`configKeysToEncrypt` 定义了需要在 `config.json` 中加密的字段路径，定义于 [server/common/config_state.go:24-27](server/common/config_state.go#L24-L27)：
+
+```go
+var configKeysToEncrypt []string = []string{
+    "middleware.identity_provider.params",  // SSO/OAuth 客户端密钥
+    "middleware.attribute_mapping.params",  // LDAP/AD 查询密码
+}
+```
+
+**加载时解密**（[server/common/config_state.go:43-68](server/common/config_state.go#L43-L68)）：
+```go
+func LoadConfig() ([]byte, error) {
+    // ... 读取文件 ...
+    
+    // 步骤1: 先从明文 secret_key 初始化派生密钥
+    if os.Getenv("CONFIG_SECRET") == "" {
+        InitSecretDerivate(gjson.Get(configStr, "general.secret_key").String())
+    }
+    
+    // 步骤2: 用 PROOF 派生密钥解密配置中的敏感字段
+    key := defaultValue(SECRET_KEY_DERIVATE_FOR_PROOF, "CONFIG_SECRET")
+    for _, jsonPathWithEncryptedData := range configKeysToEncrypt {
+        p := gjson.Get(configStr, jsonPathWithEncryptedData).String()
+        if p == "" { continue }
+        t, err := DecryptString(Hash(key, 16), p)  // 二次哈希缩短密钥长度
+        if err != nil {
+            Log.Warning("cannot decrypt config path '%s': %s", ...)
+            continue  // 解密失败跳过，不阻塞启动
+        }
+        configStr, _ = sjson.Set(configStr, jsonPathWithEncryptedData, t)
+    }
+    return []byte(configStr), nil
+}
+```
+
+**保存时加密**（[server/common/config_state.go:71-113](server/common/config_state.go#L71-L113)）：
+```go
+func SaveConfig(v []byte) error {
+    // ...
+    key := defaultValue(SECRET_KEY_DERIVATE_FOR_PROOF, "CONFIG_SECRET")
+    for _, jsonPathWithEncryptedData := range configKeysToEncrypt {
+        p := gjson.Get(configStr, jsonPathWithEncryptedData).String()
+        if p == "" { continue }
+        t, err := EncryptString(Hash(key, 16), p)  // 与解密相同的密钥派生
+        // ...
+    }
+    // ...
+}
+```
+
+### 10.3 会话凭证的加密流程
+
+用户 Session（包含后端密码、Access Key 等）通过以下流程加密：
+
+```
+明文 session JSON (含 password/access_key)
+    ↓ json.Marshal
+原始字节
+    ↓ zlib 压缩 (crypto.go:28)
+压缩字节
+    ↓ AES-256-GCM 加密，密钥 = SECRET_KEY_DERIVATE_FOR_USER (crypto.go:32)
+    ↓ nonce(12) + ciphertext + tag
+密文
+    ↓ base64.URLEncoding (crypto.go:36)
+URL 安全字符串
+    ↓ 按 3800 字节分片
+auth, auth1, auth2, ... Cookie
+```
+
+**加密算法细节**（[server/common/crypto.go:128-164](server/common/crypto.go#L128-L164)）：
+```go
+func EncryptAESGCM(key []byte, plaintext []byte) ([]byte, error) {
+    c, _ := aes.NewCipher(key)
+    gcm, _ := cipher.NewGCM(c)
+    nonce := GCMNonce.Next()  // 全局递增 nonce，带 sync.Mutex 保护
+    // 输出格式: nonce || ciphertext || auth_tag
+    return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+```
+
+### 10.4 主密钥初始化流程
+
+`Configuration.Initialise()` 在服务启动时生成/加载主密钥，定义于 [server/common/config.go:241-260](server/common/config.go#L241-L260)：
+
+```go
+func (this *Configuration) Initialise() {
+    shouldSave := false
+    
+    // ... 环境变量覆盖 ...
+    
+    // 步骤1: 首次启动时生成 16 字节随机密钥
+    if this.Get("general.secret_key").String() == "" {
+        shouldSave = true
+        key := RandomString(16)         // 从加密安全的 rand.Reader 生成
+        this.Get("general.secret_key").Set(key)
+    }
+    
+    if shouldSave {
+        this.Save()                      // 持久化到 config.json
+    }
+    
+    // 步骤2: 从主密钥派生所有子密钥
+    InitSecretDerivate(this.Get("general.secret_key").String())
+}
+```
+
+### 10.5 密钥更新流程（手动操作）
+
+当前代码库**没有自动密钥轮换机制**。手动更换主密钥的操作步骤如下：
+
+```
+步骤1: 通知所有用户密钥即将轮换（现有会话将全部失效）
+步骤2: 管理员登录后台，记录当前 connections 配置（不含密码）
+步骤3: 停止服务，备份 state/config/config.json
+步骤4: 编辑 config.json，设置新的 general.secret_key（16字符以上）
+步骤5: 清空 config.json 中所有已加密字段（会用旧密钥加密，新密钥无法解密）：
+       - middleware.identity_provider.params
+       - middleware.attribute_mapping.params
+步骤6: 删除所有 state/db/ 下的持久化会话（如果有）
+步骤7: 重启服务
+步骤8: 管理员重新配置 SSO/LDAP 等中间件参数（会用新密钥加密）
+步骤9: 所有用户需重新登录（旧 Cookie 无法解密）
+```
+
+**密钥更新影响面**：
+| 数据类型 | 是否失效 | 恢复方式 |
+|---------|---------|---------|
+| 已登录用户的 Session Cookie | 是 | 用户重新登录 |
+| 管理员 Session Cookie | 是 | 管理员重新登录 |
+| 共享链接（无密码） | 不受影响 | 通过独立的 share_id 识别 |
+| 共享链接（有密码） | 是 | 需要重新创建或重新输入密码（密码哈希独立） |
+| `config.json` 中的中间件参数 | 是 | 重新配置并保存 |
+| 已缓存的后端连接 | 是 | 自动重建，用户无感 |
+| 文件内容/元数据 | 不受影响 | 不依赖主密钥加密 |
+
+### 10.6 OAuth 凭证的特殊处理
+
+Google Drive、Dropbox 等支持 OAuth 的后端，Access Token/Refresh Token 经过 `OAuthToken` 方法补充到 session 后，随其他字段一起加密存储在 Cookie 中：
+
+定义于 [server/ctrl/session.go:65-80](server/ctrl/session.go#L65-L80)：
+```go
+if obj, ok := backend.(interface {
+    OAuthToken(*map[string]interface{}) error
+}); ok {
+    if err := obj.OAuthToken(&ctx.Body); err != nil {
+        SendErrorResult(res, NewError("Can't authenticate (OAuth error)", 401))
+        return
+    }
+    // OAuth 成功后，session 包含 access_token/refresh_token，
+    // 这些 token 会被整个 session JSON 一起加密存储
+    session = model.MapStringInterfaceToMapStringString(ctx.Body)
+    backend, err = model.NewBackend(ctx, session)
+}
+```
+
+**存储链**：
+```
+OAuth 回调 → OAuthToken() 填充 access_token/refresh_token
+    → session map 完整序列化
+    → EncryptString(USER_KEY, JSON)
+    → 分片写入 auth Cookie
+```
+
+## 11. 多后端同时挂载时的文件名冲突与命名空间隔离
+
+### 11.1 架构前提：单会话单后端
+
+Filestash 的核心设计是**每个浏览器会话只关联一个后端类型和一个根路径**，不是多后端聚合文件管理器。因此不存在真正意义上的"同时挂载多个后端并合并命名空间"的场景。
+
+**会话结构**（[server/ctrl/session.go:21-26](server/ctrl/session.go#L21-L26)）：
+```go
+type Session struct {
+    Home          *string `json:"home,omitempty"`
+    IsAuth        bool    `json:"is_authenticated"`
+    Backend       string  `json:"backendID"`   // 单个后端 ID
+    Authorization string  `json:"authorization,omitempty"`
+}
+```
+
+每个 HTTP 请求的 `ctx.Backend` 是**单一** `IBackend` 实例，不是数组或映射。
+
+### 11.2 命名空间隔离的四层设计
+
+尽管不支持多后端聚合，但 Filestash 通过四层机制确保单个后端实例内的路径/文件不串扰：
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Layer 1: 会话级 Path 前缀约束                        │
+│   ctx.Session["path"] 作为所有操作的强制前缀        │
+│   PathBuilder() 确保 HasPrefix 成立                  │
+├──────────────────────────────────────────────────────┤
+│ Layer 2: 配置级 isAllowed() 范围校验                 │
+│   NewBackend() 检查连接参数在 Admin 配置范围内      │
+├──────────────────────────────────────────────────────┤
+│ Layer 3: 后端级内部路径映射                           │
+│   单后端多共享/多存储桶时，通过第一层虚拟目录隔离    │
+├──────────────────────────────────────────────────────┤
+│ Layer 4: 本地存储级 Chroot 目录                       │
+│   TmpStorage/URL 后端为每个用户创建独立的文件系统根  │
+└──────────────────────────────────────────────────────┘
+```
+
+### 11.3 Layer 1：PathBuilder 的前缀约束
+
+定义于 [server/ctrl/files.go:1104-1117](server/ctrl/files.go#L1104-L1117)：
+
+```go
+func PathBuilder(ctx *App, path string) (string, error) {
+    if path == "" {
+        return "", NewError("No path available", 400)
+    }
+    sessionPath := ctx.Session["path"]
+    // 将会话根路径 + 用户请求路径拼接
+    basePath := filepath.ToSlash(filepath.Join(sessionPath, path))
+    if path[len(path)-1:] == "/" && basePath != "/" {
+        basePath += "/"
+    }
+    // 关键校验：防止通过 ../../ 越界
+    if strings.HasPrefix(basePath, ctx.Session["path"]) == false {
+        return "", ErrFilesystemError
+    }
+    return basePath, nil
+}
+```
+
+**越权示例**：
+```
+会话 path = "/bucket/userA/"
+用户请求 path = "/../userB/secret.txt"
+拼接后 = "/bucket/userB/secret.txt"
+HasPrefix("/bucket/userA/") = false → 返回 ErrFilesystemError
+```
+
+### 11.4 Layer 2：配置级白名单校验
+
+`model.NewBackend()` 中的 `isAllowed()` 确保用户只能连接 Admin 在配置中预设的后端和路径范围：
+
+```go
+// 路径范围检查
+if val, ok := d["path"]; ok == true {
+    configPath := val.(string)
+    // 用户的 session path 必须以 configPath 为前缀
+    if strings.HasPrefix(conn["path"], configPath) == false {
+        continue  // 不匹配，该配置项不可用
+    }
+}
+
+// 主机/URL 范围检查
+if val, ok := d["hostname"]; ok == true {
+    if conn["hostname"] != val.(string) { continue }
+}
+```
+
+### 11.5 Layer 3：单后端内部的虚拟命名空间
+
+部分后端（Samba、S3、CardDAV）在一个连接下有多个"桶/共享/集合"，通过第一层虚拟目录实现内部隔离。
+
+**Samba 多共享挂载**（[server/plugin/plg_backend_samba/index.go:35-38](server/plugin/plg_backend_samba/index.go#L35-L38)）：
+```go
+type Samba struct {
+    session *smb2.Session
+    share   map[string]*smb2.Share  // 多个共享名 → Share 句柄映射
+}
+```
+
+**Ls 方法的命名空间分发**（[server/plugin/plg_backend_samba/index.go:170-194](server/plugin/plg_backend_samba/index.go#L170-L194)）：
+```go
+func (smb Samba) Ls(path string) ([]os.FileInfo, error) {
+    // 根路径 "/" 时，返回所有可用的共享名作为虚拟子目录
+    if path == "/" {
+        f := make([]os.FileInfo, 0)
+        for key, _ := range smb.share {
+            f = append(f, File{
+                FName: key,      // "documents", "videos", "backups"...
+                FType: "directory",
+            })
+        }
+        return f, nil
+    }
+    // 非根路径，解析出共享名 + 相对路径
+    share, path, err := smb.toSambaPath(path)
+    // path = "/documents/report.pdf"
+    // → share = smb.share["documents"], path = "/report.pdf"
+    dir, err := share.Open(path)
+    return dir.Readdir(-1), nil
+}
+```
+
+**S3 多桶模式** 类似：根目录列出所有配置的 bucket，进入 bucket 后才进行实际 S3 API 调用。
+
+**命名冲突处理**：
+- Samba：共享名由服务器管理员命名，不会重名
+- S3：Bucket 名全局唯一，不会冲突
+- 如果后端列表中有两个同名共享（例如通过不同协议挂载同名目录），**无自动重命名机制**，后注册的会覆盖先注册的
+
+### 11.6 Layer 4：本地 Chroot 目录隔离
+
+TmpStorage 和 URL 下载后端为每个用户创建完全独立的文件系统根：
+
+**TmpStorage 隔离**（[server/plugin/plg_backend_tmp/index.go:13-51](server/plugin/plg_backend_tmp/index.go#L13-L51)）：
+```go
+const FILESTASH_DIRECTORY = "/tmp/filestash_tmp/"
+
+func (this TmpStorage) Init(params map[string]string, app *App) (IBackend, error) {
+    // userID 必须匹配正则 [a-zA-Z0-9]*，防止路径注入
+    if regexp.MustCompile(`^[a-zA-Z0-9]*$`).MatchString(params["userID"]) == false {
+        return nil, ErrAuthenticationFailed
+    }
+    this.userID = params["userID"]
+    // 每个 user 的 chroot = /tmp/filestash_tmp/{userID}/
+    root, err := this.fullpath("/")
+    os.MkdirAll(root, 0755)
+    return &this, nil
+}
+
+func (this TmpStorage) fullpath(path string) (string, error) {
+    // 内部通过 userID 拼接真实路径
+    p := filepath.Join(FILESTASH_DIRECTORY, this.userID, path)
+    // 二次检查是否逃逸出用户目录
+    if strings.HasPrefix(p, filepath.Join(FILESTASH_DIRECTORY, this.userID)) == false {
+        Log.Warning("plg_backend_tmp::chroot attempt to circumvent chroot via path[%s]", path)
+        return "", ErrFilesystemError
+    }
+    return p, nil
+}
+```
+
+**ChrootCache 自动清理**（[server/plugin/plg_backend_tmp/index.go:22-28](server/plugin/plg_backend_tmp/index.go#L22-L28)）：
+```go
+ChrootCache.OnEvict(func(key string, value interface{}) {
+    chroot := value.(string)
+    // 用户 30 天不活动后，自动删除其临时目录
+    if strings.HasPrefix(chroot, FILESTASH_DIRECTORY) {
+        os.RemoveAll(chroot)
+    }
+})
+```
+
+### 11.7 跨用户文件名冲突的场景分析
+
+| 场景 | 隔离机制 | 潜在风险 |
+|------|---------|---------|
+| **Local 后端多用户使用同一路径前缀** | PathBuilder HasPrefix 检查 | 若 Admin 配置 path="/data/shared/"，所有用户读写同一目录，**会有文件名冲突**。需由上层业务解决（如按用户名建子目录） |
+| **Local 后端用户 A path="/data/a/"，用户 B path="/data/b/"** | PathBuilder 独立前缀 + 系统文件权限 | 安全隔离，无冲突。但需确保 OS 级目录权限正确设置 |
+| **S3 同 bucket 不同用户** | `session["path"] = "/bucket/userA/"` | PathBuilder 前缀隔离，除非手工构造路径绕过 |
+| **Samba 同服务器不同共享** | 第一层虚拟目录（共享名）+ `toSambaPath()` 路由 | 天然隔离。跨共享 Mv 需两个共享分别 Open，由 Samba 插件内部处理 |
+| **TmpStorage 不同 userID** | 独立 Chroot 目录 `/tmp/filestash_tmp/{id}/` | 完全隔离，缓存驱逐自动清理 |
+
+### 11.8 跨后端操作的边界
+
+当前架构**不支持跨后端的文件操作**（如从 S3 直接 Mv 到 FTP）：
+
+- `Mv(from, to)` 的 `from` 和 `to` 必须在同一个 `ctx.Backend` 下
+- 跨后端传输需要前端分别调用 `Cat` 下载 + `Save` 上传
+- 因此不会出现跨后端文件名冲突问题
+
+## 12. 完整调用链示例
 
 以列出目录请求为例：
 
@@ -895,23 +1384,29 @@ FileLs 控制器
     └→ SendSuccessResultsWithMetadata(...)
 ```
 
-## 10. 相关文件速查表
+## 13. 相关文件速查表
 
 | 文件 | 职责 |
 |------|------|
 | [server/common/types.go](server/common/types.go) | `IBackend` 接口定义 |
-| [server/common/backend.go](server/common/backend.go) | `Driver` 注册中心、`Nothing` 空实现 |
+| [server/common/backend.go](server/common/backend.go) | `Driver` 注册中心、`Nothing` 空实现、降级回退 |
 | [server/common/plugin.go](server/common/plugin.go) | `Hooks` 扩展机制 |
-| [server/common/crypto.go](server/common/crypto.go) | 加密、哈希、会话 ID 生成 |
-| [server/common/constants.go](server/common/constants.go) | 密钥派生、Cookie 配置 |
+| [server/common/crypto.go](server/common/crypto.go) | AES-GCM 加密、zlib 压缩、会话 ID、Nonce 生成器 |
+| [server/common/constants.go](server/common/constants.go) | 密钥分层派生、Cookie 路径配置 |
+| [server/common/config.go](server/common/config.go) | Configuration.Initialise() 主密钥初始化 |
+| [server/common/config_state.go](server/common/config_state.go) | 配置文件加解密、configKeysToEncrypt |
 | [server/common/cache.go](server/common/cache.go) | 会话绑定缓存、并发安全 |
 | [server/common/default.go](server/common/default.go) | HTTP 客户端、TLS 标准化配置 |
-| [server/plugin/index.go](server/plugin/index.go) | 所有插件导入入口 |
-| [server/model/files.go](server/model/files.go) | `NewBackend()` 工厂函数、安全检查 |
-| [server/middleware/session.go](server/middleware/session.go) | 中间件注入 `ctx.Backend` |
-| [server/ctrl/session.go](server/ctrl/session.go) | 会话认证、Cookie 管理、安全规则 |
-| [server/ctrl/files.go](server/ctrl/files.go) | 控制器方法分发、路径约束 |
-| [server/pkg/extension/discovery.go](server/pkg/extension/discovery.go) | 外部插件发现与加载 |
-| [server/pkg/extension/adapter/runtime/](server/pkg/extension/adapter/runtime/) | Wasm 沙箱运行时 |
+| [server/plugin/index.go](server/plugin/index.go) | 所有插件导入入口（编译时链接） |
+| [server/model/files.go](server/model/files.go) | `NewBackend()` 工厂、isAllowed 配置校验 |
+| [server/middleware/session.go](server/middleware/session.go) | 中间件注入 `ctx.Backend`、会话解密 |
+| [server/ctrl/session.go](server/ctrl/session.go) | 会话认证、Cookie 分片、OAuthToken 处理 |
+| [server/ctrl/admin.go](server/ctrl/admin.go) | 管理员 Cookie 加密、Backend.Drivers() 列表 |
+| [server/ctrl/files.go](server/ctrl/files.go) | 控制器方法分发、PathBuilder 前缀约束 |
+| [server/pkg/extension/discovery.go](server/pkg/extension/discovery.go) | 外部 Wasm 插件发现与加载 |
+| [server/pkg/extension/adapter/runtime/](server/pkg/extension/adapter/runtime/) | Wasm 沙箱运行时、互斥锁保护 |
+| [server/plugin/plg_backend_local/](server/plugin/plg_backend_local/) | Local 后端实现（Admin 密码认证） |
+| [server/plugin/plg_backend_tmp/](server/plugin/plg_backend_tmp/) | TmpStorage 用户 Chroot 目录隔离 |
+| [server/plugin/plg_backend_samba/](server/plugin/plg_backend_samba/) | Samba 多共享虚拟命名空间 |
 | [server/plugin/plg_backend_*/index.go](server/plugin/) | 各后端具体实现 |
 | [go.mod](go.mod) | 外部依赖版本锁定 |
