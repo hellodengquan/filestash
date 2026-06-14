@@ -1949,3 +1949,579 @@ Phase 3: 安全加固
 | `server/model/index.go` | 33-44 | `Verification` 表定义 + 每 6 小时过期清理任务 |
 | `server/common/config.go` | 71 | `secret_key` 配置定义（轮换影响所有 Session） |
 | `server/common/constants.go` | 72-78 | SECRET_KEY 派生链（跨节点一致性核心） |
+
+---
+
+## 二十三、长期登录 Token（记住我）与刷新逻辑
+
+### 23.1 现状：单一 Cookie 有效期，无"记住我"开关
+
+**核心结论**：Filestash 不存在传统的"短期会话 Token + 长期 Refresh Token"双令牌架构，也没有"记住我"复选框。所有登录会话共享同一个 Cookie 有效期，由全局配置 `general.cookie_timeout` 统一控制。
+
+| 设计要素 | 现状 | 典型企业级实现对比 |
+|----------|------|-------------------|
+| **Session Token** | Cookie `auth`，存储完整 Session JSON 加密 | 短期 JWT（15m-2h） |
+| **Refresh Token** | 不存在 | 长期随机字符串（7d-30d），独立存储可吊销 |
+| **记住我开关** | 不存在（前端登录页无复选框） | 用户可选，勾选则延长 Refresh Token 有效期 |
+| **滑动过期** | 不存在（Cookie MaxAge 不刷新） | 每次请求刷新 token 有效期 |
+| **强制吊销** | 不存在（只能等过期或改 SECRET_KEY） | Refresh Token 黑名单 / 主动删除 |
+
+### 23.2 cookie_timeout 配置详解
+
+**定义**：`server/common/config.go:84`
+
+```go
+FormElement{
+    Name:        "cookie_timeout",
+    Type:        "number",
+    Default:     60 * 24 * 7,  // 10080 分钟 = 7 天
+    Description: "Authentication Cookie expiration in minutes. Default: 60 * 24 * 7 = 1 week",
+},
+```
+
+**设置生效点**（两处完全一致的逻辑）：
+
+1. **路径 A（直连登录）**：`ctrl/session.go:115`
+   ```go
+   MaxAge: 60 * Config.Get("general.cookie_timeout").Int(),
+   ```
+
+2. **路径 B（插件登录）**：`ctrl/session.go:479`
+   ```go
+   MaxAge: 60 * Config.Get("general.cookie_timeout").Int(),
+   ```
+
+**注意**：单位是**分钟**，但代码中还会再乘以 60 转成秒传给 MaxAge。
+- 默认值 10080 分钟 × 60 = 604800 秒 = 7 天
+- 若管理员设 1 分钟，则实际 MaxAge = 60 秒
+
+**管理员 Cookie 独立有效期**：`ctrl/admin.go:76` 中硬编码为 1 小时（3600 秒），不受 `cookie_timeout` 影响。
+
+### 23.3 服务端硬过期的兜底（365 天上限）
+
+即便 `cookie_timeout` 设得很大（比如 999999 分钟 ≈ 694 天），服务端在 `_extractSession` 中还有一层硬校验：
+
+```go
+// middleware/session.go:306-313
+t, err := time.Parse(time.RFC3339, session["timestamp"])
+if err != nil {
+    return session, ErrNotAuthorized
+}
+if time.Since(t) > time.Hour*24*365 {
+    return session, ErrNotAuthorized
+}
+```
+
+**两层过期的关系**：
+
+```
+浏览器层 (Cookie MaxAge)
+   ↓ 先到先失效
+服务端层 (timestamp + 365 天)
+```
+
+因此任何 Session Cookie 的**最大理论有效期**是 365 天，无论 `cookie_timeout` 设多大。
+
+### 23.4 无滑动刷新机制
+
+当前实现中，**Cookie MaxAge 和 timestamp 都不会在后续请求中刷新**：
+
+- `MaxAge` 在登录时写死，后续请求不更新 Cookie
+- `timestamp` 在登录时写入 JSON，后续请求不修改 session 内容
+- 因此用户无论每天多么活跃，登录 7 天后（默认）必然掉线，需要重新登录
+
+**刷新前后对比**：
+
+| 场景 | 当前行为 | 期望的滑动刷新行为 |
+|------|----------|-------------------|
+| 用户登录第 1 天 | MaxAge=604800, timestamp=T1 | MaxAge=604800, timestamp=T1 |
+| 用户第 6 天访问 | MaxAge 不变 (剩余 1 天) | MaxAge 刷新为 604800 (剩余 7 天) |
+| 用户第 7 天访问 | 强制登出 | 刷新后可继续使用 |
+
+### 23.5 SessionGet 接口与会话状态检查
+
+前端通过 `GET /api/session`（`SessionGet`，`ctrl/session.go:28-50`）轮询会话状态：
+
+```go
+type Session struct {
+    Home          *string `json:"home,omitempty"`
+    IsAuth        bool    `json:"is_authenticated"`
+    Backend       string  `json:"backendID"`
+    Authorization string  `json:"authorization,omitempty"`
+}
+
+func SessionGet(ctx *App, res http.ResponseWriter, req *http.Request) {
+    r := Session{IsAuth: false}
+    if ctx.Backend == nil {
+        SendSuccessResult(res, r)
+        return
+    }
+    home, err := model.GetHome(ctx.Backend, ctx.Session["path"])
+    if err != nil {
+        SendSuccessResult(res, r) // 后端不可达也返回未认证
+        return
+    }
+    r.IsAuth = true
+    r.Home = NewString(home)
+    r.Backend = backendID(ctx.Session)
+    // Chromecast 功能开启时返回完整 Authorization token
+    if ctx.Share.Id == "" && Config.Get("features.protection.enable_chromecast").Bool() {
+        r.Authorization = ctx.Authorization
+    }
+    SendSuccessResult(res, r)
+}
+```
+
+**关键行为**：
+- 后端连接失败（如 SFTP 服务端重启）会导致 `IsAuth=false`，前端自动跳转登录页
+- 这是**被动的**会话检查，不是主动的 token 刷新
+- `backendID` 由 `GenerateID(ctx.Session)` 计算（见下一章）
+
+### 23.6 可实现的刷新机制扩展方案
+
+基于现有基础设施，可按以下方式增加"记住我"和 token 刷新能力：
+
+#### 方案 A：基于 Session 内容的滑动刷新（最小改动）
+
+```go
+// 在 SessionGet 或 SessionStart 中增加:
+if time.Since(t) > time.Hour*24*6 { // 距离过期不足 1 天
+    // 刷新 timestamp
+    session["timestamp"] = time.Now().Format(time.RFC3339)
+    s, _ := json.Marshal(session)
+    obfuscate, _ := EncryptString(SECRET_KEY_DERIVATE_FOR_USER, string(s))
+    // 重新分片写入 Cookie
+    for index := 0; ; index++ {
+        http.SetCookie(res, &http.Cookie{
+            Name:   CookieName(index),
+            Value:  obfuscate[index*3800 : end],
+            MaxAge: 60 * Config.Get("general.cookie_timeout").Int(),
+            // ...
+        })
+    }
+}
+```
+
+**缺点**：每次刷新都会重写所有 Cookie 分片，带宽开销较大。
+
+#### 方案 B：双令牌架构（标准 Refresh Token）
+
+```
+Phase 1: 登录时下发
+  ├─ Access Token: Cookie (HttpOnly, 15m)
+  └─ Refresh Token: 独立 Cookie (HttpOnly, 7d, 仅 /api/session/refresh 路由可见)
+
+Phase 2: 正常 API 调用
+  → 仅携带 Access Token
+
+Phase 3: Access Token 过期 → 前端收到 401
+  → 后台自动 POST /api/session/refresh
+  → 服务端验证 Refresh Token（查 Redis 白名单）
+  → 签发新的 Access Token + 可选轮换 Refresh Token
+  → 返回 200，前端重试原请求
+```
+
+**需新增**：
+- `POST /api/session/refresh` 路由
+- Refresh Token 存储（Redis 白名单，支持主动吊销）
+- 前端 axios 拦截器处理 401 → 自动刷新 → 重试原请求
+
+#### 方案 C："记住我"复选框支持
+
+在 `SessionAuthenticate` 和 `SessionAuthMiddleware` 中增加分支：
+
+```go
+rememberMe := ctx.Body["remember_me"].(bool)
+if rememberMe {
+    maxAge = 60 * 60 * 24 * 30 // 30 天
+} else {
+    maxAge = 60 * Config.Get("general.cookie_timeout").Int()
+}
+// 同时在 session JSON 中写入 remember_me 标志，用于服务端策略判断
+```
+
+---
+
+## 二十四、登录设备管理：活跃会话与远程注销
+
+### 24.1 现状：无设备概念，无法远程注销
+
+**核心结论**：Filestash 开源版**不存在设备管理能力**。没有活跃会话列表、没有设备指纹、没有远程注销功能。管理员无法查看谁在线，也无法踢掉某个设备。
+
+| 能力 | 现状 | 说明 |
+|------|------|------|
+| 活跃会话列表 | ✗ | 无服务端 Session 存储，无法统计 |
+| 设备指纹 | 仅 `GenerateID`，非设备维度 | 按 Session 参数哈希，用于插件索引 |
+| 远程注销指定设备 | ✗ | 无 Session ID 机制，无法定位特定会话 |
+| 全局强制所有用户登出 | Δ | 改 SECRET_KEY 可实现，但代价太大 |
+| 多端登录提示 | ✗ | 无设备数量限制和冲突检测 |
+
+### 24.2 GenerateID：Session 身份标识（非设备标识）
+
+`GenerateID` (`common/crypto.go:193-218`) 创建一个可区分不同 Session 的唯一 ID：
+
+```go
+func GenerateID(params map[string]string) string {
+    orderedKeys := make([]string, len(params))
+    for key := range params {
+        orderedKeys = append(orderedKeys, key)
+    }
+    sort.Strings(orderedKeys)
+    p := ""
+    for _, key := range orderedKeys {
+        switch key {
+        case "password", "path", "session", "timestamp":
+            // 忽略敏感和易变字段
+        default:
+            if val := params[key]; val != "" {
+                p += key + "=>" + params[key] + ", "
+            }
+        }
+    }
+    if p == "" { return "na" }
+    p += "salt=>" + SECRET_KEY
+    return Hash(p, 20) // SHA1 截断前 20 字符
+}
+```
+
+**计算逻辑**（按字母序拼接非敏感字段 + SECRET_KEY → 哈希）：
+- 拼接顺序按 key 字母序，确保 map 遍历不确定时结果一致
+- 排除字段：`password`（敏感）、`path`（用户 chroot 不影响身份）、`session`（扩展字段）、`timestamp`（时间戳每次不同）
+- 加盐：SECRET_KEY，防止彩虹表反向推导凭据
+
+**使用场景**：
+- `plg_widget_recent`：按 `GenerateID` 存储最近访问文件（`backend_id` 维度）
+- `plg_widget_favourite`：按 `GenerateID` 存储收藏夹
+- `plg_widget_description`：按 `GenerateID` 存储文件描述
+- `SessionGet`：返回 `backendID` 字段供前端使用
+
+**关键局限**：
+- 同一用户在不同设备用**相同凭据**登录 → **相同** `GenerateID`
+  - 因为两者的 `username`、`hostname`、`type` 等字段完全相同
+- 同一用户在不同设备用**不同凭据**登录 → **不同** `GenerateID`
+  - 但这是凭据的不同，不是设备的不同
+- `GenerateID` 不是设备 ID，无法区分"用户 A 的手机"和"用户 A 的笔记本"
+
+### 24.3 backendID 辅助函数
+
+`backendID` (`ctrl/session.go:129-137`) 对 `GenerateID` 做了简单包装：
+
+```go
+func backendID(session map[string]string) string {
+    id := GenerateID(session)
+    if id == "na" {
+        if session["type"] != "" {
+            return session["type"]
+        }
+        return ""
+    }
+    return id
+}
+```
+
+若 Session 中所有字段都是排除字段（如 passthrough 模式），返回 `type` 作为兜底。
+
+### 24.4 无 Session 列表的根本原因
+
+Session 完全存储在**客户端 Cookie** 中，服务端不维护任何 Session 注册表：
+
+```
+[客户端]                [服务端]
+  auth Cookie → 解密 → Session JSON
+                          ↓
+                    业务逻辑处理
+                          ↓
+                    响应返回
+                          ↓
+              (不存任何 Session 状态)
+```
+
+没有集中式的 Session 存储 → 没有活跃会话列表 → 无法远程注销。
+
+### 24.5 设备管理扩展方案
+
+要实现设备管理，需要引入**服务端 Session 注册表**：
+
+#### Phase 1：引入 Session ID + 设备指纹
+
+```
+登录时生成:
+  ├─ Session ID: 32 位随机字符串
+  ├─ 设备指纹: Hash(User-Agent + IP + 可选客户端生成的 device_id)
+  └─ 设备名称: 从 UA 解析 ("Chrome on macOS", "Safari on iOS" 等)
+```
+
+在 Session JSON 中新增字段：
+```go
+session["sid"] = "a1b2c3..."      // Session ID，每个设备唯一
+session["device_name"] = "Chrome on macOS"
+session["device_fp"] = "d4e5f6..." // 设备指纹
+```
+
+#### Phase 2：服务端 Session 注册表（Redis）
+
+```go
+// 存储结构: Hash
+redis.HSet("sessions:"+userHash, sessionID, `{
+    "sid": "...",
+    "device_name": "...",
+    "device_fp": "...",
+    "login_time": "2026-06-14T10:00:00Z",
+    "last_seen": "2026-06-14T10:30:00Z",
+    "ip": "192.168.1.100",
+    "user_agent": "Mozilla/5.0 ...",
+    "is_current": false
+}`)
+
+// 每个 Session 单独设置 TTL = cookie_timeout
+redis.Expire("sessions:"+userHash+":"+sessionID, cookieTimeout)
+```
+
+#### Phase 3：活跃会话列表 API
+
+```
+GET /admin/api/sessions?user=<email>
+  ├─ 中间件: AdminOnly
+  ├─ 查询 Redis: HGETALL sessions:<userHash>
+  ├─ 遍历比对当前请求的 sid，标记 is_current=true
+  └─ 返回 Session 列表 JSON
+```
+
+#### Phase 4：远程注销 API
+
+```
+DELETE /admin/api/sessions?sid=<session_id>
+  ├─ 中间件: AdminOnly
+  ├─ 校验 session_id 属于哪个用户
+  ├─ redis.HDel("sessions:"+userHash, sessionID)
+  ├─ redis.Del("revoke:"+sessionID)
+  ├─ 在黑名单中加入 session_id (TTL = cookie_timeout)
+  └─ 返回 200 OK
+
+// 在 SessionStart 中间件增加吊销检查:
+if redis.Exists("revoke:"+session["sid"]).Val() == 1 {
+    return session, ErrNotAuthorized
+}
+```
+
+#### Phase 5：用户级自助设备管理（可选）
+
+```
+GET /api/sessions → 当前用户所有设备列表
+DELETE /api/sessions/:sid → 用户自己注销其他设备
+```
+
+### 24.6 全局强制登出的两种路径
+
+| 方式 | 操作 | 影响范围 | 代价 |
+|------|------|----------|------|
+| **改 SECRET_KEY** | 修改 `general.secret_key` 配置 | 所有用户所有设备立刻掉线（解密失败） | 所有共享链接失效、所有需要重新登录 |
+| **Redis 清理**（需改造） | `FLUSHDB` 或批量删除 `sessions:*` + 写入全局 `revoke_all` 标记 | 所有用户所有设备掉线 | 共享链接不受影响（不走 Session 注册表） |
+
+---
+
+## 二十五、管理员模拟用户登录（Impersonation）链路
+
+### 25.1 现状：无原生 Impersonation 能力
+
+**核心结论**：Filestash 开源版**不存在管理员模拟用户登录**的功能。没有 `actAs` 或 `sudo` 模式，管理员无法直接切换到用户视角排查问题。
+
+| 能力 | 现状 | 说明 |
+|------|------|------|
+| 管理员切换到用户视角 | ✗ | 无 API，无 UI |
+| Impersonation 审计日志 | ✗ | 无操作追踪 |
+| 模拟状态标识（"正在以 XX 身份操作"） | ✗ | 无 UI 提示 |
+| 退出模拟返回管理员身份 | ✗ | 无入口 |
+| 禁止模拟特定用户 | ✗ | 无权限控制 |
+
+### 25.2 为什么需要 Impersonation
+
+典型业务场景：
+1. **故障排查**：用户报告某个后端连接不上 / 文件看不到 → 管理员以用户身份登录复现
+2. **配置验证**：管理员修改了 IdP 属性映射 → 以测试用户身份登录验证
+3. **内容审核**：检查某个用户的文件操作是否合规
+4. **客服支持**：远程协助用户完成操作
+
+### 25.3 基于现有架构的 Impersonation 实现方案
+
+需要新增一条独立的管理员路由，通过 AdminOnly 校验后直接生成目标用户的 Session Cookie。
+
+#### Phase 1：新增 Impersonation API 路由
+
+```go
+// routes.go 新增:
+admin.HandleFunc("/impersonate", NewMiddlewareChain(AdminImpersonate,
+    []Middleware{ApiHeaders, AdminOnly, SecureOrigin, PluginInjector})).Methods("POST")
+```
+
+#### Phase 2：`AdminImpersonate` 处理函数（核心逻辑）
+
+```go
+func AdminImpersonate(ctx *App, res http.ResponseWriter, req *http.Request) {
+    // 1. 校验管理员身份 (已由 AdminOnly 中间件保证)
+
+    // 2. 提取目标用户标识
+    targetEmail := ctx.Body["email"].(string)
+    targetBackend := ctx.Body["backend"].(string) // 可选，指定模拟哪个后端
+
+    // 3. 从对应认证插件获取目标用户的完整 Session 数据
+    var session map[string]string
+    var err error
+
+    switch Config.Get("middleware.identity_provider.type").String() {
+    case "local":
+        // 从 local 插件的 users 数组中查找
+        users := loadUsers() // 复用 plg_authenticate_local 的 loadUsers
+        for _, u := range users {
+            if u.Email == targetEmail {
+                session = map[string]string{
+                    "username": u.Email,
+                    "user":     u.Email,
+                    "role":     u.Role,
+                    "bcrypt":   u.Password,
+                    "type":     targetBackend, // 需要管理员指定后端类型
+                    // 注意: 无法获取用户明文密码，passthrough 后端不可行
+                }
+                break
+            }
+        }
+    case "ldap", "openid", "saml":
+        // 企业版 IdP：查询用户属性映射模板，模拟渲染
+        // 或者通过 API 从 IdP 获取用户属性
+    default:
+        SendErrorResult(res, NewError("Impersonation not supported for this IdP", 405))
+        return
+    }
+
+    if session == nil {
+        SendErrorResult(res, NewError("User not found", 404))
+        return
+    }
+
+    // 4. 补齐 Session 系统字段
+    session["timestamp"] = time.Now().Format(time.RFC3339)
+    if session["path"] == "" {
+        session["path"] = "/"
+    }
+    // 关键: 增加 impersonation 标记，用于审计和识别
+    session["impersonated_by"] = "admin"
+    session["impersonated_at"] = time.Now().Format(time.RFC3339)
+    session["impersonated_from_ip"] = req.RemoteAddr
+
+    // 5. 加密写入 Cookie（复用 SessionAuthenticate 的分片逻辑）
+    s, _ := json.Marshal(session)
+    obfuscate, _ := EncryptString(SECRET_KEY_DERIVATE_FOR_USER, string(s))
+    // ... 分片写入 Cookie (同 ctrl/session.go:107-117)
+
+    // 6. 审计日志
+    Log.Stdout(fmt.Sprintf(
+        "AUDIT action[impersonate] admin=%s target=%s ip=%s",
+        GetUserFromAdminToken(ctx), targetEmail, req.RemoteAddr,
+    ))
+
+    // 7. 返回成功
+    SendSuccessResult(res, map[string]interface{}{
+        "status": "ok",
+        "redirect": "/",
+    })
+}
+```
+
+#### Phase 3：Impersonation 状态的 UI 识别
+
+前端通过 `GET /api/session` 检测 session 中的 `impersonated_by` 字段，在页面顶部显示蓝色提示条：
+```
+"您正在以 user@example.com 身份操作 | 退出模拟"
+```
+
+"退出模拟"按钮调用新 API `POST /admin/impersonate/stop`，清除当前 Cookie 并重新签发管理员 Cookie。
+
+#### Phase 4：审计增强
+
+在所有操作的审计日志中增加 `impersonated_by` 字段：
+```
+AUDIT action[ls] path=/Docs impersonated_by=admin@example.com user=user@example.com
+```
+
+### 25.4 安全约束与边界
+
+Impersonation 是高权限操作，必须有严格的安全约束：
+
+| 约束 | 实现方式 |
+|------|----------|
+| **仅超级管理员可使用** | AdminOnly 中间件确保只有管理员能调用 |
+| **无法获取用户明文密码** | 对于 passthrough 后端（需要明文密码连接 SFTP），模拟时需要额外指定密码或使用匿名访问 |
+| **Session 中保留模拟标记** | `impersonated_by` 字段永久保留在该 Session 中，无法伪造清除 |
+| **审计不可抵赖** | 所有操作日志记录模拟者身份 |
+| **操作隔离** | 模拟期间不允许修改管理员配置、不允许调用 `DELETE /admin/api/session`（修改管理员密码） |
+| **禁止模拟其他管理员** | 目标用户 role == "admin" 时拒绝操作 |
+| **模拟 Session 短期有效** | Impersonation 的 Session MaxAge 固定 1 小时，不继承全局 cookie_timeout |
+| **密码哈希不可复用** | local 插件存储的是 bcrypt 哈希，模拟登录时如果后端需要密码验证（如 passthrough），需要特殊处理（见下） |
+
+### 25.5 不同认证插件的 Impersonation 实现差异
+
+| 插件 | 模拟可行性 | 实现要点 |
+|------|-----------|----------|
+| `local` | 高 | 从 users 数组读取用户属性，构造 session。但 bcrypt 哈希不能当明文密码用 |
+| `admin` | N/A | 管理员自身就是超级用户，不需要模拟 |
+| `passthrough` | 低 | 需要明文密码才能连接后端，管理员不知道用户密码 → 只能用于不需要凭证的后端 |
+| `htpasswd` | 中 | 只读读取 htpasswd 文件，同 local 只有哈希 |
+| `wordpress` | 中 | 通过 XML-RPC 重新获取用户，但需要用户密码 |
+| `ldap` (企业版) | 高 | LDAP 管理员绑定后可读取任何用户属性，属性映射模板可正常渲染 |
+| `openid` / `saml` (企业版) | 高 | 管理员可使用 Client Credentials Flow 获取目标用户的 token，或通过 IdP 管理员 API 模拟 |
+
+### 25.6 关键难点：密码哈希 vs 明文密码
+
+local 插件的用户密码是 bcrypt 哈希，无法还原为明文。这导致：
+
+- ✅ **本地虚拟后端**：type=local（不需要连接外部服务）→ 可直接模拟
+- ✅ **已知凭据后端**：S3 / AzureBlob 等在属性映射中硬编码凭据 → 可模拟
+- ❌ **passthrough 后端**：需要用户明文密码连接 SFTP/FTP → 无法模拟（除非管理员额外输入密码）
+- ❌ **用户特定 OAuth 后端**：用户自己的 OAuth token 不在 IdP 存储 → 无法模拟
+
+### 25.7 退出模拟（Stop Impersonation）
+
+需要提供 `POST /admin/impersonate/stop` API：
+
+```go
+func AdminStopImpersonate(ctx *App, res http.ResponseWriter, req *http.Request) {
+    // 1. 清除用户 auth Cookie 分片
+    for index := 0; ; index++ {
+        if _, err := req.Cookie(CookieName(index)); err != nil {
+            break
+        }
+        http.SetCookie(res, &http.Cookie{
+            Name:   CookieName(index),
+            Value:  "",
+            MaxAge: -1,
+            Path:   COOKIE_PATH,
+        })
+    }
+    // 2. 管理员 Session 本身仍然有效（admin Cookie 未被清除）
+    // 3. 返回重定向到 /admin
+    // 4. 审计日志
+    Log.Stdout(fmt.Sprintf("AUDIT action[impersonate_stop] admin=%s ip=%s", ...))
+}
+```
+
+---
+
+## 二十六、补充代码索引（四）
+
+| 文件 | 行号 | 职责 |
+|------|------|------|
+| `server/common/config.go` | 84 | `cookie_timeout` 配置定义（默认 7 天，单位分钟） |
+| `server/ctrl/session.go` | 21-26 | `Session` 响应结构体（IsAuth / Backend / Authorization） |
+| `server/ctrl/session.go` | 28-50 | `SessionGet` — 前端轮询会话状态接口 |
+| `server/ctrl/session.go` | 115 | 路径 A Cookie MaxAge 设置（`cookie_timeout` × 60） |
+| `server/ctrl/session.go` | 479 | 路径 B Cookie MaxAge 设置（同上） |
+| `server/ctrl/session.go` | 129-137 | `backendID` — GenerateID 包装函数 |
+| `server/ctrl/admin.go` | 16-45 | `AdminSessionGet` — 管理员登录态检查 |
+| `server/ctrl/admin.go` | 76 | 管理员 Cookie MaxAge 硬编码 1 小时（3600 秒） |
+| `server/middleware/session.go` | 306-313 | Session timestamp 硬过期校验（365 天上限） |
+| `server/common/crypto.go` | 193-218 | `GenerateID` — Session 身份哈希（排除 password/path/session/timestamp） |
+| `server/common/crypto.go` | 220-240 | `GenerateMachineID` — 服务器机器标识（/etc/machine-id 等） |
+| `server/plugin/plg_widget_recent/index.go` | 22,32,75,83 | `GenerateID` + `getUser` 用于最近文件索引 |
+| `server/plugin/plg_widget_favourite/index.go` | 73-83 | `GenerateID` 用于收藏夹索引 |
+| `server/plugin/plg_widget_description/handler.go` | 54 | `GenerateID` 用于文件描述索引 |
+| `server/plugin/plg_authenticate_local/service.go` | 12-67 | `loadUsers` / `saveUsers` — local 插件用户数据读写（Impersonation 依赖） |
