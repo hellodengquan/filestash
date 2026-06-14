@@ -2010,7 +2010,482 @@ go func() {
 | **自定义指标** | 插件自行实现 | 通过 `Hooks.Register.Middleware()` 添加 |
 | **告警** | 无内置 | 基于日志/追踪数据在外部系统配置 |
 
-## 15. 完整调用链示例
+## 15. 插件 Panic 恢复策略与崩溃隔离机制
+
+### 15.1 三层崩溃隔离架构
+
+Filestash 通过**三层**隔离机制防止单点插件崩溃影响整体服务：
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Layer 1: HTTP 请求级 recover                         │
+│   Telemetry 中间件 recover() 捕获 handler 级 panic  │
+│   → 返回 500 错误，不影响其他请求                     │
+├──────────────────────────────────────────────────────┤
+│ Layer 2: 后台 goroutine 级 recover                   │
+│   搜索爬虫、索引器等后台 goroutine 自行 recover      │
+│   → 记录错误日志，单个任务失败不影响守护进程         │
+├──────────────────────────────────────────────────────┤
+│ Layer 3: Wasm 沙箱隔离                               │
+│   外部扩展插件运行在 Wasm 沙箱中                     │
+│   → 沙箱崩溃不影响宿主进程                           │
+└──────────────────────────────────────────────────────┘
+```
+
+### 15.2 Layer 1：HTTP 请求级 Panic 恢复
+
+Telemetry 中间件中的 `RequestID` 生成使用 recover 防御，定义于 [server/middleware/telemetry.go:72-81](server/middleware/telemetry.go#L72-L81)：
+
+```go
+RequestID: func() string {
+    defer func() string {
+        if r := recover(); r != nil {
+            return "oops"  // 防止生成 RequestID 时 panic
+        }
+        return "null"
+    }()
+    return res.Header().Get("X-Request-ID")
+}(),
+```
+
+**请求级 recover 的缺失**：
+- 核心 HTTP handler 链没有全局 panic recovery 中间件
+- 存储后端方法 panic 会直接导致进程崩溃（除非插件自行 recover）
+- 建议在生产环境通过 `runtime/debug.SetPanicOnFault(false)` 或外部 supervisor 保护
+
+### 15.3 Layer 2：后台 Goroutine 级恢复
+
+搜索爬虫等长生命周期 goroutine 在每个任务中都有 recover 保护。
+
+**SQLite FTS 爬虫示例**（[server/plugin/plg_search_sqlitefts/crawler/daemon.go:140-151](server/plugin/plg_search_sqlitefts/crawler/daemon.go#L140-L151)）：
+
+```go
+defer func() {
+    // recover from panic if one occurred.
+    if r := recover(); r != nil {
+        name := "na"
+        for _, el := range crawlerBackend.LoginForm().Elmnts {
+            if el.Name == "type" {
+                name = el.Value.(string)
+            }
+        }
+        Log.Error("plg_search_sqlitefs::panic backend=\"%s\" recover=\"%s\"", name, r)
+    }
+}()
+heap.Push(&s.FoldersUnknown, &Document{...})
+```
+
+**恢复策略**：
+- 仅记录错误日志，不重试
+- 爬虫守护进程继续运行，等待下一个任务
+- 单个后端的索引失败不影响其他后端的索引
+
+**NFS4 客户端恢复**（[server/plugin/plg_backend_nfs4/repo/nfs4/client.go:173](server/plugin/plg_backend_nfs4/repo/nfs4/client.go#L173)）：
+- NFS RPC 调用层有多个 recover 点，防止协议错误导致进程崩溃
+- 恢复后将 panic 转换为 error 返回给上层
+
+### 15.4 Layer 3：Wasm 沙箱崩溃隔离
+
+外部扩展插件运行在 Wazero Wasm 沙箱中，定义于 [server/pkg/extension/adapter/runtime/runtime.go:13-55](server/pkg/extension/adapter/runtime/runtime.go#L13-L55)：
+
+```go
+type Runtime struct {
+    wrt wazero.Runtime
+    ctx context.Context
+    mu  sync.Mutex      // 互斥锁保护并发调用
+    mod api.Module
+}
+
+func (r *Runtime) Call(ctx context.Context, fnName string, key, val any) error {
+    r.mu.Lock()          // 串行调用，防止并发崩溃
+    defer r.mu.Unlock()
+    fn := r.mod.ExportedFunction(fnName)
+    _, err := fn.Call(...)
+    return err  // Wasm 陷阱以 error 形式返回，不 panic
+}
+```
+
+**沙箱安全边界**：
+- Wasm 陷阱（trap）以 error 形式返回，不导致 Go 进程 panic
+- 每个插件有独立的 Runtime 实例，互不影响
+- 沙箱无法直接访问宿主内存、文件系统、网络
+- 插件加载失败仅影响该插件，不阻塞主程序启动
+
+### 15.5 Bad Cookie 恢复机制
+
+`RecoverFromBadCookie` 处理 Cookie 格式异常导致的解密失败，定义于 [server/common/recovery.go:7-21](server/common/recovery.go#L7-L21)：
+
+```go
+func RecoverFromBadCookie(res http.ResponseWriter) {
+    Log.Debug("common::recovery exec=RecoverFromBadCookie")
+    http.SetCookie(res, &http.Cookie{
+        Name:     "auth",
+        Value:    "",
+        MaxAge:   -1,      // 删除无效 Cookie
+        HttpOnly: true,
+        SameSite: http.SameSiteStrictMode,
+        Path:     WithBase("/api/"),
+        Secure:   false,
+    })
+}
+```
+
+**触发场景**：
+- 2024/10 Canary 版本变更 Cookie 格式后，旧版本用户 Cookie 无法解密
+- 用户手动篡改 Cookie 导致解密失败
+- 主密钥轮换后所有 Session 失效
+
+**恢复策略**：
+- 静默删除无效 Cookie
+- 用户下一次请求表现为未登录状态
+- 不影响服务可用性
+
+### 15.6 Panic 影响范围总结
+
+| 组件 | 崩溃方式 | 是否影响全局 | 恢复机制 |
+|------|---------|-------------|---------|
+| **主 HTTP handler** | panic 直接崩溃 | ✅ 是（进程退出） | 无（依赖 supervisor） |
+| **存储后端 Init()** | panic 导致登录失败 | ❌ 否（仅该会话） | 无（用户需重新登录） |
+| **存储后端 Ls/Cat 等** | panic 导致请求失败 | ❌ 否（仅该请求） | 无（用户重试） |
+| **搜索爬虫 goroutine** | panic 导致索引失败 | ❌ 否（仅该次爬取） | defer recover + 日志 |
+| **Wasm 插件调用** | trap 转为 error | ❌ 否（仅该调用） | Wasm 沙箱 |
+| **Session 解密失败** | 返回 error | ❌ 否（仅该用户） | RecoverFromBadCookie |
+| **外部 Wasm 插件加载失败** | 跳过该插件 | ❌ 否（仅该插件） | 日志 + continue |
+
+**运营注意事项**：
+- 核心存储后端插件的 panic 会导致请求失败，部分场景可能导致进程崩溃
+- 建议在生产环境使用 systemd/supervisor 进行进程守护和自动重启
+- 关键插件升级前需在预发环境充分压测
+- 通过 `DEBUG=true` 可启用 pprof 调试端点（`/debug/pprof/`）
+
+## 16. 插件升级的版本化策略与请求中转
+
+### 16.1 静态资源版本化：BUILD_REF 机制
+
+所有前端静态资源和插件前端文件通过 `BUILD_REF`（构建哈希）进行版本化，定义于 [server/routes.go:100-104](server/routes.go#L100-L104)：
+
+```go
+// 带版本号的插件静态资源（缓存友好）
+r.HandleFunc(WithBase("/assets/"+BUILD_REF+"/plugin/{name}.zip/{path:.+}"), 
+    NewMiddlewareChain(PluginStaticHandler, middlewares)).Methods("GET", "OPTIONS", "HEAD")
+
+// 带版本号的核心静态资源
+r.PathPrefix(WithBase("/assets/"+BUILD_REF)).Handler(
+    http.HandlerFunc(NewMiddlewareChain(ServeFile("/"), middlewares))).Methods("GET", "OPTIONS")
+
+// 不带版本号的回退路径（兼容旧链接）
+r.PathPrefix(WithBase("/assets/")).Handler(
+    http.HandlerFunc(NewMiddlewareChain(ServeFile("/"), middlewares))).Methods("GET", "OPTIONS")
+```
+
+**版本号生成**（[server/generator/constants.go:28](server/generator/constants.go#L28)）：
+```go
+BUILD_REF = "<git_commit_hash_or_build_id>"
+```
+
+**缓存策略**：
+- `BUILD_REF` 路径资源 → 长缓存（immutable），浏览器永久缓存
+- 非版本路径 → 短缓存或协商缓存，保证升级后立即生效
+- ETag 由 `base + BUILD_REF + LICENSE + signature` 计算
+
+### 16.2 插件前端的版本化分发
+
+外部插件的前端文件也通过 `BUILD_REF` 路径分发，定义于 [server/routes.go:100-101](server/routes.go#L100-L101)：
+
+```
+/assets/{BUILD_REF}/plugin/{plugin_name}.zip/{path}
+```
+
+**双路径兼容**：
+- `/assets/{BUILD_REF}/plugin/{name}.zip/{path}` → 版本化路径，缓存友好
+- `/assets/plugin/{name}.zip/{path}` → 无版本路径，用于动态加载
+
+**升级时的缓存失效**：
+- 新版本发布后，`BUILD_REF` 变化 → 所有静态资源 URL 变化 → 浏览器重新加载
+- 旧版本缓存的插件前端代码会在用户刷新页面后自动失效
+- 无需手动清除浏览器缓存
+
+### 16.3 配置热更新：OnConfig 钩子
+
+配置变更通过 `OnConfig` 钩子通知所有插件，无需重启服务，定义于 [server/common/plugin.go:286-294](server/common/plugin.go#L286-L294)：
+
+```go
+var configChange []func()
+
+func (this Register) OnConfig(fn func()) {
+    configChange = append(configChange, fn)
+}
+
+func (this Get) OnConfig() []func() {
+    return configChange
+}
+```
+
+**触发时机**（[server/common/config.go:213-217](server/common/config.go#L213-L217)）：
+```go
+func (this *Configuration) Load() error {
+    // ... 读取并解析配置文件 ...
+    this.cache.Clear()
+    Log.SetVisibility(this.Get("log.level").String())
+    for _, fn := range Hooks.Get.OnConfig() {
+        fn()  // 通知所有订阅了配置变更的插件
+    }
+    return nil
+}
+```
+
+**典型 OnConfig 用例**：
+- `plg_widget_favourite`：重新加载收藏夹配置
+- `plg_widget_description`：重新加载描述配置
+- `plg_widget_chat`：重新加载聊天配置
+- `plg_editor_codemirror`：重新加载编辑器配置
+
+### 16.4 升级时的请求中转：无原生支持
+
+**重要结论：Filestash 没有原生的插件热替换和请求中转机制。**
+
+| 升级场景 | 处理方式 | 影响 |
+|---------|---------|------|
+| **静态资源升级** | `BUILD_REF` 版本化 + 浏览器缓存失效 | 用户刷新页面后生效，无中断 |
+| **后端插件逻辑升级** | 重新编译 + 进程重启 | 服务中断，依赖连接池重建 |
+| **配置变更** | OnConfig 钩子热更新 | 无感，现有连接不受影响 |
+| **外部 Wasm 插件升级** | 无热替换，需重启服务 | 服务中断 |
+| **缓存的后端连接** | 重启后全部失效，自动重建 | 用户首次请求稍慢 |
+
+### 16.5 多版本共存的替代方案
+
+虽然没有原生的新旧版本共存机制，但可通过以下方式实现类似效果：
+
+#### 方案 1：配置级多后端实例
+通过 Admin 配置多个同类型后端连接，用户可选择不同配置：
+```
+connections:
+  - type: s3
+    name: "S3 (v1 - 稳定)"
+    bucket: legacy-bucket
+  - type: s3
+    name: "S3 (v2 - 新版)"
+    bucket: new-bucket
+```
+用户在登录时选择不同配置，实现"软多版本"。
+
+#### 方案 2：部署级多实例
+部署两个版本的 Filestash 实例，通过反向网关分流：
+```
+用户 → 反向代理 → filestash-v1 (旧版)
+              ↘ filestash-v2 (新版，金丝雀)
+```
+通过 Cookie 或权重实现灰度发布。
+
+#### 方案 3：配置回滚
+`config.json` 是纯文本文件，升级失败时可回滚配置并触发 `OnConfig`：
+```bash
+# 备份配置
+cp state/config/config.json state/config/config.json.bak
+
+# 升级后出问题，回滚配置
+cp state/config/config.json.bak state/config/config.json
+# 配置文件被 watcher 检测到变更后自动 Reload 并触发 OnConfig
+```
+
+## 17. 插件生命周期钩子：启动、关闭与健康检查
+
+### 17.1 完整生命周期时间线
+
+插件生命周期贯穿服务启动到退出的全过程：
+
+```
+服务启动
+    ↓
+init() 阶段（按 import 顺序）
+    ↓ 注册所有接口，无副作用
+extension.Discovery()
+    ↓ 发现并加载外部 Wasm 插件
+workflow.Init()
+    ↓ 初始化工作流引擎
+Onload 回调（按注册顺序）
+    ↓ 数据库初始化、后台服务启动
+HTTP 端点注册
+    ↓ 注册插件自定义路由
+Starter 启动
+    ↓ 监听端口，服务对外
+... 正常运行 ...
+    ↓ SIGTERM / SIGINT
+Starter 停止
+    ↓ 关闭监听，停止接受新请求
+OnQuit 回调（按注册顺序逆序？）
+    ↓ 资源清理、连接关闭
+进程退出
+```
+
+### 17.2 Onload：启动后钩子
+
+定义于 [server/common/plugin.go:268-275](server/common/plugin.go#L268-L275)：
+
+```go
+var afterload []func()
+
+func (this Register) Onload(fn func()) {
+    afterload = append(afterload, fn)
+}
+
+func (this Get) Onload() []func() {
+    return afterload
+}
+```
+
+**执行时机**（[cmd/main.go:34-36](cmd/main.go#L34-L36)）：
+```go
+for _, fn := range Hooks.Get.Onload() {
+    fn()  // 在 Starter 启动前执行
+}
+```
+
+**典型 Onload 用例**：
+
+| 插件 | Onload 操作 |
+|------|-----------|
+| plg_widget_recent | 创建 recents 数据表 |
+| plg_widget_favourite | 创建 favourites 数据表 |
+| plg_widget_description | 创建 descriptions 数据表 |
+| plg_widget_chat | 创建 chat 数据表 |
+| plg_video_thumbnail | 检查 ffmpeg 依赖 |
+| plg_starter_http2 | 检查 TLS 证书配置 |
+| plg_search_sqlitefts | 启动索引爬虫守护进程 |
+| plg_security_svg | 注册 SVG 安全过滤器 |
+| plg_editor_onlyoffice | 配置 OnlyOffice 连接器 |
+| plg_handler_mcp | 注册 MCP 工具 |
+
+**执行顺序**：按 `Hooks.Register.Onload()` 的调用顺序，即插件 `init()` 中的注册顺序。
+
+### 17.3 OnQuit：退出前钩子
+
+定义于 [server/common/plugin.go:277-284](server/common/plugin.go#L277-L284)：
+
+```go
+var onquit []func()
+
+func (this Register) OnQuit(fn func()) {
+    onquit = append(onquit, fn)
+}
+
+func (this Get) OnQuit() []func() {
+    return onquit
+}
+```
+
+**执行时机**（[cmd/main.go:47-49](cmd/main.go#L47-L49)）：
+```go
+Hooks.Get.Starter()(withSignal(), router)  // Starter 返回即服务停止
+for _, fn := range Hooks.Get.OnQuit() {    // 执行退出清理
+    fn()
+}
+```
+
+**信号处理**（[cmd/main.go:60-69](cmd/main.go#L60-L69)）：
+```go
+func withSignal() context.Context {
+    ctx, cancel := context.WithCancel(context.Background())
+    go func() {
+        quit := make(chan os.Signal, 1)
+        signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+        <-quit    // 等待终止信号
+        cancel()   // 取消 context，通知所有组件退出
+    }()
+    return ctx
+}
+```
+
+**典型 OnQuit 场景**：
+- 关闭数据库连接
+- 刷新写入缓存
+- 停止后台 goroutine
+- 上报退出事件
+
+**注意**：
+- 按注册顺序执行（不是逆序）
+- 没有超时限制，插件需自行确保快速退出
+- panic 会导致退出清理中断，插件应自行 recover
+
+### 17.4 OnConfig：配置变更钩子
+
+运行时配置变更的热更新机制，定义于 [server/common/config.go:215-217](server/common/config.go#L215-L217)：
+
+```go
+for _, fn := range Hooks.Get.OnConfig() {
+    fn()  // 配置加载/变更时调用
+}
+```
+
+**触发场景**：
+1. 服务启动时 `Config.Load()` → 第一次调用
+2. 管理员修改配置并保存 → `Config.Save()` → 重新加载 → 触发
+3. 配置文件被外部修改后被检测到
+
+### 17.5 健康检查：HealthHandler
+
+`/healthz` 端点提供服务健康状态，定义于 [server/ctrl/report.go:30-129](server/ctrl/report.go#L30-L129)：
+
+**三项检查**：
+
+| 检查项 | 方法 | 失败状态码 |
+|--------|------|-----------|
+| **配置文件可读** | `os.OpenFile` 读取 config.json | 500 |
+| **服务自连通** | HTTP GET `/about` 端点自检 | 500 |
+| **配置完整性** | 检查 secret_key 长度=16、admin 密码 bcrypt 长度=60 | 503 |
+
+**检查流程**：
+```go
+// CHECK 1: 打开配置文件
+file, err := os.OpenFile(GetAbsolutePath(CONFIG_PATH, "config.json"), ...)
+if err != nil { return 500, "fopen_error" }
+
+// CHECK 2: 自连通测试
+r, err := http.Get("http://127.0.0.1:{port}/about")
+if err == nil && !slices.Contains([]int{200, 404}, r.StatusCode) {
+    return 500, "endpoint_error"
+}
+
+// CHECK 3: 配置完整性校验
+if len(secret_key) != 16 || len(admin_password) != 60 {
+    return 503, "configuration_error"  // 服务不可用
+}
+
+// 全部通过 → 200 OK
+return 200, `{"status": "pass"}`
+```
+
+**无插件级健康检查**：
+- 健康检查仅覆盖核心服务和配置
+- 没有 `Hooks.Healthcheck()` 之类的插件健康检查钩子
+- 单个后端插件故障不会导致 `/healthz` 返回失败
+
+### 17.6 调试端点：DebugRoutes
+
+`DEBUG=true` 环境变量启用 pprof 调试端点，定义于 [server/routes.go:127-142](server/routes.go#L127-L142)：
+
+```go
+func DebugRoutes(r *mux.Router) {
+    r.HandleFunc("/debug/pprof/", pprof.Index)
+    r.HandleFunc("/debug/pprof/profile", pprof.Profile)
+    r.HandleFunc("/debug/pprof/heap", pprof.Handler("heap"))
+    r.HandleFunc("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+    r.HandleFunc("/debug/pprof/allocs", pprof.Handler("allocs"))
+    // ... 更多 pprof 端点
+    r.HandleFunc("/debug/free", func(w http.ResponseWriter, r *http.Request) {
+        debug.FreeOSMemory()  // 手动触发 GC 和内存释放
+        w.Write([]byte("DONE"))
+    })
+}
+```
+
+**性能调优用途**：
+- 分析插件内存泄漏：`/debug/pprof/heap`
+- 分析 goroutine 泄漏：`/debug/pprof/goroutine`
+- CPU 性能分析：`/debug/pprof/profile?seconds=30`
+- 阻塞分析：`/debug/pprof/block`
+
+## 18. 完整调用链示例
 
 以列出目录请求为例：
 
@@ -2042,16 +2517,17 @@ Telemetry 中间件
     └→ Log.Stdout("HTTP 200 GET 123.4ms /api/ls?path=/documents")
 ```
 
-## 16. 相关文件速查表
+## 19. 相关文件速查表
 
 | 文件 | 职责 |
 |------|------|
 | [server/common/types.go](server/common/types.go) | `IBackend`、`IAuthorisation`、`IAuditPlugin` 接口定义 |
 | [server/common/backend.go](server/common/backend.go) | `Driver` 注册中心、`Nothing` 空实现、降级回退 |
-| [server/common/plugin.go](server/common/plugin.go) | `Hooks` 扩展机制、Onload/OnQuit/Workflow 排序 |
+| [server/common/plugin.go](server/common/plugin.go) | `Hooks` 扩展机制、Onload/OnQuit/OnConfig/Workflow 排序 |
+| [server/common/recovery.go](server/common/recovery.go) | Bad Cookie 恢复机制 |
 | [server/common/crypto.go](server/common/crypto.go) | AES-GCM 加密、zlib 压缩、会话 ID、Nonce 生成器 |
-| [server/common/constants.go](server/common/constants.go) | 密钥分层派生、Cookie 路径配置 |
-| [server/common/config.go](server/common/config.go) | Configuration.Initialise() 主密钥初始化 |
+| [server/common/constants.go](server/common/constants.go) | 密钥分层派生、Cookie 路径配置、BUILD_REF |
+| [server/common/config.go](server/common/config.go) | Configuration.Load/Save、OnConfig 触发、主密钥初始化 |
 | [server/common/config_state.go](server/common/config_state.go) | 配置文件加解密、configKeysToEncrypt |
 | [server/common/cache.go](server/common/cache.go) | 会话绑定缓存、并发安全 |
 | [server/common/default.go](server/common/default.go) | HTTP 客户端、TLS 标准化配置、超时设置 |
@@ -2060,19 +2536,23 @@ Telemetry 中间件
 | [server/model/permissions.go](server/model/permissions.go) | CanRead/CanEdit/CanUpload 粗粒度权限 |
 | [server/model/audit.go](server/model/audit.go) | SimpleAudit 默认实现、AuditForm 查询表单 |
 | [server/middleware/session.go](server/middleware/session.go) | 中间件注入 `ctx.Backend`、会话解密 |
-| [server/middleware/telemetry.go](server/middleware/telemetry.go) | HTTP 请求性能监控、日志输出、遥测上报 |
+| [server/middleware/telemetry.go](server/middleware/telemetry.go) | HTTP 请求性能监控、日志输出、遥测上报、RequestID recover |
 | [server/pkg/tracer/](server/pkg/tracer/) | 分布式追踪框架（OpenTracing 兼容） |
 | [server/ctrl/session.go](server/ctrl/session.go) | 会话认证、Cookie 分片、OAuthToken、登录登出审计 |
 | [server/ctrl/admin.go](server/ctrl/admin.go) | 管理员 Cookie 加密、Backend.Drivers()、/audit 端点 |
 | [server/ctrl/files.go](server/ctrl/files.go) | 控制器方法分发、授权中间件调用、PathBuilder |
+| [server/ctrl/report.go](server/ctrl/report.go) | /healthz 健康检查、/report 上报、/.well-known 端点 |
+| [server/ctrl/static.go](server/ctrl/static.go) | 静态资源服务、BUILD_REF 版本化、ETag 计算 |
 | [server/plugin/plg_backend_sftp/tracing.go](server/plugin/plg_backend_sftp/tracing.go) | SFTP 全操作追踪埋点（装饰器模式） |
 | [server/plugin/plg_backend_s3/utils.go](server/plugin/plg_backend_s3/utils.go) | S3 HTTP RoundTripper 追踪埋点 |
 | [server/plugin/plg_authorisation_example/](server/plugin/plg_authorisation_example/) | 授权中间件示例（审计日志+权限控制） |
+| [server/plugin/plg_search_sqlitefts/crawler/daemon.go](server/plugin/plg_search_sqlitefts/crawler/daemon.go) | 搜索爬虫 panic 恢复示例 |
 | [server/pkg/extension/discovery.go](server/pkg/extension/discovery.go) | 外部 Wasm 插件发现与加载、失败隔离 |
-| [server/pkg/extension/adapter/runtime/](server/pkg/extension/adapter/runtime/) | Wasm 沙箱运行时、互斥锁保护 |
+| [server/pkg/extension/adapter/runtime/](server/pkg/extension/adapter/runtime/) | Wasm 沙箱运行时、互斥锁保护、trap 转 error |
 | [server/plugin/plg_backend_local/](server/plugin/plg_backend_local/) | Local 后端实现（Admin 密码认证） |
 | [server/plugin/plg_backend_tmp/](server/plugin/plg_backend_tmp/) | TmpStorage 用户 Chroot 目录隔离 |
 | [server/plugin/plg_backend_samba/](server/plugin/plg_backend_samba/) | Samba 多共享虚拟命名空间 |
 | [server/plugin/plg_backend_*/index.go](server/plugin/) | 各后端具体实现 |
-| [cmd/main.go](cmd/main.go) | 主程序启动流程、Onload 执行顺序、Starter 依赖检查 |
+| [server/routes.go](server/routes.go) | 路由注册、Debug pprof 端点、静态资源版本化 |
+| [cmd/main.go](cmd/main.go) | 主程序启动流程、Onload/OnQuit 执行、信号处理、Starter 依赖 |
 | [go.mod](go.mod) | 外部依赖版本锁定 |
