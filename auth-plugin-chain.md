@@ -866,3 +866,455 @@ if err != nil || attributes != v {
 | `server/plugin/plg_authenticate_local/auth.go` | 83-238 | local 插件 MFA 完整流程 (EntryPoint + Callback) |
 | `server/plugin/plg_authenticate_local/auth.go` | 240-267 | `withMFA` / `EncryptedString` — MFA 暂存加解密 |
 | `server/ctrl/session.go` | 361-391 | SSO State 签名校验 |
+
+---
+
+## 十五、登录限流与暴力破解防护
+
+### 15.1 多层限流体系
+
+Filestash 的暴力破解防护不是单一措施，而是由多个独立层叠加形成纵深防御：
+
+```
+请求进入
+  │
+  ├─ 层 1: 全局令牌桶限流 (RateLimiter)
+  │   └─ 10 req/s, burst 1000, 全局共享
+  │
+  ├─ 层 2: 管理员登录故意延迟 (AdminSessionAuthenticate)
+  │   └─ 每次尝试固定 sleep 1.5s
+  │
+  ├─ 层 3: 来源校验 (SecureOrigin)
+  │   └─ Host 头 + X-Requested-With 校验
+  │
+  ├─ 层 4: 扫描器陷阱 (plg_security_scanner)
+  │   └─ 已知攻击路径返回反制内容
+  │
+  └─ 层 5: Syncthing Basic Auth 延迟
+      └─ 认证失败时 sleep 1s
+```
+
+### 15.2 全局令牌桶限流 (RateLimiter)
+
+- **实现**：`server/middleware/http.go:107-121`
+- **算法**：`golang.org/x/time/rate` 令牌桶，`rate.NewLimiter(10, 1000)`
+- **参数**：每秒 10 个令牌，突发容量 1000
+- **作用域**：**全局单一实例** — 所有 IP、所有用户共享同一个 limiter
+- **拦截行为**：返回 `429 Too Many Requests`
+- **日志**：`Log.Warning("middleware::http::ratelimit too many requests")`
+
+**限流在路由链中的位置**：
+
+| 路由 | 是否有 RateLimiter | 说明 |
+|------|-------------------|------|
+| `POST /api/session` (直连登录) | ✓ | 路径 A 核心登录入口 |
+| `GET/POST /api/session/auth/` (插件登录) | ✗ | 路径 B 仅经过 ApiHeaders + SecureHeaders + PluginInjector |
+| `POST /admin/api/session` (管理员登录) | ✓ | 管理员入口有独立限流 |
+| 其他 API 路由 | 视路由而定 | `/api/share`、`/api/files` 等需要 SessionStart 的路由不含限流 |
+
+> **注意**：路径 B (`/api/session/auth/`) 的中间件链中**没有 RateLimiter**，这意味着 SSO/插件登录不受全局令牌桶保护。如果 IdP 外部回调量大，理论上可以无限次触发 `plugin.Callback()`。
+
+### 15.3 管理员登录的故意延迟
+
+`AdminSessionAuthenticate` (`server/ctrl/admin.go:47-84`) 在执行任何密码校验之前强制等待 1.5 秒：
+
+```go
+func AdminSessionAuthenticate(ctx *App, res http.ResponseWriter, req *http.Request) {
+    // Step 1: Deliberatly make the request slower to make hacking attempt harder for the attacker
+    time.Sleep(1500 * time.Millisecond)
+
+    // Step 2: Make sure current user has appropriate access
+    admin := Config.Get("auth.admin").String()
+    // ... bcrypt 校验 ...
+}
+```
+
+- **作用**：将管理员密码暴力破解的速率限制在约 0.67 次/秒
+- **不影响普通用户登录**：仅 `/admin/api/session` POST 走此逻辑
+- **配合管理员令牌有效期**：`AdminToken` 有效期仅 24 小时 (`common/token.go:19`)，Cookie MaxAge 仅 1 小时 (`admin.go:76`)，即使窃取也很快失效
+
+### 15.4 来源校验作为辅助防护
+
+`SecureOrigin` (`server/middleware/http.go:79-105`) 拦截不合法的跨域请求：
+
+1. **Host 校验**：`req.Host` 必须与 `general.host` 配置一致
+   - 不匹配时：`Log.Error("Request coming from ... was blocked")` + 返回 403
+   - `/admin/` 路径下仅 Warning 不拦截（管理台可能通过不同域名访问）
+2. **XHR 校验**：请求必须携带 `X-Requested-With: XmlHttpRequest` 头
+   - 豁免：API 模式 (`features.api.enable=true`) 且无 Cookie 的请求
+   - 不满足时：`Log.Warning("Intrusion detection: %s - %s", IP, URL)` + 返回 403
+
+这一层实际上阻止了：
+- 大多数自动化脚本（不带 XHR 头的 curl/wget）
+- Host 头注入攻击
+- 跨域表单提交（浏览器不发 XHR 头的 `<form>` POST）
+
+### 15.5 Syncthing 认证延迟
+
+`plg_handler_syncthing` 的 `AuthBasic` 函数 (`server/plugin/plg_handler_syncthing/index.go:84-91`) 在 Basic Auth 失败时 sleep 1 秒：
+
+```go
+var notAuthorised = func(res http.ResponseWriter, req *http.Request) {
+    time.Sleep(1 * time.Second)
+    res.Header().Set("WWW-Authenticate", `Basic realm="User protect", charset="UTF-8"`)
+    res.WriteHeader(http.StatusUnauthorized)
+    // ...
+}
+```
+
+### 15.6 WebDAV 黑名单（非 IP 黑名单）
+
+`WebdavBlacklist` (`server/ctrl/webdav.go:67-134`) 是**文件名黑名单**，非 IP 黑名单。它在 WebDAV 共享链接链路 (`/s/{share}`) 中过滤 macOS 系统垃圾文件：
+
+- **PUT/MKCOL 拦截**：`._*`、`.DS_Store`、`.localized` → 405 Method Not Allowed
+- **PROPFIND 拦截**：上述 + `.ql_disablethumbnails`、`.ql_disablecache`、`.hidden`、`.Spotlight-V100`、`.metadata_never_index`、`Contents` 等 → 403 Forbidden
+
+### 15.7 安全扫描器陷阱 (plg_security_scanner)
+
+`plg_security_scanner` (`server/plugin/plg_security_scanner/index.go`) 注册了大量已知攻击路径的 handler，当扫描器触达这些路径时：
+
+1. **记录攻击**：`Log.Info("Attack attempt %s %s %s", IP, URL, UserAgent)`
+2. **随机反制**（概率分布）：
+   - 5%：返回空响应，Content-Length 虚报 1000
+   - 5%：返回十亿级大小的 XML（Billion Laughs Attack 反制）
+   - 15%：返回 gzip 炸弹（10MB 解压为 10GB）
+   - 10%：重定向回攻击者自身 IP
+   - 5%：返回死循环 JS
+   - 其余：XML 炸弹 / 伪装 JSON / geo 协议重定向
+
+**配置开关**：`features.protection.enable`（默认 true）
+
+### 15.8 当前防护的局限与缺失
+
+| 层面 | 现状 | 风险 |
+|------|------|------|
+| IP 黑名单 | **不存在** | 无法封禁持续攻击的 IP |
+| 按 IP 限流 | **不存在** | RateLimiter 全局共享，单 IP 可耗尽配额 |
+| 按 用户/账号 限流 | **不存在** | 单个邮箱可无限次尝试登录 |
+| 登录失败计数 | **不存在** | 无"第 N 次失败后锁定"机制 |
+| CAPTCHA | **不存在** | 无法区分人与机器 |
+| 路径 B 限流 | **不存在** | `/api/session/auth/` 链路无 RateLimiter |
+
+> Filestash 当前的暴力破解防护主要依赖**延迟 + 校验**策略，而非**计数 + 封禁**策略。这在低流量场景下够用，但在公网暴露的高价值目标面前存在明显短板。
+
+---
+
+## 十六、CSRF / 跨域请求保护与鉴权链的协同
+
+### 16.1 CSRF 防护机制全景
+
+Filestash 不使用传统 CSRF Token，而是采用三层替代方案：
+
+```
+跨域请求进入
+  │
+  ├─ 层 1: Cookie SameSite=Strict
+  │   └─ 浏览器级：跨站请求不携带 Cookie
+  │
+  ├─ 层 2: SecureOrigin XHR 头校验
+  │   └─ 服务端级：无 X-Requested-With 头 → 403
+  │
+  └─ 层 3: Cookie HttpOnly=true
+      └─ 浏览器级：JS 无法读取 Cookie 内容
+```
+
+### 16.2 Cookie SameSite 策略的分支逻辑
+
+`applyCookieRules()` (`server/ctrl/session.go:489-502`) 根据是否启用 iframe 嵌入模式，选择不同的 SameSite 策略：
+
+```
+features.protection.iframe 配置
+  │
+  ├─ 为空（默认，未启用 iframe）
+  │   └─ SameSite: Strict
+  │       HttpOnly: true
+  │       → 浏览器禁止跨站请求携带此 Cookie
+  │       → 等效于 CSRF Token 的防护效果
+  │
+  └─ 非空（启用了 iframe 嵌入，值为允许的 origin）
+      ├─ Referer 是 https:// 开头？
+      │   ├─ 是 → SameSite: None
+      │   │       Secure: true
+      │   │       Partitioned: true (CHIPS)
+      │   │       → 允许跨站携带 Cookie（iframe 场景必须）
+      │   │       → 依赖 Partitioned 隔离不同顶级站点
+      │   └─ 否 → SameSite: Strict (降级)
+      │            + Log.Warning("non secure origin + iframe enabled")
+      └─ 同时在响应中设置 bearer header:
+          res.Header().Set("bearer", obfuscate)
+          → iframe 通过 URL fragment 传递 #bearer=xxx
+```
+
+**iframe 模式下的特殊认证传递**：
+
+当 `features.protection.iframe` 启用时，登录成功后除了设置 Cookie，还通过两种方式传递 token：
+
+1. **响应 Header**：`res.Header().Set("bearer", obfuscate)` — 供 JS 读取
+2. **重定向 URL Fragment**：`redirectURI += "#bearer=" + obfuscate` — 供 iframe 父页面读取
+
+### 16.3 三类路由的 CORS/CSRF 策略差异
+
+| 路由类别 | CORS 策略 | CSRF 防护 | 典型路由 |
+|----------|-----------|-----------|----------|
+| **公共只读 API** | `PublicCORS`: `Access-Control-Allow-Origin: *` | 无 Cookie 无需防护 | `/api/config`、`/api/backend`、`/api/plugin`、静态资源 |
+| **用户认证 API** | 无 CORS 头 | SameSite=Strict + XHR 校验 | `/api/session`、`/api/session/auth/` |
+| **管理员 API** | 无 CORS 头 | SameSite=Strict + AdminOnly 中间件 | `/admin/api/config`、`/admin/api/session` |
+
+### 16.4 PublicCORS 中间件
+
+`PublicCORS` (`server/middleware/http.go:35-47`) 仅用于**不需要 Cookie** 的公共端点：
+
+```go
+func PublicCORS(fn HandlerFunc) HandlerFunc {
+    header.Set("Access-Control-Allow-Origin", "*")
+    header.Set("Access-Control-Allow-Headers", "x-requested-with, x-request-id")
+    if req.Method == http.MethodOptions {
+        header.Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+        res.WriteHeader(http.StatusNoContent)
+        return // OPTIONS 预检请求直接返回
+    }
+    fn(ctx, res, req)
+}
+```
+
+**使用场景**：`/api/config`（前端获取公共配置）、`/api/plugin`（获取插件列表）、`/report`（用户反馈提交）、静态资源。
+
+这些端点返回的是不涉及用户数据的信息，允许任何来源读取，因此 `Access-Control-Allow-Origin: *` 是安全的。
+
+### 16.5 插件级 CORS — Site 和 MCP
+
+#### Site 插件 (plg_handler_site)
+
+`cors()` 中间件 (`server/plugin/plg_handler_site/middleware.go:12-32`) 提供受控 CORS：
+
+- 配置项：`features.site.cors_allow_origins`
+- 值为 `*`：允许所有来源
+- 值为逗号分隔域名列表：仅允许匹配的 Origin
+- 用于 `/public/{share}/` 路由，允许外部站点通过 JS API 嵌入 Filestash 共享文件
+
+#### MCP 插件 (plg_handler_mcp)
+
+`WithCORS()` (`server/plugin/plg_handler_mcp/utils/cors.go:9-16`) 提供 MCP 协议所需的 CORS：
+
+```go
+w.Header().Set("Access-Control-Allow-Origin", "*")
+w.Header().Set("Access-Control-Allow-Headers", "mcp-protocol-version, Content-Type, Authorization")
+```
+
+MCP 端点（`/sse`、`/messages`）通过 `Authorization` 头传递 token，不依赖 Cookie，因此 `Allow-Origin: *` 不会造成 CSRF 风险。
+
+### 16.6 SecureOrigin 与 CSRF 的协同
+
+`SecureOrigin` 实际上承担了 CSRF 防护的核心职责。它的判断逻辑确保：
+
+1. **浏览器发起的带 Cookie 请求**：必须带 `X-Requested-With: XmlHttpRequest` 头
+   - 跨站 `<form>` POST 不带此头 → 被拦截
+   - `fetch()` 跨域请求受 SameSite Cookie 限制 → Cookie 不发送 → 后续 SessionStart 失败
+2. **API 客户端（无 Cookie）**：`features.api.enable=true` 且请求无 Cookie → 放行
+   - API 客户端使用 `Authorization: Bearer` 头认证，不依赖 Cookie
+3. **Host 校验**：防止 DNS 重绑定攻击（攻击者控制 DNS 指向自身服务器，但 Host 头不匹配）
+
+### 16.7 X-Frame-Options 与 Clickjacking 防护
+
+`IndexHeaders` (`server/middleware/http.go:49-65`) 设置：
+
+- `features.protection.iframe` 为空时：`X-Frame-Options: DENY` — 禁止任何 iframe 嵌入
+- `features.protection.iframe` 非空时：不设置 X-Frame-Options — 允许指定 origin 的 iframe 嵌入
+- `Referrer-Policy: same-origin` — 阻止 Referrer 泄漏到外部
+
+---
+
+## 十七、账号锁定与解锁路径
+
+### 17.1 现有锁定机制：local 插件的 Disabled 字段
+
+`plg_authenticate_local` 的 `User` 模型 (`server/plugin/plg_authenticate_local/index.go:24-32`) 包含 `Disabled bool` 字段：
+
+```go
+type User struct {
+    Email    string `json:"email"`
+    Password string `json:"password"`
+    Role     string `json:"role,omitempty"`
+    Disabled bool   `json:"disabled,omitempty"`
+    Code     string `json:"-"`
+    MFA      string `json:"mfa,omitempty"`
+}
+```
+
+**锁定检测** (`auth.go:185-194`)：
+
+```go
+if users[i].Disabled == true {
+    http.SetCookie(res, &http.Cookie{
+        Name:   "flash",
+        Value:  "Account is disabled",
+        MaxAge: 1,
+        Path:   "/",
+    })
+    Log.Warning("plg_authentication_simple::auth action=authenticate email=%s err=disabled", users[i].Email)
+    return nil, ErrAuthenticationFailed
+}
+```
+
+**关键特征**：
+- 锁定检查在密码校验**之后**、MFA 校验**之前**
+- 这意味着即使密码正确，Disabled 账号也无法登录
+- 日志明确区分了"密码错误"和"账号禁用"（后者有专门的 Warning）
+- 用户看到的提示是"Account is disabled"，而非"Invalid password"
+
+### 17.2 锁定/解锁操作路径
+
+账号的锁定与解锁完全由管理员通过 `/admin/api/simple-user-management` 端点操作：
+
+```
+管理员操作锁定:
+  POST /admin/api/simple-user-management
+  ├─ 中间件: AdminOnly (验证管理员 Cookie/Token)
+  ├─ 表单参数: email=xxx&password=xxx&role=xxx&disabled=on
+  ├─ updateUser() 执行:
+  │   ├─ 定位用户 (by email)
+  │   ├─ 更新 Disabled = true
+  │   └─ saveUsers() → 序列化为 JSON → 写入 middleware.identity_provider.params.db
+  └─ 返回 303 重定向
+
+管理员操作解锁:
+  POST /admin/api/simple-user-management?email=xxx
+  ├─ 表单参数: disabled 不传 (checkbox 未勾选 = Disabled = false)
+  └─ 同上流程，Disabled = false
+
+管理员删除用户:
+  DELETE /admin/api/simple-user-management?email=xxx
+  └─ removeUser() → 从数组中移除 → saveUsers()
+```
+
+### 17.3 用户数据存储与持久化
+
+local 插件的所有用户数据（包括 Disabled 状态）存储在**配置文件**而非数据库中：
+
+```
+用户数据流:
+  ┌──────────────────────────────────────┐
+  │ middleware.identity_provider.params   │  ← JSON 配置字符串
+  │ {                                    │
+  │   "type": "local",                   │
+  │   "mfa": "TOTP",                     │
+  │   "db": "[                           │
+  │     {\"email\":\"a@b.com\",          │
+  │      \"password\":\"$2a$...\",        │
+  │      \"disabled\":false,             │
+  │      \"mfa\":\"JBSWY3DPEHPK3PXP\"},  │
+  │     ...                              │
+  │   ]"                                 │
+  │ }                                    │
+  └──────────────┬───────────────────────┘
+                 │ savePluginData()
+                 ▼
+  ┌──────────────────────────────────────┐
+  │ state/config/config.json             │  ← 磁盘持久化
+  └──────────────────────────────────────┘
+```
+
+`savePluginData()` (`server/plugin/plg_authenticate_local/data.go:31-42`) 通过 `Config.Get(...).Set(string(b))` 将修改写回配置系统，配置系统负责持久化到磁盘。
+
+### 17.4 自动锁定：当前不存在
+
+当前代码中**没有**基于失败次数的自动锁定机制。以下是整个登录链中不存在的行为：
+
+| 期望行为 | 是否存在 | 说明 |
+|----------|----------|------|
+| 连续 N 次失败后自动锁定账号 | ✗ | local 插件仅检查 `Disabled` 静态字段 |
+| 连续 N 次失败后临时封禁 IP | ✗ | RateLimiter 不按 IP 区分 |
+| 锁定后自动解锁（超时） | ✗ | 只有管理员手动解锁 |
+| 锁定后通知用户 | ✗ | 仅管理员可见日志 |
+| 登录失败计数器 | ✗ | 无任何计数逻辑 |
+
+### 17.5 运营介入流程
+
+当需要通过运营手段处理账号安全事件时，当前可用的操作路径：
+
+#### 场景 1：用户账号被攻击者尝试暴力破解
+
+```
+1. 运营查看日志:
+   GET /admin/api/log  (AdminOnly)
+   → 检索 access.log 中的 "failed authentication" 和 "AUDIT action[fail]" 条目
+
+2. 当前能做的:
+   - 修改 auth.admin 密码（如果是管理员账号被攻击）
+   - 在 IdP 侧修改用户密码（local 插件: 管理页面重置密码）
+   - 禁用被攻击账号（设置 Disabled=true）
+
+3. 当前做不到的:
+   - 封禁攻击者 IP
+   - 限制单 IP 登录频率
+   - 查看结构化的登录失败统计
+```
+
+#### 场景 2：用户忘记密码 / 账号被锁定
+
+```
+1. 用户无法自行解锁:
+   - 没有自助"忘记密码"功能
+   - 没有"联系管理员"入口
+
+2. 运营解锁路径:
+   管理员访问 /admin/simple-user-management
+   ├─ 查找用户 → 修改密码 (POST)
+   ├─ 或: 取消勾选 disabled (POST)
+   └─ 可选: 发送邀请邮件 (仅新用户创建时自动触发)
+
+3. 密码重置:
+   - 管理员在用户管理页面设置新密码
+   - 新密码经 bcrypt 哈希后存储
+   - 若邮件配置完整，可通过自定义 notification 模板通知用户
+```
+
+#### 场景 3：管理员账号被入侵
+
+```
+1. 紧急措施:
+   - 修改 auth.admin 配置（修改管理员密码哈希）
+   - 需要直接编辑 state/config/config.json 或通过环境变量
+
+2. AdminToken 失效:
+   - AdminToken 有效期 24 小时 (token.go:19)
+   - Cookie MaxAge 1 小时 (admin.go:76)
+   - 修改密码后旧 token 仍有效直到过期（无主动吊销机制）
+   - SECRET_KEY 变更会使所有现有 token 失效（密钥派生链断裂）
+```
+
+### 17.6 审计日志的运营可用性
+
+管理员可通过两种方式查看安全事件：
+
+1. **原始日志**：`GET /admin/api/log` — 返回 `state/log/access.log` 的纯文本内容
+   - 包含所有 `AUDIT action[fail/login/logout]` 条目
+   - 无结构化查询能力
+2. **审计插件**：`GET /admin/api/audit` — 调用 `IAuditPlugin.Query()`
+   - 默认实现 `SimpleAudit` 返回"需要安装审计插件"的提示
+   - 企业版可提供按用户/IP/时间/操作的结构化审计查询
+
+---
+
+## 十八、补充代码索引（二）
+
+| 文件 | 行号 | 职责 |
+|------|------|------|
+| `server/middleware/http.go` | 35-47 | `PublicCORS` — 公共端点 CORS 中间件 |
+| `server/middleware/http.go` | 79-105 | `SecureOrigin` — Host 校验 + XHR 来源校验 |
+| `server/middleware/http.go` | 107-121 | `RateLimiter` — 全局令牌桶限流 |
+| `server/ctrl/admin.go` | 47-84 | `AdminSessionAuthenticate` — 管理员登录 (含 1.5s 延迟) |
+| `server/ctrl/session.go` | 489-502 | `applyCookieRules` — Cookie SameSite/Secure/Partitioned 分支 |
+| `server/ctrl/session.go` | 504-507 | `applyCookieSameSiteRule` — SSO Cookie SameSite 覆写 |
+| `server/ctrl/webdav.go` | 67-134 | `WebdavBlacklist` — WebDAV macOS 垃圾文件过滤 |
+| `server/common/token.go` | 11-35 | `AdminToken` 结构与有效期校验 |
+| `server/common/constants.go` | 11-18 | Cookie 名称/路径常量 |
+| `server/plugin/plg_security_scanner/index.go` | 21-264 | 扫描器陷阱 — 攻击路径注册与反制 |
+| `server/plugin/plg_handler_site/middleware.go` | 12-48 | Site 插件 CORS + BasicAuth 中间件 |
+| `server/plugin/plg_handler_site/config.go` | 44-56 | Site CORS 配置 (`features.site.cors_allow_origins`) |
+| `server/plugin/plg_handler_mcp/utils/cors.go` | 9-16 | MCP 插件 CORS 中间件 |
+| `server/plugin/plg_handler_syncthing/index.go` | 84-91 | Syncthing Basic Auth 延迟 |
+| `server/plugin/plg_authenticate_local/index.go` | 24-32 | `User` 结构体 (含 Disabled/MFA 字段) |
+| `server/plugin/plg_authenticate_local/service.go` | 12-67 | 用户 CRUD (createUser/updateUser/removeUser) |
+| `server/plugin/plg_authenticate_local/data.go` | 18-52 | 插件配置读写 + isEnabled 检查 |
+| `server/plugin/plg_authenticate_local/notify.go` | 32-71 | 邀请邮件发送 (sendInvitateMail) |
