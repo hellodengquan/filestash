@@ -1387,7 +1387,471 @@ hls.attachMedia($video);
 
 ---
 
-## 十四、关键代码索引
+## 十四、Service Worker 离线缓存
+
+> **注意**：截至当前代码，SW 路由已注册但前端未主动 `navigator.serviceWorker.register()`，仅在全局错误兜底时调用 `unregister()` 清理旧 SW。预留了 `/sw.js` 路由（`server/routes.go:105`）指向 `ServeFile("/assets/")`，但仓库中无 `public/assets/sw.js` 源文件。以下分析现有 SW 基础设施和预留设计。
+
+### 14.1 SW 路由注册
+
+**位置**：`server/routes.go:105`
+
+```go
+r.HandleFunc(WithBase("/sw.js"), http.HandlerFunc(NewMiddlewareChain(ServeFile("/assets/"), middlewares))).Methods("GET")
+```
+
+将 `/sw.js` 映射到静态文件服务器根目录 `/assets/`，使得 SW 能被部署到网站根路径从而获得最大作用域。
+
+### 14.2 错误兜底：SW 清理机制
+
+**位置**：`public/assets/boot/ctrl_boot_frontoffice.js:57-63`
+
+`window.onerror` 全局错误处理中包含 SW 清理逻辑：
+
+```javascript
+window.onerror = function(msg, url, lineNo, colNo, error) {
+    report(msg, error, url, lineNo, colNo);
+    $error(msg);
+    if ("serviceWorker" in navigator) navigator.serviceWorker
+        .getRegistrations()
+        .then((registrations) => {
+            for (const registration of registrations) {
+                registration.unregister();
+            }
+        });
+};
+```
+
+**设计意图**：如果旧版本 SW 导致错误，自动注销所有注册，防止离线缓存的旧版本代码持续引发问题。
+
+### 14.3 现有离线策略现状
+
+当前项目**未启用主动 SW 注册**，离线能力依赖：
+1. 浏览器标准 HTTP 缓存（Cache-Control / ETag / Last-Modified）
+2. 服务端 Session 级文件缓存（`file_cache`，见第十三章）
+3. 视频 HLS.js 客户端缓冲（20s）
+
+---
+
+## 十五、Range 请求分段处理详解
+
+Filestash 完整实现 RFC 7233 HTTP Range Request，支持大文件（视频、PDF、音频）的**渐进式下载**。核心在 `FileCatHandler`（`server/ctrl/files.go:193`）。
+
+### 15.1 处理流程全景
+
+```
+客户端: Range: bytes=1048576-2097151
+    │
+    ▼
+┌─ ① needToCreateCache 判断 ─────────────┐
+│   if Range 头存在 && 后端不支持 Seek?     │
+│     是 → ② 下载整个文件到 tmp 缓存        │
+│     否 → ④ 直接使用后端 ReadSeeker       │
+└───────────────┬─────────────────────────┘
+                │
+                ▼
+┌─ ③ 解析 Range 头 ─────────────────────┐
+│   支持多段: bytes=0-100,200-300         │
+│   支持省略端点: bytes=-500 (尾部500B)   │
+│   ranges = [[1048576, 2097151]]         │
+└───────────────┬─────────────────────────┘
+                │
+                ▼
+┌─ ⑤ 响应设置 ─────────────────────────┐
+│   Accept-Ranges: bytes                 │
+│   Content-Range: bytes 1048576-2097151/10485760 │
+│   Content-Length: 1048576              │
+│   HTTP 206 Partial Content             │
+└───────────────┬─────────────────────────┘
+                │
+                ▼
+┌─ ⑥ 流式分块输出 ─────────────────────┐
+│   Seek(range[0][0])                   │
+│   io.LimitReader + io.CopyBuffer       │
+│   缓冲区: 32KB / 128KB / 2MB (可配)    │
+└───────────────────────────────────────┘
+```
+
+### 15.2 后端 Seek 适配策略（步骤 ①~②）
+
+```go
+// files.go:316-358
+if req.Header.Get("range") != "" && needToCreateCache == true {
+    if obj, ok := file.(io.Seeker); ok == true {
+        // 策略1：原生支持 Seek（如本地文件系统）
+        size, _ := obj.Seek(0, io.SeekEnd)
+        obj.Seek(0, io.SeekStart)
+        contentLength = size
+    } else {
+        // 策略2：不支持 Seek（S3/FTP/SFTP 等）→ 完整下载到本地 tmp
+        tmpPath := GetAbsolutePath(TMP_PATH, "file_"+QuickString(20)+".dat")
+        f, _ := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE, os.ModePerm)
+        file_cache.Set(ctx.Session, tmpPath)  // 注册到 5 分钟 Session 缓存
+        io.Copy(f, file)
+        f.Sync()
+        f.Close()
+        file.Close()
+        f, _ = os.OpenFile(tmpPath, os.O_RDONLY, os.ModePerm)
+        // 后续所有 Range 请求都走本地缓存文件
+    }
+}
+```
+
+**关键设计**：`needToCreateCache` 在以下情况被设为 `true`：
+- 请求携带 `range` 头（`files.go:268-270`）
+- 即便是首次 Range 请求，对不支持 Seek 的后端也只下载一次
+
+### 15.3 Range 头解析（步骤 ③）
+
+```go
+// files.go:360-383
+ranges := make([][]int64, 0)
+for _, r := range strings.Split(strings.TrimPrefix(req.Header.Get("range"), "bytes="), ",") {
+    r = strings.TrimSpace(r)
+    sides := strings.Split(r, "-")
+    if start, err = strconv.ParseInt(sides[0], 10, 64); err != nil || start < 0 {
+        start = 0  // 非法/缺失起点 → 从 0 开始
+    }
+    if end, err = strconv.ParseInt(sides[1], 10, 64); err != nil || end < start {
+        end = contentLength - 1  // 非法/缺失终点 → 文件末尾
+    }
+    ranges = append(ranges, []int64{start, end})
+}
+```
+
+**支持的 Range 格式**：
+- `bytes=0-1023`：第 1 个 1KB
+- `bytes=1024-`：从 1024 到末尾
+- `bytes=-500`：最后 500 字节
+- `bytes=0-100,200-300`：多段（当前代码只取 `ranges[0]`，其余丢弃）
+
+> **注意**：当前实现只响应**第一段 Range**（`ranges[0]`），不返回 `multipart/byteranges`。
+
+### 15.4 响应输出（步骤 ⑤~⑥）
+
+```go
+// files.go:412-438
+header.Set("Accept-Ranges", "bytes")
+
+if f, ok := file.(io.ReadSeeker); ok && len(ranges) > 0 {
+    if _, err = f.Seek(ranges[0][0], io.SeekStart); err == nil {
+        header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d",
+            ranges[0][0], ranges[0][1], contentLength))
+        header.Set("Content-Length", fmt.Sprintf("%d",
+            ranges[0][1]-ranges[0][0]+1))
+        res.WriteHeader(http.StatusPartialContent)
+        io.CopyBuffer(res, io.LimitReader(f,
+            ranges[0][1]-ranges[0][0]+1), buf)
+    } else {
+        res.WriteHeader(http.StatusRequestedRangeNotSatisfiable)  // 416
+    }
+} else {
+    io.CopyBuffer(res, file, buf)  // 非 Range 请求：整个文件流式输出
+}
+```
+
+**缓冲区大小配置**（`general.buffer_size`）：
+| 值 | 缓冲区 | 适用场景 |
+|----|--------|---------|
+| `small` | 32 KB | 低内存环境 |
+| `medium` | 128 KB | **默认** |
+| `large` | 2 MB | 高带宽大文件 |
+
+---
+
+## 十六、TUS 可恢复上传协议
+
+TUS（Resumable Upload Protocol）实现位于后端 `FileSave`（`server/ctrl/files.go:479`）和前端 `workerImplFile`（`public/assets/pages/filespage/ctrl_upload.js:335`）。支持分片上传、断点续传、可选校验和。
+
+### 16.1 协议支持能力
+
+后端 OPTIONS 响应（`files.go:547-552`）：
+```
+Tus-Resumable: 1.0.0
+Tus-Version: 1.0.0
+Tus-Extension: creation,checksum
+Tus-Checksum-Algorithm: sha1,crc32
+```
+
+### 16.2 后端状态机：5 个 HTTP 方法
+
+| 方法 | 作用 | 关键响应头 |
+|------|------|-----------|
+| `OPTIONS` | 协商能力 | `Tus-Extension`, `Tus-Checksum-Algorithm` |
+| `HEAD` | 查询上传进度 | `Upload-Offset`, `Upload-Length` |
+| `POST` | 创建上传会话 | `201 Created`, `Location` |
+| `PATCH` | 上传分片 | `204 No Content`, `Upload-Offset` |
+| `POST`（无 Tus-Resumable） | 小文件直传 | `200 OK` |
+
+### 16.3 chunkedUpload 数据结构
+
+```go
+// files.go:702-734
+type chunkedUpload struct {
+    fn     func(path string, file io.Reader) error  // Backend.Save
+    stream *io.PipeWriter                            // 写入端
+    offset uint64                                    // 已上传字节数
+    size   uint64                                    // 总大小
+    done   chan error                                // Backend.Save goroutine 返回值
+    once   sync.Once                                 // done 只 close 一次
+    mu     sync.Mutex                                // offset 读写锁
+}
+```
+
+**设计模式**：`io.Pipe` + goroutine，一边通过 PATCH 向 `PipeWriter` 写，另一边 `Backend.Save` 从 `PipeReader` 读，零拷贝流式上传。
+
+```go
+// files.go:672-685
+func createChunkedUploader(save func(...), path string, size uint64) *chunkedUpload {
+    r, w := io.Pipe()
+    done := make(chan error, 1)
+    go func() {
+        done <- save(path, r)  // 独立 goroutine 执行后端保存
+    }()
+    return &chunkedUpload{ stream: w, done: done, ... }
+}
+```
+
+### 16.4 PATCH 分片上传流程
+
+```go
+// files.go:593-668
+if proto == "tus" && req.Method == http.MethodPatch {
+    // 校验 Content-Type: application/offset+octet-stream
+    // 解析 Upload-Checksum（可选 sha1/crc32）
+    // 解析 Upload-Offset
+
+    uploader := chunkedUploadCache.Get(cacheKey).(*chunkedUpload)
+    initialOffset, totalSize := uploader.Meta()
+
+    if initialOffset != requestOffset {
+        SendErrorResult(res, ErrNotValid)  // 偏移不匹配 → 拒绝
+        return
+    }
+
+    // io.TeeReader 同时计算校验和
+    reader := io.NopCloser(io.TeeReader(req.Body, hash))
+    if err := uploader.Next(reader); err != nil { ... }
+
+    // 校验和比对
+    if expectedChecksum != hex.EncodeToString(hash.Sum(nil)) {
+        SendErrorResult(res, NewError("Checksum Mismatch", 460))
+        return
+    }
+
+    newOffset, _ := uploader.Meta()
+    if newOffset == totalSize {
+        uploader.Close()                 // 关闭 PipeWriter，触发 save() 返回
+        chunkedUploadCache.Del(cacheKey) // 清理缓存
+    }
+
+    h.Set("Upload-Offset", fmt.Sprintf("%d", newOffset))
+    res.WriteHeader(http.StatusNoContent)
+}
+```
+
+### 16.5 上传缓存与清理
+
+```go
+// files.go:687-700
+func initChunkedUploader() {
+    chunkedUploadCache = NewAppCache(60*24, 1)  // 24h TTL，1min 清理
+    chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+        c := value.(*chunkedUpload)
+        c.Close()  // 缓存过期自动关闭 PipeWriter，终止上传
+    })
+}
+```
+
+**Cache Key 构成**：`{ path, session_hash }` — 同用户同路径恢复上传。
+
+### 16.6 前端工作池与分片策略
+
+**位置**：`public/assets/pages/filespage/ctrl_upload.js:100-326`
+
+```
+┌─ Upload Worker Pool (MAX_WORKERS = 4) ─┐
+│  Worker 0  Worker 1  Worker 2  Worker 3 │
+│    ▼         ▼         ▼         ▼      │
+│  Task[] — 按序出队 — 并发执行            │
+└────────────────────────────────────────┘
+```
+
+**前端分片决策**（`ctrl_upload.js:364-391`）：
+```javascript
+const chunkSize = getConfig("upload_chunk_size", 0) * 1024 * 1024;  // 默认 0 = 不分片
+const numberOfChunks = Math.ceil(file.size / chunkSize);
+
+if (chunkSize === 0 || numberOfChunks <= 1) {
+    // 小文件：直接 POST body = file
+} else {
+    // 大文件：TUS 协议
+    // 1. HEAD 查询是否已有上传会话
+    // 2. POST 创建会话（Upload-Length: file.size）
+    // 3. 循环 PATCH（Upload-Offset, Content-Type: application/offset+octet-stream）
+    //    可选 Upload-Checksum: sha1 <hex>
+}
+```
+
+**前端断点续传**（`ctrl_upload.js:397-412`）：
+```javascript
+const resp = await executeHttp.call(this, apiURL, { method: "HEAD", headers: tusHeaders });
+if (file.size === parseInt(resp.headers["upload-length"])) {
+    const tmp = parseInt(resp.headers["upload-offset"]);
+    if (tmp > 0) { offset = tmp; uploadURL = apiURL; }  // 恢复之前的偏移
+}
+```
+
+---
+
+## 十七、Thumbnail 生成 Pipeline 与缓存
+
+缩略图通过**插件钩子系统**实现，`FileCatHandler` 中触发。有两套机制：
+
+| 机制 | 注册方式 | 适用 |
+|------|---------|------|
+| **`IThumbnailer` 接口** | `Hooks.Register.Thumbnailer(mimeType, handler)` | 视频缩略图（ffmpeg） |
+| **`ProcessFileContentBeforeSend` 钩子** | `Hooks.Register.ProcessFileContentBeforeSend(fn)` | 图片转码/缩放（libvips/CGO） |
+
+### 17.1 触发入口
+
+**位置**：`server/ctrl/files.go:274-298`
+
+```go
+thumb := query.Get("thumbnail")
+if thumb == "true" {
+    fileMutation = true
+    // Last-Modified / If-Modified-Since → 304 Not Modified
+    for plgMType, plgHandler := range Hooks.Get.Thumbnailer() {
+        if plgMType != mType { continue }           // 按 MIME 匹配
+        file, err = plgHandler.Generate(file, ctx, &res, req)
+        break  // 只取第一个匹配的 Thumbnailer
+    }
+}
+// 然后执行 ProcessFileContentBeforeSend 钩子链
+// （图片插件通过此钩子实现转码缩放）
+```
+
+**前端请求示例**（`filespage/thing.js:115`）：
+```javascript
+$img.src = "api/files/cat?path=" + encodeURIComponent(path) +
+           "&thumbnail=true" + location.search.replace("?", "&");
+```
+
+### 17.2 图片缩略图：plg_image_light
+
+**位置**：`server/plugin/plg_image_light/index.go:107-182`
+
+注册 `ProcessFileContentBeforeSend` 钩子，通过 CGO 调用 libvips/libtranscode 进行缩放转码。
+
+#### 处理 Pipeline
+
+```
+原始文件流
+    │
+    ▼
+┌─ 1. MIME 过滤 ──────────────────────────┐
+│   非 image/* | svg | x-icon → 跳过       │
+│   thumbnail=false 且无 size → 跳过       │
+│   thumbnail=false 且 gif → 跳过（保动图） │
+└────────────┬─────────────────────────────┘
+             ▼
+┌─ 2. 构造 Transform 参数 ────────────────┐
+│   thumbnail=true:  Size=300 Crop=true    │
+│                   Quality=50 Exif=false   │
+│                   Cache: 259200s (3d)     │
+│   size=<N>:       Size=N Crop=false       │
+│                   Quality=90 Exif=true    │
+│                   Cache: 3600s (1h)       │
+└────────────┬─────────────────────────────┘
+             ▼
+┌─ 3. 落盘（阻抗匹配） ──────────────────┐
+│   io.Copy → /tmp/imagein_xxxxx.dat       │
+│   (CGO 需要文件路径而非 Go io.Reader)    │
+└────────────┬─────────────────────────────┘
+             ▼
+┌─ 4. RAW 预处理 ─────────────────────────┐
+│   IsRaw(mType) → ExtractPreview()         │
+│   (从 RAW 内嵌 JPEG 预览提取)             │
+└────────────┬─────────────────────────────┘
+             ▼
+┌─ 5. 终态缩放 ──────────────────────────┐
+│   CreateThumbnail(transform)             │
+│   仅处理 jpeg/png/gif/tiff               │
+└──────────────────────────────────────────┘
+```
+
+#### 可配置项
+
+| 配置键 | 默认值 | 含义 |
+|--------|--------|------|
+| `features.image.enable_image` | `true` | 总开关 |
+| `features.image.thumbnail_size` | `300` | 缩略图边长（px） |
+| `features.image.thumbnail_quality` | `50` | 缩略图 JPEG 质量（0-100） |
+| `features.image.thumbnail_caching` | `259200`（3天） | 浏览器缓存缩略图 |
+| `features.image.image_quality` | `90` | 全图转码质量 |
+| `features.image.image_caching` | `3600`（1h） | 浏览器缓存全图 |
+
+**Cache-Control 输出**（`index.go:137-139`）：
+```go
+if query.Get("thumbnail") == "true" {
+    (*res).Header().Set("Cache-Control", fmt.Sprintf("max-age=%d", thumb_caching()))
+}
+```
+
+### 17.3 视频缩略图：plg_video_thumbnail（ffmpeg）
+
+**位置**：`server/plugin/plg_video_thumbnail/index.go:34-80`
+
+通过 `Hooks.Register.Thumbnailer("video/mp4", &ffmpegThumbnail{})` 注册，支持 `video/mp4`、`video/x-matroska`、`video/x-msvideo`。
+
+#### 生成流程
+
+```
+GET /api/files/cat?path=/movie.mp4&thumbnail=true
+    │
+    ▼
+┌─ 1. 缓存命中检测 ─────────────────────┐
+│   cachePath = data/cache/video-thumbnail/ │
+│               thumb_<session>_<hash(path)>.jpeg │
+│   文件存在 → 直接返回                    │
+└────────────┬─────────────────────────────┘
+             │ 未命中
+             ▼
+┌─ 2. ffmpeg 命令执行 ─────────────────┐
+│   ffmpeg                                 │
+│     -headers "cookie: <session_cookies>" │  ← 鉴权
+│     -skip_frame nokey                     │
+│     -i http://127.0.0.1:<port>/api/files/cat?path=... │
+│                                                ↑ 自调用拿源文件
+│     -vf "thumbnail,scale=320:320:force_original_aspect_ratio=decrease" │
+│     -frames:v 1                              │
+│     -c:v mjpeg cachePath                     │
+└────────────┬─────────────────────────────┘
+             ▼
+┌─ 3. 返回 + 清理 ───────────────────────┐
+│   setHeader(res):                        │
+│     Content-Type: image/jpeg             │
+│     Cache-Control: max-age=2592000 (30d) │
+│     ETag: base64(hash)                   │
+│   plugin 启动时/缓存过期时 os.RemoveAll   │
+└──────────────────────────────────────────┘
+```
+
+**关键技巧**：ffmpeg 无法携带 Authorization Header，但可以通过 `-headers "cookie: ..."` 携带 Cookie。Filestash 后端鉴权支持 Cookie 通道（见第十章），因此 ffmpeg 通过自调用 `/api/files/cat` 即可获得原始视频流。
+
+### 17.4 缩略图缓存层级总结
+
+| 缓存层级 | 位置 | TTL | 触发条件 |
+|---------|------|-----|---------|
+| **L1 浏览器** | `Cache-Control: max-age` | 缩略图 3d，全图 1h，视频缩略图 30d | 相同 URL + HTTP 缓存 |
+| **L2 磁盘（视频）** | `data/cache/video-thumbnail/thumb_*.jpeg` | 进程生命周期（启动时清理） | 同 session 同路径 |
+| **L2 磁盘（Range）** | `/tmp/file_*.dat` | 5 min（Session 级） | Range 请求 + 后端不支持 Seek |
+| **L3 If-Modified-Since** | `Last-Modified` 对比 | 文件修改即失效 | 同文件未修改 |
+| **L4 ETag** | 校验和对比（部分场景） | 内容变化即失效 | ETag 不变 → 304 |
+
+---
+
+## 十八、关键代码索引
 
 | 层级 | 文件 | 关键函数/结构 |
 |------|------|-------------|
@@ -1430,3 +1894,21 @@ hls.attachMedia($video);
 | 视频播放器 | `public/assets/pages/viewerpage/application_video.js:24` | HLS.js + 原生 `<video>` |
 | PDF 预览器 | `public/assets/pages/viewerpage/application_pdf.js:16` | 原生 `<embed>` / PDF.js 双模式 |
 | Chromecast 投屏 | `public/assets/model/chromecast.js:38` | 跨域播放鉴权 TODO |
+| SW 路由注册 | `server/routes.go:105` | `/sw.js` 路由映射 |
+| SW 错误兜底 | `public/assets/boot/ctrl_boot_frontoffice.js:57` | `window.onerror` 自动注销 SW |
+| Range 适配策略 | `server/ctrl/files.go:316` | Seek 支持检测 + tmp 缓存 |
+| Range 头解析 | `server/ctrl/files.go:360` | `bytes=a-b,c-d` 多段解析 |
+| Range 响应输出 | `server/ctrl/files.go:412` | 206 Partial Content + `io.CopyBuffer` |
+| TUS 上传 handler | `server/ctrl/files.go:479` | `FileSave()` — 5 种 HTTP 方法状态机 |
+| TUS chunkedUpload 结构体 | `server/ctrl/files.go:702` | `io.Pipe` + goroutine 流式上传 |
+| TUS 缓存初始化 | `server/ctrl/files.go:687` | `initChunkedUploader()` — 24h TTL + OnEvict 清理 |
+| 前端上传 Worker Pool | `public/assets/pages/filespage/ctrl_upload.js:100` | `MAX_WORKERS = 4` 并发上传 |
+| 前端 TUS 分片实现 | `public/assets/pages/filespage/ctrl_upload.js:335` | `workerImplFile` — HEAD/POST/PATCH + 断点续传 |
+| Thumbnailer 接口 | `server/common/types.go:61` | `IThumbnailer.Generate()` |
+| Thumbnailer 注册中心 | `server/common/plugin.go:172` | `thumbnailer map[string]IThumbnailer` |
+| 缩略图触发入口 | `server/ctrl/files.go:274` | `?thumbnail=true` → 遍历 Thumbnailer + ProcessFileContentBeforeSend |
+| 图片缩略图 Pipeline | `server/plugin/plg_image_light/index.go:107` | `ProcessFileContentBeforeSend` → CGO libvips 缩放 |
+| 图片缩略图 Transform | `server/plugin/plg_image_light/index.go:185` | `Transform` 结构体 |
+| 视频缩略图 ffmpeg | `server/plugin/plg_video_thumbnail/index.go:47` | `Hooks.Register.Thumbnailer("video/mp4", ...)` |
+| 视频缩略图缓存 | `server/plugin/plg_video_thumbnail/index.go:17` | `VideoCachePath = "data/cache/video-thumbnail/"` |
+| 前端缩略图请求 | `public/assets/pages/filespage/thing.js:115` | `?path=...&thumbnail=true` |
