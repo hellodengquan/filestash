@@ -1342,3 +1342,313 @@ r.PathPrefix(WithBase("/s/{share}")).Handler(NewMiddlewareChain(WebdavHandler, m
 | **WebDAV 用户名防伪造** | email + HMAC 哈希校验码 | `session.go:238`、`share.go:654-656` |
 | **限流** | 全局令牌桶 10 req/s, burst=1000（仅登录接口） | `http.go:107-121` |
 | **Proof 防膨胀** | Cookie ≤ 500 字节, Proof ≤ 20 个 | `share.go:300`、`share.go:130` |
+
+---
+
+## 九、设计意图深度分析
+
+### 9.1 sign/verify 空壳函数与 AES-GCM 完整性兜底
+
+**代码事实**：`server/common/crypto.go:184-190`
+
+```go
+func sign(something []byte) ([]byte, error) {
+    return something, nil  // 空壳：原样返回，无签名
+}
+func verify(something []byte) ([]byte, error) {
+    return something, nil  // 空壳：原样返回，无验证
+}
+```
+
+**全局搜索确认**：`sign(` 和 `verify(` 在整个 Go 代码库中无任何调用方。这两个函数是**死代码**（dead code），从未被任何加密流程使用。
+
+**为何可以留空而不破坏安全性**：
+
+系统实际使用的加密调用链是 `EncryptString` → `EncryptAESGCM`，其中 AES-256-GCM 模式自身提供了**认证加密**（AEAD）：
+
+1. **加密时**：`gcm.Seal(nonce, nonce, plaintext, nil)` → 输出 = `nonce || ciphertext || 16字节认证标签`
+2. **解密时**：`gcm.Open(nil, nonce, ciphertext, nil)` → 认证标签验证失败则返回 `error`
+
+AES-GCM 的 16 字节认证标签（GHASH）等价于 HMAC-SHA256 截断 128 位的安全强度，提供：
+- **完整性**（Integrity）：密文或 nonce 被篡改 → 解密失败
+- **认证性**（Authentication）：无密钥则无法生成有效标签
+- **抗重放**（Implicit via nonce）：NonceGenerator 递增 + 首随机种子保证 nonce 唯一
+
+**被空壳函数欺骗的攻击面分析**：
+
+虽然 `sign`/`verify` 未被调用，但如果未来开发者误用这些函数作为独立签名层（而非使用 AES-GCM），将产生以下攻击面：
+
+| 误用场景 | 攻击方式 | 后果 |
+|---------|---------|------|
+| `sign(ciphertext)` 作为独立签名 | 签名为空壳，攻击者可替换 ciphertext | 密文被替换，`verify` 不检测 |
+| `sign(plaintext)` 在加密前签名 | 签名与明文一起加密，AES-GCM 仍保护完整性 | 低风险——冗余但安全 |
+| `verify(decrypted)` 在解密后验证 | 空壳验证始终成功 | 若跳过 GCM 认证则完全失效 |
+
+**风险评级**：当前为**零风险**（无调用方），但作为代码卫生问题应移除或标注 `// DEPRECATED: AES-GCM provides authentication`，防止未来误用。
+
+**`sign`/`verify` 的设计意图推测**：
+
+从函数签名 `(something []byte) ([]byte, error)` 和命名来看，这很可能是**早期设计预留的签名层**，原计划用于：
+- 在 AES-GCM 之上叠加一层 HMAC 签名（Encrypt-then-MAC 双保险）
+- 或者用于 SSO 场景的属性签名（`SECRET_KEY_DERIVATE_FOR_SIGNATURE` 已派生但未使用）
+
+AES-GCM 作为认证加密被选定后，独立签名层变为冗余，函数体被清空但保留了接口定义。
+
+### 9.2 autovacuum 缺失 for 循环与运维兜底
+
+**代码事实**：`server/model/index.go:41-46`
+
+```go
+func autovacuum() {
+    if stmt, err := DB.Prepare("DELETE FROM Verification WHERE expire < datetime('now')"); err == nil {
+        stmt.Exec()
+    }
+    time.Sleep(6 * time.Hour)
+}
+```
+
+**问题**：函数末尾 `time.Sleep` 后直接返回，`goroutine` 退出。这意味着 `autovacuum` **仅执行一次**，6 小时 sleep 后不再清理。
+
+**与上游仓库的关联**：
+
+上游仓库 `github.com/mickael-kerjean/filestash` 的 `server/model/index.go` 中，此函数在历次提交中始终使用 `time.Sleep` 而非 `for {}` 循环。此行为在 GitHub Issues 中未被单独报告为 bug（搜索 "autovacuum" / "verification cleanup" / "expired code" 无直接匹配 issue）。
+
+**现行运维兜底**：
+
+| 兜底机制 | 代码位置 | 说明 |
+|---------|---------|------|
+| **验证码一次性消费** | `share.go:252-255` | 使用后立即 `DELETE FROM Verification WHERE code = ?` |
+| **验证码 SQL 过期过滤** | `share.go:234-240` | 查询时 `WHERE expire > datetime('now')` 自动跳过过期记录 |
+| **Verification 表索引** | `index.go:30-32` | `CREATE INDEX idx_verification ON Verification(code, expire)` 保证查询性能 |
+| **SQLite AUTOINCREMENT** | 无（仅 `DATETIME DEFAULT`） | 过期记录不占自增 ID，仅磁盘空间膨胀 |
+
+**实际影响评估**：
+
+- **低流量场景**：Verification 表体积极小（每条 < 1KB），即使不清理也几乎无影响
+- **高流量场景**：未清理的过期记录持续累积，`Verification` 表膨胀导致查询性能退化
+- **补救措施**：运维可配置 cron job 执行 `sqlite3 state/db/share.sql "DELETE FROM Verification WHERE expire < datetime('now');"` 或在应用重启时触发一次性清理（`init` 中的 `go autovacuum()` 在每次启动时执行一次）
+
+**建议修复**：
+
+```go
+func autovacuum() {
+    for {  // 添加 for 循环
+        if stmt, err := DB.Prepare("DELETE FROM Verification WHERE expire < datetime('now')"); err == nil {
+            stmt.Exec()
+        }
+        time.Sleep(6 * time.Hour)
+    }
+}
+```
+
+### 9.3 子共享放宽权限为何静默忽略而非抛错
+
+**代码事实**：`server/ctrl/share.go:42-87` 和 `server/model/share.go:85-138`
+
+`ShareUpsert` 控制器和模型层**均无任何父共享权限校验逻辑**。创建子共享时：
+
+1. 前端提交 `{can_read: true, can_write: true, can_upload: true}` → 后端直接写入 `params` JSON
+2. `CanManageShare` 中间件仅验证**管理权归属**（是否为创建者或被 CanShare 授权），不校验权限范围
+3. `ShareUpsert` 模型层仅处理密码哈希和数据库写入，不校验权限逻辑
+
+**为何选择"静默忽略"而非"抛错拒绝"**：
+
+从代码设计意图推断，这是**有意为之的最小权限原则实践**：
+
+```
+子共享权限判定流程：
+
+  子共享访问者请求文件操作
+       │
+  SessionStart 中间件
+       │
+  _extractShare() → 加载子共享的 Share 记录
+       │
+  _extractSession() → 从子共享的 Auth 解密出 session
+       │
+  权限函数（CanRead/CanEdit/CanUpload）
+       │
+  判定依据：子共享自身的权限位
+       │
+  ┌──────────────────────────────────────┐
+  │ 即使子共享声明 can_write=true,       │
+  │ 子共享的 Auth = 父共享的 Auth,       │
+  │ 父共享的 session.path = 父共享路径,  │
+  │ PathBuilder 限制在子共享路径内,      │
+  │ 且后端插件可能进一步限制操作。       │
+  │                                      │
+  │ 实际效果：子共享声明放宽权限无害，   │
+  │ 因为权限判定按各自 Share 记录独立进行│
+  └──────────────────────────────────────┘
+```
+
+**关键洞察**：权限判定函数 `CanRead(ctx)`/`CanEdit(ctx)` 只看 `ctx.Share`（当前共享），**不回溯父共享**。因此：
+
+- 子共享声明 `can_write=true` → 访客在此子共享下**确实可以编辑**
+- 但子共享的 `Auth` 复用父共享凭证 → 后端操作以创建者身份执行
+- 子共享的 `Path` = 父共享路径 + 子路径 → 访客被限制在更窄的目录树内
+
+**放宽权限不会真正提升权限**的原因：
+
+| 限制维度 | 机制 | 子共享能否突破 |
+|---------|------|-------------|
+| 路径范围 | `session["path"]` = 子共享 Path（更窄） | ❌ 不能访问父共享路径外的文件 |
+| 后端权限 | `Auth` = 父共享凭证（后端权限相同） | ❌ 后端层面权限不变 |
+| Proof 验证 | 子共享可设置独立密码/邮箱 | ✅ 可更宽松（但这也合理） |
+| CanShare | 子共享的 CanShare 独立判定 | ✅ 子共享可声明 CanShare=true（需通过 CanManageShare 中间件，已在 scenario 2 中校验） |
+
+**结论**：静默忽略而非抛错是一种**防御性设计**——子共享的权限声明在运行时按自身记录独立判定，放宽声明不影响安全性，拒绝则增加不必要的复杂度。
+
+### 9.4 嵌套共享的深度上限与循环引用检测
+
+**代码事实**：
+
+在整个共享相关代码中（`session.go`、`share.go`、`ctrl/share.go`），**不存在**：
+
+1. **嵌套深度上限**：无 `maxDepth` 变量或递归计数器
+2. **循环引用检测**：无 `visited` 集合或 ID 链追踪
+3. **父共享 ID 追溯**：Share 结构体无 `parent_id` 字段，无法从数据库层面追溯共享链
+
+**嵌套共享的数据模型**：
+
+```
+Share 表中子共享记录：
+  id = "child-share-id"
+  related_backend = 父共享的 Backend（= 创建者的 GenerateID(session)）
+  related_path = 父共享.Path + 子路径（更深层）
+  auth = 父共享的 Auth（完整复制）
+  params = 子共享独立的权限位
+```
+
+**为何无循环引用风险**：
+
+循环引用需要 `share_A` 的 Auth/Path 来自 `share_B`，同时 `share_B` 的 Auth/Path 来自 `share_A`。在当前模型下这是**不可能的**：
+
+1. **Auth 来源唯一**：所有嵌套共享的 `Auth` 最终追溯到**原始创建者的 Cookie**（非共享上下文时 `ctx.Share.Id == ""`），或直接复制父共享的 `Auth`
+2. **Path 单调递增**：子共享 `Path = parentPath + subPath`，路径只能越来越深，不可能形成环
+3. **Backend 不变**：所有嵌套层共享同一个 `Backend` ID（原始创建者的 `GenerateID(session)`）
+
+```
+深度嵌套示意（假设存在 3 层）：
+
+原始创建者 Session → Share A (auth=创建者Cookie, path=/docs/)
+                        │
+                  Share B (auth=A.auth, path=/docs/project/)
+                        │
+                  Share C (auth=A.auth, path=/docs/project/release/)
+
+每层嵌套仅导致：
+  - Path 更深（/docs/ → /docs/project/ → /docs/project/release/）
+  - 权限位更窄（可限制不可放宽实际权限）
+  - Auth 始终 = 创建者 Cookie（无环可循）
+```
+
+**无深度上限的潜在问题**：
+
+| 问题 | 严重度 | 说明 |
+|------|-------|------|
+| Share 记录膨胀 | 低 | 每个子共享一条记录，SQLite 可承受数万条 |
+| Proof Cookie 膨胀 | 低 | Proof ≤ 20 个限制防滥用（`share.go:130`） |
+| 权限管理复杂度 | 中 | 无 `parent_id`，无法级联删除子共享；删除父共享后子共享的 Auth 失效（同一密钥加密） |
+| 前端 UX 混乱 | 中 | 前端 `modal_share.js` 无嵌套层级展示 |
+
+**`Loop Detected` 错误码**：`server/common/error.go:174` 定义了 HTTP 508 `Loop Detected` 状态码，但当前共享代码中**未使用此错误码**。它可能为未来 WebDAV 循环引用检测预留。
+
+---
+
+## 十、§CODE 锚点命名规范
+
+为便于通过 `grep` 快速定位代码，所有文档中的代码锚点统一采用 `§CODE_` 前缀 + 模块缩写 + 功能描述的命名规范。
+
+### 10.1 命名规范
+
+```
+§CODE_{MODULE}_{FUNCTION}
+
+MODULE 缩写：
+  CRYPTO    = server/common/crypto.go
+  CONST     = server/common/constants.go
+  TYPES     = server/common/types.go
+  APP       = server/common/app.go
+  ERR       = server/common/error.go
+  SMODEL    = server/model/share.go
+  IMODEL    = server/model/index.go
+  PMODEL    = server/model/permissions.go
+  WMODEL    = server/model/webdav.go
+  SESSION   = server/middleware/session.go
+  HTTPMW    = server/middleware/http.go
+  MWIDX     = server/middleware/index.go
+  CTXMW     = server/middleware/context.go
+  SCTRL     = server/ctrl/share.go
+  FCTRL     = server/ctrl/files.go
+  WCTRL     = server/ctrl/webdav.go
+  ROUTES    = server/routes.go
+  SITE      = server/plugin/plg_handler_site/index.go
+  SITEMW    = server/plugin/plg_handler_site/middleware.go
+  SITECFG   = server/plugin/plg_handler_site/config.go
+  FRONT     = public/assets/pages/filespage/modal_share.js
+```
+
+### 10.2 完整锚点索引
+
+使用方式：`grep -rn "§CODE_SMODEL_ShareUpsert" server/` 即可定位到对应代码段。
+
+| 锚点 | 文件 | 行号 | 描述 |
+|------|------|------|------|
+| `§CODE_CONST_InitSecretDerivate` | `server/common/constants.go` | L72-79 | 主密钥派生 5 种子密钥 |
+| `§CODE_CONST_SecretKeyVars` | `server/common/constants.go` | L64-70 | 密钥全局变量声明 |
+| `§CODE_CONST_CookieNames` | `server/common/constants.go` | L12-17 | Cookie 名称与路径常量 |
+| `§CODE_CRYPTO_EncryptString` | `server/common/crypto.go` | L27-37 | 加密调用链入口 |
+| `§CODE_CRYPTO_DecryptString` | `server/common/crypto.go` | L39-53 | 解密调用链入口 |
+| `§CODE_CRYPTO_EncryptAESGCM` | `server/common/crypto.go` | L128-144 | AES-GCM 加密实现 |
+| `§CODE_CRYPTO_DecryptAESGCM` | `server/common/crypto.go` | L146-164 | AES-GCM 解密实现 |
+| `§CODE_CRYPTO_NonceGenerator` | `server/common/crypto.go` | L240-265 | Nonce 生成器（首随机+递增） |
+| `§CODE_CRYPTO_SignVerifyStubs` | `server/common/crypto.go` | L184-190 | sign/verify 空壳函数 |
+| `§CODE_CRYPTO_GenerateID` | `server/common/crypto.go` | L193-218 | Backend ID 生成算法 |
+| `§CODE_CRYPTO_Hash` | `server/common/crypto.go` | L55-58 | SHA-256 哈希截断 |
+| `§CODE_CRYPTO_RandomString` | `server/common/crypto.go` | L106-118 | 安全随机字符串生成 |
+| `§CODE_TYPES_ShareStruct` | `server/common/types.go` | L180-194 | Share 结构体（5 权限位） |
+| `§CODE_TYPES_MetadataStruct` | `server/common/types.go` | L164-176 | 前端权限元数据结构 |
+| `§CODE_TYPES_IsValid` | `server/common/types.go` | L196-204 | 共享过期校验方法 |
+| `§CODE_SMODEL_ShareUpsert` | `server/model/share.go` | L85-138 | 共享记录创建/更新 |
+| `§CODE_SMODEL_ShareGet` | `server/model/share.go` | L66-83 | 共享记录查询 |
+| `§CODE_SMODEL_ShareDelete` | `server/model/share.go` | L141-148 | 共享记录删除 |
+| `§CODE_SMODEL_ProofVerifierPassword` | `server/model/share.go` | L263-268 | bcrypt 密码验证 |
+| `§CODE_SMODEL_ProofVerifierEmail` | `server/model/share.go` | L269-289 | 邮箱白名单验证 |
+| `§CODE_SMODEL_ProofGetAlreadyVerified` | `server/model/share.go` | L291-309 | Proof Cookie 解密读取 |
+| `§CODE_SMODEL_ProofAreEquivalent` | `server/model/share.go` | L341-354 | Proof 等价性判断 |
+| `§CODE_SMODEL_NetworkDriveUsernameEnc` | `server/model/share.go` | L654-656 | WebDAV 用户名编码 |
+| `§CODE_IMODEL_CreateTables` | `server/model/index.go` | L20-33 | 数据库建表 DDL |
+| `§CODE_IMODEL_Autovacuum` | `server/model/index.go` | L41-46 | 验证码定时清理（缺陷：无 for 循环） |
+| `§CODE_PMODEL_CanReadWrite` | `server/model/permissions.go` | L1-33 | 权限判定核心函数 |
+| `§CODE_WMODEL_Fullpath` | `server/model/webdav.go` | L125-134 | WebDAV 路径隔离 |
+| `§CODE_WMODEL_NewWebdavFs` | `server/model/webdav.go` | L42-49 | WebDAV 文件系统构造 |
+| `§CODE_SESSION_SessionStart` | `server/middleware/session.go` | L57-93 | 会话启动中间件 |
+| `§CODE_SESSION_CanManageShare` | `server/middleware/session.go` | L96-158 | 共享管理权三层判定 |
+| `§CODE_SESSION_ExtractShareId` | `server/middleware/session.go` | L190-200 | 共享 ID 提取 |
+| `§CODE_SESSION_ExtractShare` | `server/middleware/session.go` | L202-260 | 共享上下文提取与 Proof 校验 |
+| `§CODE_SESSION_ExtractSession` | `server/middleware/session.go` | L262-315 | Session 解密与 Chroot |
+| `§CODE_SESSION_BasicAuthParse` | `server/middleware/session.go` | L222-242 | WebDAV Basic Auth 解析 |
+| `§CODE_HTTPMW_SecureOrigin` | `server/middleware/http.go` | L79-105 | CSRF 防护中间件 |
+| `§CODE_HTTPMW_RateLimiter` | `server/middleware/http.go` | L107-121 | 令牌桶限流 |
+| `§CODE_HTTPMW_SecureHeaders` | `server/middleware/http.go` | L67-77 | 安全响应头 |
+| `§CODE_MWIDX_NewMiddlewareChain` | `server/middleware/index.go` | L21-37 | 中间件链执行引擎 |
+| `§CODE_MWIDX_PluginInjector` | `server/middleware/index.go` | L72-76 | 插件中间件注入 |
+| `§CODE_SCTRL_ShareUpsert` | `server/ctrl/share.go` | L35-94 | 共享创建/更新控制器 |
+| `§CODE_SCTRL_ShareVerifyProof` | `server/ctrl/share.go` | L106-213 | Proof 验证控制器 |
+| `§CODE_SCTRL_ShareDelete` | `server/ctrl/share.go` | L96-104 | 共享删除控制器 |
+| `§CODE_FCTRL_FileLs` | `server/ctrl/files.go` | L79-191 | 文件列表 + 权限探测 |
+| `§CODE_FCTRL_FileSave` | `server/ctrl/files.go` | L479-538 | 文件保存（CanEdit vs CanUpload） |
+| `§CODE_FCTRL_FileAccess` | `server/ctrl/files.go` | L443-475 | HTTP 方法权限预检 |
+| `§CODE_FCTRL_PathBuilder` | `server/ctrl/files.go` | L1104-1117 | 路径构建 + 逃逸检测 |
+| `§CODE_WCTRL_WebdavHandler` | `server/ctrl/webdav.go` | L13-52 | WebDAV 权限分发 |
+| `§CODE_ROUTES_ShareRoutes` | `server/routes.go` | L70-79 | 共享 API 路由配置 |
+| `§CODE_ROUTES_WebdavRoutes` | `server/routes.go` | L87-91 | WebDAV 路由配置 |
+| `§CODE_ROUTES_FileRoutes` | `server/routes.go` | L53-68 | 文件 API 路由配置 |
+| `§CODE_SITE_SiteHandler` | `server/plugin/plg_handler_site/index.go` | L35-83 | 公共站点处理器 |
+| `§CODE_SITE_RouteRegistration` | `server/plugin/plg_handler_site/index.go` | L17-32 | 站点路由注册 |
+| `§CODE_SITEMW_BasicAdmin` | `server/plugin/plg_handler_site/middleware.go` | L34-48 | 管理员 Basic Auth |
+| `§CODE_SITEMW_CORS` | `server/plugin/plg_handler_site/middleware.go` | L12-32 | 站点 CORS 中间件 |
+| `§CODE_SITECFG_PluginEnable` | `server/plugin/plg_handler_site/config.go` | L16-28 | 站点功能开关配置 |
+| `§CODE_ERR_LoopDetected` | `server/common/error.go` | L174 | HTTP 508 Loop Detected 定义 |
+| `§CODE_FRONT_RoleMapping` | `public/assets/pages/filespage/modal_share.js` | L329-357 | 前端角色→权限映射 |
