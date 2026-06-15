@@ -1394,6 +1394,102 @@ AES-GCM 的 16 字节认证标签（GHASH）等价于 HMAC-SHA256 截断 128 位
 
 AES-GCM 作为认证加密被选定后，独立签名层变为冗余，函数体被清空但保留了接口定义。
 
+#### 9.1.1 AES-GCM Nonce 复用风险与 IV 派生策略
+
+**Nonce 生成器的全局状态**：`server/common/crypto.go:22-25`
+
+```go
+var (
+    Letters                 = []rune("...")
+    GCMNonce NonceGenerator = NewNonceGenerator(12)  // 包级全局变量
+)
+```
+
+`GCMNonce` 在 `package common` 加载时初始化，是进程内**唯一的全局 Nonce 生成器实例**，为以下所有加密输出提供 nonce：
+- `EncryptString(SECRET_KEY_DERIVATE_FOR_USER, ...)` → Session Cookie / Share.auth
+- `EncryptString(SECRET_KEY_DERIVATE_FOR_PROOF, ...)` → Proof Cookie
+- 未来可能的其他加密场景
+
+**IV 派生策略对比**：
+
+| 策略 | 实现 | 安全性 | 本项目选择 |
+|------|------|--------|-----------|
+| 纯随机 nonce | `rand.Read(nonce)` 每次生成 | 生日悖论：2^48 加密后碰撞概率 ~50% | ❌ 未选 |
+| 计数器递增 | 逐次 +1 | 理论 2^96 次加密内零碰撞，但进程重启后从 0 开始有重复风险 | ❌ 未选 |
+| **首随机 + 递增（本项目）** | `NewNonceGenerator` → `rand.Read` 首种子 → 逐次 +1 | 进程重启种子变 → 跨进程无碰撞；单进程 2^96 次才溢出 | ✅ 选择 |
+
+**Nonce 复用的数学风险（NIST SP 800-38D §8）**：
+
+AES-GCM 对同一密钥下的 nonce 复用采用**零容忍策略**。假设攻击者获取了两组使用相同 `(key, nonce)` 的密文 `C1, C2`（对应明文 `P1, P2`）：
+
+```
+C1 = nonce || E(key, counter=1) XOR P1 || GHASH(H, A, C1)
+C2 = nonce || E(key, counter=1) XOR P2 || GHASH(H, A, C2)
+
+由于 E(key, counter=1) 相同：
+  C1 XOR C2 = P1 XOR P2   →  知道 P1 就能推导出 P2
+
+更严重的是 GHASH 子密钥 H 泄露：
+  H = E(key, 0^128)
+  tag1 XOR tag2 = GHASH(H, ...) XOR GHASH(H, ...)
+  → 攻击者可解线性方程组恢复 H
+  → 掌握 H 后可伪造任意密文的有效 tag
+```
+
+**NonceGenerator 的安全边界**：
+
+| 风险场景 | 概率 | 严重度 | 防护 |
+|---------|------|--------|------|
+| 单进程内 nonce 重复 | ≈0（12 字节递增，2^96 空间） | 致命 | Mutex 锁 + 大端序递增 |
+| 跨进程 nonce 重复 | 1 / (2^96 * N)，N=重启次数 | 可忽略 | 首随机种子 2^96 熵 |
+| **多个密钥共享同一 NonceGenerator** | ≠ nonce 复用！（AES-GCM 安全边界是 `(key, nonce)` 对） | **安全** | 不同派生密钥各自独立 |
+
+> **关键安全洞察**：虽然 `USER`/`PROOF`/`ADMIN` 三个派生密钥共用同一个 `GCMNonce` 计数器，但 AES-GCM 的 nonce 唯一性要求是**每密钥下唯一**，而非全局唯一。不同密钥使用相同 nonce 不违反 SP 800-38D。因此共享计数器是安全的。
+
+#### 9.1.2 空壳 sign/verify 攻击者构造伪造请求的前置条件
+
+由于 `sign()`/`verify()` 当前为死代码（0 处调用），**直接攻击面为零**。但攻击者构造伪造请求需要满足以下前置条件链，任何一步断裂都导致攻击不可行：
+
+```
+攻击可行性依赖链：
+
+  ① 未来代码修改调用 sign()/verify()
+       │
+       ├─ 场景 A：加密前调用 sign(plaintext) → 加密后密文仍由 AES-GCM 保护
+       │     → 冗余签名，攻击无效
+       │
+       ├─ 场景 B：加密后调用 sign(ciphertext) 作为外层签名
+       │     → sign 返回原 ciphertext（空壳）
+       │     → verify 也返回原 ciphertext（空壳）
+       │     → 攻击者仍无法伪造有效密文（AES-GCM tag 未被绕过）
+       │     → 但存在**认知欺骗风险**：
+       │        开发者阅读代码时以为"有独立签名层"，
+       │        从而在其他代码中做出错误假设（如跳过 GCM 校验）
+       │
+       └─ 场景 C：用 sign/verify 替代 AES-GCM 做明文完整性检查
+             → sign 空壳，攻击者可任意篡改明文
+             → 前置条件：
+                - 代码改动中有人用 sign/verify 替代了 GCM
+                - 且被篡改的明文进入了信任链（如 Session 反序列化）
+                - 且篡改的内容能控制后续的权限判定逻辑
+       │
+  ② 篡改后的明文/密文能通过后续信任边界
+       │
+       └─ DecryptString → json.Unmarshal → 进入 ctx.Session / ctx.Share
+            → session["path"] 被篡改？ → PathBuilder 再次逃逸检测（两道防线）
+            → 权限位被篡改？ → 权限位来自 Share.params（数据库存储），不经过 sign/verify
+```
+
+**真实攻击面评估**：
+
+| 攻击路径 | 前置条件满足数 | 可行性 | 说明 |
+|---------|--------------|--------|------|
+| 当前版本直接攻击 | 0 / 2 | 不可行 | sign/verify 无调用方 |
+| 代码重构后引入场景 C | 2 / 2 （极低概率） | 理论可行 | 需有人同时：① 改用 sign/verify ② 去掉 GCM 认证 ③ 篡改内容控制权限 |
+| **认知欺骗（最可能）** | 1 / 2 （中等概率） | 间接风险 | 开发者被空壳函数误导，在其他模块做出错误安全假设 |
+
+> **代码卫生建议**：应在 `sign`/`verify` 函数体中添加 `panic("sign/verify are DEPRECATED stubs; AES-GCM provides AEAD")` 而非静默返回，确保任何未来调用都在测试阶段被立即发现。
+
 ### 9.2 autovacuum 缺失 for 循环与运维兜底
 
 **代码事实**：`server/model/index.go:41-46`
@@ -1426,7 +1522,67 @@ func autovacuum() {
 
 - **低流量场景**：Verification 表体积极小（每条 < 1KB），即使不清理也几乎无影响
 - **高流量场景**：未清理的过期记录持续累积，`Verification` 表膨胀导致查询性能退化
-- **补救措施**：运维可配置 cron job 执行 `sqlite3 state/db/share.sql "DELETE FROM Verification WHERE expire < datetime('now');"` 或在应用重启时触发一次性清理（`init` 中的 `go autovacuum()` 在每次启动时执行一次）
+- **补救措施**：运维可配置 cron job 执行 `sqlite3 state/db/share.sql "DELETE FROM Verification WHERE expire < datetime('now');" 或在应用重启时触发一次性清理（`init` 中的 `go autovacuum()` 在每次启动时执行一次）
+
+#### 9.2.1 autovacuum bug 的生产触发频次与规避
+
+**触发条件量化**：
+
+autovacuum 仅在以下事件发生时执行一次清理，**不持续运行。`time.Sleep(6h)` 后 goroutine 无任何后续动作即退出。生产环境中触发清理的实际频次取决于：
+
+| 触发事件 | 典型频次 | 触发清理次数 | 剩余过期记录 |
+|-----------|-----------|-------------|--------------|
+| 应用冷启动 | 每天/每周/每月（取决于发布节奏） | N 次启动 = N 次清理 | 启动前 10 分钟内的过期记录 |
+| 应用热更新 / OOM Killer 重启 | 高内存环境：每天数次 | 每次重启 1 次 | 重启窗口 10 分钟内 |
+| Kubernetes Pod 滚动更新 | 每周/每月 1 次 | 每个 Pod 1 次 | 同上 |
+| **不重启的长驻进程** | 数月不重启的单体部署 | **0 次** | **全部累积至下次重启 |
+
+**不同部署模式下的 bug 严重度：
+
+```
+┌──────────────────────────────────────────────────────┐
+│   Docker Compose / Systemd 长驻（最常见）         │
+│   部署模式：数月不重启                           │
+│   进程 uptime = 90 天                           │
+│   平均每日 100 次邮箱验证                       │
+│   → 累积过期记录 ≈ 90 × 100 = 9,000 条   │
+│   → SQLite B-tree 深度 ≈ log₂(9000) ≈ 14 层    │
+│   → 查询性能影响：可忽略（<1ms）                  │
+├──────────────────────────────────────────────────────┤
+│   Kubernetes 滚动更新（中等规模                       │
+│   部署模式：每周滚动更新                          │
+│   每周 1000 次验证                          │
+│   → 每周自动清理 7 × 1000 = 7,000 条           │
+│   → 实际影响：零                                   │
+├──────────────────────────────────────────────────────┤
+│   高频 SaaS 多租户（极端情况）                       │
+│   部署模式：每日发布                               │
+│   每日 100,000 次验证                            │
+│   → 单日累积过期 = 100,000 条                       │
+│   → 磁盘占用 ≈ 100,000 × 100B ≈ 10MB                │
+│   → 每次发布重启时清理，影响轻微                        │
+│   → 风险：发布日当天无重启的周末累积 = 20MB                 │
+└──────────────────────────────────────────────────────┘
+```
+
+**四层运维兜底矩阵：
+
+| 层级 | 兜底机制 | 覆盖场景 | 代码位置 / 操作 |
+|-----|---------|---------|-------------|
+| L1 应用层 | 验证码使用后立即 DELETE | 正常使用路径 | `server/model/share.go:252-255 |
+| L2 查询层 | SELECT 时 `WHERE expire > datetime('now')` | 所有验证码查询自动过滤过期 | `server/model/share.go:234-240 |
+| L3 索引层 | `idx_verification(code, expire) | 查询性能保证 | `server/model/index.go:30-32 |
+| L4 运维层 | 外部 cron / systemd timer | 长驻进程兜底 | 运维脚本（建议补充） |
+
+**推荐 L4 运维兜底脚本**（补全 `for {}` 的等效方案**：
+
+```bash
+# /etc/cron.d/filestash-verification-cleanup
+# 每 6 小时清理过期验证码
+0 */6 * * * filestash sqlite3 /var/lib/filestash/state/db/share.sql \
+  "DELETE FROM Verification WHERE expire < datetime('now');" \
+  "VACUUM;"
+```
 
 **建议修复**：
 
@@ -1499,6 +1655,41 @@ func autovacuum() {
 
 **结论**：静默忽略而非抛错是一种**防御性设计**——子共享的权限声明在运行时按自身记录独立判定，放宽声明不影响安全性，拒绝则增加不必要的复杂度。
 
+#### 9.3.1 放宽合并的安全边界判别
+
+逐个分析 5 个权限位被"放宽"（子共享声明的权限 > 父共享实际权限）时的安全边界：
+
+**定义**：父共享 P 的权限位为 (R_p, W_p, U_p, S_p, M_p)，子共享 C 的权限位为 (R_c, W_c, U_c, S_c, M_c)。放宽即存在某个 i 使得 i_c = true 且 i_p = false。
+
+| 权限位 | 放宽后行为 | 实际危险？ | 安全边界 | 代码锚点 |
+|-------|-----------|-----------|---------|---------|
+| **CanRead** | 子共享声明 `can_read=true`，父共享为 `false` | ❌ 不危险 | 子共享访问者在 `CanRead(ctx)` 中按 C 记录判定为 true，但文件操作仍被**路径 Chroot** 限制在 C.Path 内（更窄）。数据泄露范围**不超过**父共享已授权的子目录树。 | `§CODE_PMODEL_CanReadWrite` + `§CODE_SESSION_ExtractSession` |
+| **CanWrite** | 子共享声明 `can_write=true`，父共享为 `false` | ❌ 不危险 | 虽然 `CanEdit(ctx)` 判定为 true，访客可以编辑/删除，但操作被限制在 C.Path 子树内。父共享不允许写是对访客范围的限制，子共享创建者（通过父共享 CanShare 授权）将自己有权限的子目录开放写操作——**这本质是被授权方的自主二次授权**，符合权限委托语义。 | `§CODE_FCTRL_FileSave` + `§CODE_SESSION_CanManageShare` |
+| **CanUpload** | 子共享声明 `can_upload=true`，父共享为 `false` | ❌ 不危险 | 同 CanWrite，被路径 Chroot 限制。且 `FileSave` 中仅 CanUpload 时**禁止覆盖**（409 Conflict），不影响已有文件。 | `§CODE_FCTRL_FileSave` |
+| **CanShare** | 子共享声明 `can_share=true`，父共享为 `false` | ⚠️ **边界特例** | **关键边界**：CanManageShare 中间件的 Scenario 3（`session.go:131-154`）明确要求**父共享 CanShare=true** 才能创建子共享。因此父共享 CanShare=false 时，创建子共享的请求会在中间件层被 403 拦截——**子共享根本无法创建**。不存在放宽路径。 | `§CODE_SESSION_CanManageShare` |
+| **CanManageOwn** | 子共享声明为 true | ❌ 不危险 | 当前代码中 CanManageOwn 字段**未被任何判定函数读取**，是预留字段。声明 true/false 均不影响运行时行为。 | `§CODE_TYPES_ShareStruct` |
+
+**CanShare 边界的完整依赖链**：
+
+```
+创建子共享请求（share=parent_id, body={can_share: true, ...}）
+     │
+     ▼
+CanManageShare 中间件 (Scenario 3)
+     │
+     ├─ 条件 1：ctx.Share.Id != ""（通过父共享访问）✓
+     ├─ 条件 2：GenerateID(session) == s.Backend（父共享创建者本人？）
+     │     → 若是：通过 → 允许创建（创建者本人不受 CanShare 限制）
+     │     → 若否：进入条件 3
+     │
+     └─ 条件 3：ctx.Share.CanShare == true？
+           ├─ true：通过 → 允许创建子共享
+           └─ false：SendErrorMessage("User has no right to manage this share", 403)
+                    ── 子共享无法创建，不存在"CanShare 放宽" ──
+```
+
+**结论**：5 个权限位中，4 个放宽路径无害（被路径隔离收敛），1 个（CanShare）被中间件阻断根本无法创建。因此后端无需在 ShareUpsert 中再次校验权限范围——放宽合并的安全边界已被**前置中间件（CanShare）** + **运行时路径 Chroot（其他 4 位）** 完整覆盖。
+
 ### 9.4 嵌套共享的深度上限与循环引用检测
 
 **代码事实**：
@@ -1553,6 +1744,39 @@ Share 表中子共享记录：
 | 前端 UX 混乱 | 中 | 前端 `modal_share.js` 无嵌套层级展示 |
 
 **`Loop Detected` 错误码**：`server/common/error.go:174` 定义了 HTTP 508 `Loop Detected` 状态码，但当前共享代码中**未使用此错误码**。它可能为未来 WebDAV 循环引用检测预留。
+
+#### 9.4.1 嵌套深度检测函数位置（全库扫描结论）
+
+为确认是否存在未被发现的深度检测函数，对整个仓库进行了全量扫描，以下是**零匹配**的搜索项：
+
+| 搜索项 | 匹配数 | 说明 |
+|-------|--------|------|
+| `maxDepth` / `max_depth` | 0 | 无最大深度变量 |
+| `recursion.*limit` | 0 | 无递归深度限制 |
+| `nested.*depth` | 0 | 无嵌套深度函数 |
+| `parent_id` / `parentId` | 0 | 无父级追溯字段 |
+| `visited`（在共享/会话上下文中） | 0 | 无访问集合追踪 |
+| `depth`（`server/ctrl`, `server/model`, `server/middleware` 目录内） | 0 | 三处代码中无深度相关逻辑 |
+| `circular` / `cycle` / `circular.*ref` | 0 | 无循环引用检测 |
+| `func.*Share` 定义的函数中含 `depth` | 0 | Share 系列函数无深度参数 |
+
+**嵌套深度检测可能植入的候选位置**：
+
+虽然当前不存在，但如果未来要增加深度检测，最佳注入点如下：
+
+| 候选位置 | 函数/文件 | 检测逻辑 | 影响范围 |
+|---------|----------|---------|---------|
+| ① 管理权中间件层 | `CanManageShare()` in `session.go:96-158` | 提取父共享 ctx.Share.Id，沿 Share 表递归查询 Backend 链，超过阈值 → 403 | 创建时拦截，零运行时开销 |
+| ② 会话提取层 | `_extractShare()` in `session.go:202-260` | 解析子共享 Auth 中是否存在层层嵌套的 ID 链，超过阈值 → 400 | 访问时拦截 |
+| ③ 数据模型层 | `ShareUpsert()` in `model/share.go:85-138` | 计算 related_path 中 `/` 的数量，超过阈值 → 返回错误 | 最内层，所有路径必达 |
+| ④ 前端 UX 层 | `modal_share.js` | 超过阈值时禁用"再共享"按钮 | 体验优化，非安全 |
+
+**路径深度近似估算**：由于子共享的 `related_path = parent.Path + "/" + subPath`，可从路径深度（`/` 数量）间接推断嵌套层级。ShareList 查询使用 `related_path LIKE ? || '%'` 前缀匹配，可追溯所有同 Backend + 同路径前缀的共享记录。
+
+> 建议优先在**候选位置 ①（CanManageShare 中间件）**植入深度限制，理由：
+> - 创建时一次性拦截，不影响访问路径的性能
+> - 已有管理权三层判定的基础结构，只需追加 scenario 4
+> - 与 CanShare 边界检测同层，代码结构一致
 
 ---
 
@@ -1652,3 +1876,44 @@ MODULE 缩写：
 | `§CODE_SITECFG_PluginEnable` | `server/plugin/plg_handler_site/config.go` | L16-28 | 站点功能开关配置 |
 | `§CODE_ERR_LoopDetected` | `server/common/error.go` | L174 | HTTP 508 Loop Detected 定义 |
 | `§CODE_FRONT_RoleMapping` | `public/assets/pages/filespage/modal_share.js` | L329-357 | 前端角色→权限映射 |
+
+### 10.3 §CODE 命名反例
+
+以下是不符合规范的命名示例及其问题，便于代码审查时快速识别：
+
+| 反例 | 问题 | 正确命名 |
+|------|------|---------|
+| `§CODE_share_upsert` | ❌ 模块缩写不全，全小写 | `§CODE_SMODEL_ShareUpsert` |
+| `§CODE_FILE_CTRL` | ❌ 模块缩写不存在（无 FILE_CTRL），无功能描述 | `§CODE_FCTRL_FileSave` |
+| `§CODE_common_crypto.go_Encrypt` | ❌ 用文件名替代模块缩写 | `§CODE_CRYPTO_EncryptString` |
+| `§CODE_SERVER_MODEL_SHARE_GO_LINE_86` | ❌ 行号写在名称中（行号随代码变更） | `§CODE_SMODEL_ShareUpsert` |
+| `§CODE_can_read_function` | ❌ 无模块前缀，用描述性英文不清晰 | `§CODE_PMODEL_CanReadWrite` |
+| `§CODE_SCTRL_ShareUpsert:35` | ❌ 在锚点名称后附加行号（用索引表记录行号） | `§CODE_SCTRL_ShareUpsert` |
+| `§CODE_ENCRYPT_DECRYPT_1` | ❌ 数字后缀替代函数名，无法 grep | `§CODE_CRYPTO_EncryptString` |
+| `§CODE_permissions` | ❌ 仅模块级别，无具体功能 | `§CODE_PMODEL_CanReadWrite` |
+| `§CODE_MIDDLEWARE` | ❌ 全大写无下划线区分层级 | `§CODE_SESSION_SessionStart` |
+| `§CODE_session.start` | ❌ 用点替代下划线，grep 时需转义 | `§CODE_SESSION_SessionStart` |
+
+**命名校验正则**（供 CI Lint 使用）：
+
+```regex
+^§CODE_[A-Z]{2,9}_[A-Z][a-zA-Z0-9_]{1,40}$
+```
+
+校验规则分解：
+1. 必须以 `§CODE_` 开头
+2. 模块缩写：2-9 位大写字母
+3. 后接 `_` 分隔
+4. 函数名：首字母大写，后续 a-zA-Z0-9_，总长 ≤ 40
+5. 不含任何特殊字符（无 `.`, `:`, `-` 等）
+
+**grep 使用示例**：
+
+```bash
+# 查找某个锚点在代码中的实际位置
+grep -rn "type Share struct" server/common/        # 对应 §CODE_TYPES_ShareStruct
+grep -rn "func CanRead\|func CanEdit" server/model/ # 对应 §CODE_PMODEL_CanReadWrite
+
+# 列出文档中所有锚点（用于完整性检查）
+grep -o "§CODE_[A-Z_]*" share-permission.md | sort | uniq
+```
