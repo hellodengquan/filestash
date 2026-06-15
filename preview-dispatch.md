@@ -1851,7 +1851,527 @@ GET /api/files/cat?path=/movie.mp4&thumbnail=true
 
 ---
 
-## 十八、关键代码索引
+## 十九、多 Backend 存储切换机制
+
+Filestash 通过 `IBackend` 接口抽象多种存储后端，支持 S3、FTP、SFTP、SMB、WebDAV、本地文件系统等。后端切换在每个请求的中间件中完成。
+
+### 19.1 IBackend 接口定义
+
+**位置**：`server/common/types.go:13`
+
+```go
+type IBackend interface {
+    Init(params map[string]string, app *App) (IBackend, error)
+    Ls(path string) ([]os.FileInfo, error)
+    Stat(path string) (os.FileInfo, error)
+    Cat(path string) (io.ReadCloser, error)
+    Mkdir(path string) error
+    Rm(path string) error
+    Mv(from string, to string) error
+    Save(path string, file io.Reader) error
+    Touch(path string) error
+    LoginForm() Form
+}
+```
+
+每个方法职责：
+| 方法 | 作用 |
+|------|------|
+| `Init()` | 用连接参数初始化后端实例（鉴权、建立连接） |
+| `LoginForm()` | 返回前端登录表单结构 |
+| `Ls()`/`Stat()`/`Cat()` | 读操作 |
+| `Mkdir()`/`Rm()`/`Mv()`/`Save()`/`Touch()` | 写操作 |
+
+### 19.2 Backend Driver 注册与工厂
+
+**位置**：`server/common/backend.go`
+
+```go
+var Backend = NewDriver()  // 全局单例
+
+type Driver struct {
+    ds map[string]IBackend  // name → 空实例（原型）
+}
+
+func (d *Driver) Register(name string, driver IBackend) {
+    d.ds[name] = driver
+}
+
+func (d *Driver) Get(name string) IBackend {
+    b := d.ds[name]
+    if b == nil || name == "_nothing_" {
+        return Nothing{}  // 空操作后端
+    }
+    return b
+}
+```
+
+**插件注册示例（S3 后端）：
+```go
+// server/plugin/plg_backend_s3/index.go:37-40
+func init() {
+    Backend.Register("s3", S3Backend{})  // 注册空原型
+    S3Cache = NewAppCache(2, 1)
+}
+```
+
+**已注册的后端**（通过 `init()` 自动调用）：
+| type 值 | 后端 | 目录 |
+|---------|------|------|
+| `s3` | AWS S3 | `plg_backend_s3` |
+| `ftp` | FTP | `plg_backend_ftp` |
+| `sftp` | SFTP | `plg_backend_sftp` |
+| `smb` | SMB/CIFS | `plg_backend_smb` |
+| `webdav` | WebDAV | `plg_backend_webdav` |
+| `local` | 本地文件系统 | `plg_backend_local` |
+| `ldap` | LDAP | `plg_backend_ldap` |
+| `git` | Git | `plg_backend_git` |
+
+### 19.3 后端初始化与白名单校验
+
+**位置**：`server/model/files.go:9-51 → `NewBackend()`
+
+```go
+func NewBackend(ctx *App, conn map[string]string) (IBackend, error) {
+    isAllowed := func() bool {
+        possibilities := make([]map[string]interface{}, 0)
+        for i := 0; i < len(Config.Conn); i++ {
+            d := Config.Conn[i]
+            if d["type"] != conn["type"] { continue }
+            if val, ok := d["hostname"]; ok && val != conn["hostname"] { continue }
+            if val, ok := d["path"]; ok && !strings.HasPrefix(conn["path"], val.(string)) { continue }
+            if val, ok := d["url"]; ok && val != conn["url"] { continue }
+            possibilities = append(possibilities, Config.Conn[i])
+        }
+        return len(possibilities) > 0
+    }
+
+    if isAllowed() == false {
+        return Backend.Get("_nothing_"), ErrNotAllowed
+    }
+    return Backend.Get(conn["type"]).Init(conn, ctx)
+}
+```
+
+**安全设计**：
+- 后端连接必须匹配 `Config.Conn`（管理员在 `config.json` 中预定义的连接）
+- 匹配维度：`type` → `hostname` → `path` → `url`
+- 防止用户绕过管理员配置，连接到未授权的后端
+
+### 19.4 切换流程（每个请求）
+
+**位置**：`server/middleware/session.go:57-83 → `SessionStart()`
+
+```go
+func SessionStart(fn HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        ctx.Share, _ = _extractShare(req)        // 1. 提取 share（如有）
+        ctx.Authorization = _extractAuthorization(req)  // 2. 提取 token
+        ctx.Session, _ = _extractSession(req, ctx)      // 3. 解密 session
+        ctx.Backend, _ = _extractBackend(req, ctx)     // 4. ← 初始化后端
+        fn(ctx, res, req)                            // 5. 执行业务 handler
+    })
+}
+```
+
+`_extractBackend`：
+```go
+func _extractBackend(req *http.Request, ctx *App) (IBackend, error) {
+    return model.NewBackend(ctx, ctx.Session)
+}
+```
+
+**Session 中的后端连接参数存储在加密的 session cookie 中，包含：
+- `type`: 后端类型（`s3`/`ftp` 等）
+- `hostname`: 服务器地址
+- `username`/`password`: 凭证
+- `path`: 根路径
+- 各后端特有的参数（如 `region`, `bucket`, `encryption_key` 等）
+
+### 19.5 Config.Conn 配置来源
+
+**位置**：`server/common/config.go:194-201`
+
+```go
+var d struct { Connections []map[string]any `json:"connections"` }
+json.Unmarshal(cFile, &d)
+this.Conn = d.Connections
+```
+
+来自 `config.json` 中的 `connections` 数组，由管理员配置：
+```json
+{
+  "connections": [
+    {"type": "s3", "hostname": "s3.amazonaws.com", "path": "/my-bucket" }
+  ]
+}
+```
+
+---
+
+## 二十、ShareLink 生成、校验与公开访问权限
+
+ShareLink 允许用户将文件/文件夹分享给外部用户，支持密码保护、邮件验证、权限控制。
+
+### 20.1 Share 数据模型
+
+**SQLite 表结构（`server/model/index.go:24）：
+```sql
+CREATE TABLE Share(
+    id VARCHAR(64) PRIMARY KEY,
+    related_backend VARCHAR(16),
+    related_path VARCHAR(512),
+    params JSON,
+    auth VARCHAR(4093),
+    FOREIGN KEY (related_backend, related_path) REFERENCES Location(backend, path)
+)
+```
+
+**Share 结构体字段：
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `Id` | string | Share ID（URL 路径参数） |
+| `Backend` | string | 后端 session hash） |
+| `Path` | string | 分享的路径 |
+| `Auth` | string | 加密的 session cookie（用于后端鉴权） |
+| `Password` | *string | bcrypt 哈希密码 |
+| `Users` | *string | 逗号分隔的允许的邮箱列表 |
+| `Expire` | *int64 | 过期时间戳 |
+| `CanRead` | bool | 可读 |
+| `CanWrite` | bool | 可写 |
+| `CanUpload` | bool | 可上传 |
+| `CanShare` | bool | 可再分享 |
+| `CanManageOwn` | bool | 可管理自己的分享 |
+
+### 20.2 ShareLink 生成
+
+**位置**：`server/ctrl/share.go:35 → `ShareUpsert()
+
+```go
+func ShareUpsert(ctx *App, res http.ResponseWriter, req *http.Request) {
+    share_id := mux.Vars(req)["share"]
+    s := Share{
+        Id: share_id,
+        Auth: func() string {
+            // 从当前 cookie 中提取加密 session
+            str := ""
+            for index := 0; ; index++ {
+                cookie, err := req.Cookie(CookieName(index))
+                if err != nil { break }
+                str += cookie.Value
+            }
+            return str
+        }(),
+        Backend: GenerateID(ctx.Session),  // session hash 作为后端 ID
+        Path: leftPath + rightPath,
+        // ... 其他字段
+    }
+    if err := model.ShareUpsert(&s); err != nil { ... }
+}
+```
+
+**持久化**（`server/model/share.go:85）：
+```go
+func ShareUpsert(p *Share) error {
+    // bcrypt 哈希密码（如果有）
+    if p.Password != nil && *p.Password != PASSWORD_DUMMY {
+        hashed, _ := bcrypt.GenerateFromPassword([]byte(*p.Password), bcrypt.DefaultCost)
+        p.Password = NewString(string(hashed))
+    }
+    // 插入 Location 表（用于外键约束）
+    stmt, _ := DB.Prepare("INSERT INTO Location(backend, path) VALUES($1, $2)
+    stmt.Exec(p.Backend, p.Path)
+    // 插入/更新 Share 表
+    stmt, _ = DB.Prepare(`INSERT INTO Share(...) VALUES(...) ON CONFLICT(id) DO UPDATE SET ...`)
+    j, _ := json.Marshal(&struct{ ... }{
+        Password, Users, Expire, Url, CanShare, CanManageOwn, CanRead, CanWrite, CanUpload
+    }{...})
+    stmt.Exec(p.Id, p.Backend, p.Path, j, p.Auth)
+}
+```
+
+### 20.3 ShareLink 访问校验
+
+**位置**：`server/ctrl/share.go:106 → `ShareVerifyProof()`
+
+支持两步验证流程：
+
+```
+用户访问 /s/<share_id>
+    │
+    ▼
+┌─ ① 初始化上下文 ─────────────────────────┐
+│   model.ShareGet(share_id)             │
+│   requiredProof = ShareProofGetRequired(s)  │
+│   verifiedProof = 从 cookie 读取已验证 │
+└────────────┬─────────────────────────┘
+             │
+             ▼
+┌─ ② 验证 proof ───────────────────────┐
+│   还有未验证 proof?                      │
+│   password: bcrypt.CompareHashAndPassword  │
+│   email: 匹配 → 发验证码 → 输验证码  │
+└────────────┬─────────────────────────┘
+             │
+             ▼
+┌─ ③ 持久化验证结果 ───────────────────┐
+│   加密 proof 到 COOKIE_NAME_PROOF    │
+│   MaxAge: 30 天                      │
+│   HttpOnly, SameSite=None, Secure     │
+└────────────┬─────────────────────────┘
+             │
+             ▼
+┌─ ④ 返回权限 ─────────────────────────┐
+│   还有未验证 proof? → 返回下一个       │
+│   全部验证 → 返回 {Id, Path, 权限     │
+└───────────────────────────────────────┘
+```
+
+**Proof 验证器（`server/model/share.go:150）：
+| Proof 类型 | 验证逻辑 |
+|------------|---------|
+| `password` | bcrypt 比对，失败 sleep 1s 防暴力 |
+| `email` | 匹配邮箱列表（支持通配符 `*@domain.com`）→ 发验证码到邮箱 → 用户输入验证码 → DB 校验 |
+
+**通配符匹配**（`share.go:269）：
+```go
+func ShareProofVerifierEmail(users string, wanted string) (string, bool) {
+    for _, possibleUser := range strings.Split(users, ",") {
+        possibleUser = strings.TrimSpace(possibleUser)
+        if wanted == possibleUser { return possibleUser, true }
+        if possibleUser[0:1] == "*" {
+            if strings.HasSuffix(wanted, strings.TrimPrefix(possibleUser, "*")) {
+                return possibleUser, true
+            }
+        }
+    }
+    return "", false
+}
+```
+
+### 20.4 ShareLink 中间件
+
+**位置**：`server/middleware/session.go:96 → `CanManageShare()`
+
+```go
+func CanManageShare(fn HandlerFunc) HandlerFunc {
+    share_id := mux.Vars(req)["share"]
+    s, err := model.ShareGet(share_id)
+    // 场景 1：新 share（未找到）→ 正常 SessionStart
+    // 场景 2：share 存在
+    //   → 是创建者（s.Backend == GenerateID(ctx.Session)) → 允许
+    //   → 非创建者
+    //     → 有 CanManageOwn → 允许
+    //     → 否则 → 拒绝
+}
+```
+
+### 20.5 Share 访问鉴权
+
+**位置**：`server/middleware/session.go:262 → `_extractSession()`
+
+当 `ctx.Share.Id != "" 时：
+```go
+str, err = DecryptString(SECRET_KEY_DERIVATE_FOR_USER, ctx.Share.Auth)
+json.Unmarshal([]byte(str), &session)
+// Share.Path 是目录 → session["path"] = Share.Path
+// Share.Path 是文件 → chroot 到该文件
+```
+
+**Share 访问的文件操作通过 Share.Path 进行 chroot，确保：
+- 目录分享：可访问目录下所有文件
+- 文件分享：仅能访问该文件，无法浏览周围
+
+### 20.6 ShareLink 公开访问默认配置
+
+**位置**：`server/common/config.go:294
+
+```go
+SharedLinkDefaultAccess string `json:"share_default_access"`
+```
+
+来自 `config.json` 中的 `share_default_access` 配置，决定新创建 ShareLink 时的默认权限。
+
+---
+
+## 二十一、UserConfig 远程同步与远程 mount
+
+Filestash 的配置系统分为三层：**服务端全局配置、前端全局配置、用户偏好、远程 mount（ShareLink）。
+
+### 21.1 服务端全局配置
+
+**位置**：`server/common/config.go`
+
+```
+config.json (磁盘文件)
+    │
+    ▼
+Configuration.Load() 启动时加载
+    │
+    ▼
+Configuration.Conn → 后端连接白名单
+Configuration.Get(path) → 获取配置值
+Configuration.Export() → 导出给前端
+```
+
+**导出给前端的字段（`config.go:286-309）：
+```go
+return struct {
+    Editor                  string
+    License                 string
+    DisplayHidden           bool
+    Name                    string
+    UploadButton            bool
+    Connections             interface{}  // 后端连接列表
+    SharedLinkDefaultAccess string
+    SharedLinkRedirect      string
+    Logout                  string
+    MimeTypes               map[string]string
+    // ... 20+ 字段
+}{...}
+```
+
+### 21.2 前端配置拉取
+
+**位置**：`public/assets/model/config.js
+
+```javascript
+const config$ = ajax({ url: "api/config", method: "GET" }).pipe(
+    rxjs.map(({ responseJSON }) => responseJSON.result),
+);
+
+let CONFIG = {};
+
+export async function init() {
+    const config = await config$.toPromise();
+    CONFIG = config;
+    return config;
+}
+
+export function get(key, defaultValue) {
+    if (key) return CONFIG[key] || defaultValue;
+    return CONFIG;
+}
+```
+
+**前端启动时拉取（`ctrl_boot_frontoffice.js:13）：
+```javascript
+setup_config().then((config) => Promise.all([
+    setup_title(config),
+    verify_origin(config),
+]))
+```
+
+### 21.3 用户偏好本地存储
+
+**位置**：`public/assets/lib/store.js`
+
+```javascript
+export function settingsGet(initialValues, prefix = "") {
+    const raw = JSON.parse(localStorage.getItem("settings") || "{}") || {};
+    // 从 localStorage 读取，前缀隔离不同页面
+}
+
+export function settingsSave(currentValues, prefix = "") {
+    const raw = JSON.parse(localStorage.getItem("settings") || "{}") || {};
+    localStorage.setItem("settings", JSON.stringify(raw));
+}
+```
+
+**filespage 状态管理（`state_config.js:5-34）：
+```javascript
+let state$ = new rxjs.BehaviorSubject(settingsGet({
+    view: getConfig("default_view", "grid"),
+    show_hidden: getConfig("display_hidden", false),
+    sort: getConfig("default_sort", "type"),
+}, "filespage"));
+
+export const setState = (...args) => {
+    // ... 更新 state$
+    settingsSave({ view, show_hidden, sort, order }, "filespage");
+}
+```
+
+### 21.4 用户 Session 远程存储
+
+用户的后端连接凭证存储在**加密 Cookie 中，由服务端管理：
+
+```
+登录 /api/session/auth
+    │
+    ▼
+服务端验证后端凭证
+    │
+    ▼
+session = { type, hostname, username, password, path, ..., timestamp }
+    │
+    ▼
+加密: EncryptString(SECRET_KEY_DERIVATE_FOR_USER, json(session))
+    │
+    ▼
+分片 Cookie: CookieName(0), CookieName(1), ... (每片 3800 字节)
+    │
+    ▼
+Set-Cookie 响应头
+```
+
+**Session 超时：
+- `timestamp` 字段记录创建时间
+- 有效期：`general.cookie_timeout` 分钟（默认 1 年）
+- 超过 1 年强制重新登录
+
+### 21.5 远程 mount（ShareLink 挂载）
+
+远程 mount 指通过 ShareLink 访问其他用户分享的文件。完整调用栈：
+
+```
+GET /s/<share_id>?path=/sub/file.txt
+    │
+    ▼
+┌─ ① 中间件 SessionStart ────────────────┐
+│   _extractShare(req)                  │
+│   → 从 URL 提取 share_id              │
+│   → model.ShareGet(share_id)           │
+│   → 验证 IsValid()                   │
+└───────────────┬──────────────────────┘
+                    │
+                    ▼
+┌─ ② _extractSession ─────────────────┐
+│   ctx.Share.Id != ""                 │
+│   → DecryptString(ctx.Share.Auth)      │
+│   → 解密 session                        │
+│   → 设置 session["path"] = Share.Path   │
+└───────────────┬──────────────────────┘
+                    │
+                    ▼
+┌─ ③ _extractBackend ──────────────────┐
+│   model.NewBackend(ctx, session)          │
+│   → isAllowed() 白名单校验             │
+│   → Backend.Get(type).Init(...)          │
+└───────────────┬──────────────────────┘
+                    │
+                    ▼
+┌─ ④ 执行业务 Handler ─────────────────┐
+│   FileCatHandler(ctx, res, req)       │
+│   → 路径 = Share.Path + req.path     │
+│   → 受 Share 权限控制                 │
+└──────────────────────────────────────┘
+```
+
+### 21.6 配置层级总结
+
+| 层级 | 存储位置 | 同步方式 | 持久化 |
+|------|---------|---------|--------|
+| 服务端全局配置 | `config.json` | 服务端启动加载 | 磁盘文件 |
+| 前端全局配置 | `/api/config` | 应用启动 GET | 内存（CONFIG 对象） |
+| 用户偏好 | `localStorage["settings"]` | 页面内读写 | 浏览器本地 |
+| 用户 Session | 加密 Cookie | 每个请求自动携带 | Cookie（1 年） |
+| Share 数据 | SQLite (`share.sqlite`) | 服务端 DB | 磁盘数据库 |
+| Share Proof | 加密 Cookie | 验证后写入 | Cookie（30 天） |
+
+---
+
+## 二十二、关键代码索引
 
 | 层级 | 文件 | 关键函数/结构 |
 |------|------|-------------|
@@ -1912,3 +2432,24 @@ GET /api/files/cat?path=/movie.mp4&thumbnail=true
 | 视频缩略图 ffmpeg | `server/plugin/plg_video_thumbnail/index.go:47` | `Hooks.Register.Thumbnailer("video/mp4", ...)` |
 | 视频缩略图缓存 | `server/plugin/plg_video_thumbnail/index.go:17` | `VideoCachePath = "data/cache/video-thumbnail/"` |
 | 前端缩略图请求 | `public/assets/pages/filespage/thing.js:115` | `?path=...&thumbnail=true` |
+| **IBackend 接口** | `server/common/types.go:13` | 10 方法后端抽象 |
+| Backend Driver 注册 | `server/common/backend.go:21` | `Backend.Register(name, driver)` |
+| Backend Driver 获取 | `server/common/backend.go:28` | `Backend.Get(name)` |
+| 后端初始化 + 白名单 | `server/model/files.go:9` | `NewBackend()` → `isAllowed()` |
+| Session 中间件 | `server/middleware/session.go:57` | `SessionStart()` 每请求初始化 Backend |
+| Config.Conn 配置 | `server/common/config.go:194` | `connections` 后端连接白名单 |
+| Share 模型 | `server/model/share.go:66` | `ShareGet()` / `ShareUpsert()` / `ShareDelete()` |
+| Share 数据结构 | `server/common/types.go` | `Share` 结构体 |
+| Share API | `server/ctrl/share.go:13` | `ShareList()` / `ShareUpsert()` / `ShareDelete()` |
+| Share 校验 | `server/ctrl/share.go:106` | `ShareVerifyProof()` — 密码/邮件验证流程 |
+| Proof 验证器 | `server/model/share.go:150` | `ShareProofVerifier()` / `ShareProofVerifierPassword()` / `ShareProofVerifierEmail()` |
+| Share 中间件 | `server/middleware/session.go:96` | `CanManageShare()` — 权限控制 |
+| Share _extractShare | `server/middleware/session.go:222` | 从 URL 提取 share_id 并验证 |
+| 服务端配置加载 | `server/common/config.go:163` | `Configuration.Load()` |
+| 服务端配置导出 | `server/common/config.go:286` | `Configuration.Export()` |
+| 前端配置拉取 | `public/assets/model/config.js:4` | `config$` → `/api/config` |
+| 前端配置 get | `public/assets/model/config.js:20` | `get(key, defaultValue)` |
+| 用户偏好存储 | `public/assets/lib/store.js:1` | `settingsGet()` / `settingsSave()` |
+| filespage 状态管理 | `public/assets/pages/filespage/state_config.js:5` | `init()` / `getState$()` / `setState()` |
+| Session 提取 | `server/middleware/session.go:262` | `_extractSession()` — 解密 Cookie |
+| 鉴权提取 | `server/middleware/session.go:160` | `_extractAuthorization()` — 4 级 fallback |
