@@ -34,43 +34,162 @@ Filestash 的共享链接权限系统采用**三层验证 + 五级权限**架构
                     └─────────────────────┘
 ```
 
-核心代码分布：
-- 数据模型：`server/model/share.go`、`server/common/types.go:180-204`
-- 中间件验证：`server/middleware/session.go`
-- 控制器逻辑：`server/ctrl/share.go`、`server/ctrl/files.go`
-- 权限判定：`server/model/permissions.go`
-- 路由配置：`server/routes.go:70-79`
+核心代码分布与锚点：
+
+| 模块 | 文件 | 关键行号 |
+|-----|------|---------|
+| 密钥派生 | `server/common/constants.go` | L64-79 |
+| 加密/哈希/随机 | `server/common/crypto.go` | L1-266 |
+| Share 结构体 | `server/common/types.go` | L164-204 |
+| App 上下文 | `server/common/app.go` | L7-15 |
+| 数据模型 | `server/model/share.go` | L1-656 |
+| 数据库建表 | `server/model/index.go` | L12-46 |
+| 权限判定 | `server/model/permissions.go` | L1-33 |
+| 中间件链执行 | `server/middleware/index.go` | L21-37 |
+| 会话提取 | `server/middleware/session.go` | L57-331 |
+| HTTP 中间件 | `server/middleware/http.go` | L1-129 |
+| Body 解析 | `server/middleware/context.go` | L1-35 |
+| 共享控制器 | `server/ctrl/share.go` | L1-213 |
+| 文件控制器 | `server/ctrl/files.go` | L79-1117 |
+| 会话控制器 | `server/ctrl/session.go` | L1-537 |
+| WebDAV 处理 | `server/ctrl/webdav.go` | L1-80 |
+| WebDAV 文件系统 | `server/model/webdav.go` | L33-134 |
+| 路由配置 | `server/routes.go` | L19-176 |
+| 前端共享模态框 | `public/assets/pages/filespage/modal_share.js` | L1-370 |
+| 站点处理器插件 | `server/plugin/plg_handler_site/index.go` | L1-110 |
+| 站点中间件 | `server/plugin/plg_handler_site/middleware.go` | L1-48 |
+| 站点配置 | `server/plugin/plg_handler_site/config.go` | L1-56 |
 
 ---
 
 ## 二、凭证签发机制
 
-### 2.1 密钥派生体系
+### 2.1 主密钥初始化与派生调用链
 
-所有密钥均从主密钥 `SECRET_KEY` 通过 SHA-256 哈希派生，实现密钥用途隔离：
+主密钥 `SECRET_KEY` 在两处初始化，随后通过 `InitSecretDerivate` 派生所有子密钥：
 
-**文件**：`server/common/constants.go`
+**调用链 1 — 配置加载时**：`server/common/config_state.go:44-46`
 
-| 派生密钥 | 用途 |
-|---------|------|
-| `SECRET_KEY_DERIVATE_FOR_USER` | 加密/解密 Session Cookie（包含后端连接凭证） |
-| `SECRET_KEY_DERIVATE_FOR_PROOF` | 加密/解密 Proof Cookie（共享访问验证状态） |
-| `SECRET_KEY_DERIVATE_FOR_ADMIN` | 加密/解密管理员会话 |
-| `SECRET_KEY_DERIVATE_FOR_HASH` | 生成邮箱哈希校验码（网络驱动器认证） |
+```
+LoadConfig()
+  └─ gjson.Get(configStr, "general.secret_key").String()  // 从 config.json 读取
+  └─ InitSecretDerivate(secret)                            // 派生子密钥
+```
 
-### 2.2 加密算法
+**调用链 2 — 运行时配置变更时**：`server/common/config.go:251-259`
 
-采用 **AES-256-GCM** 对称加密 + **Zlib** 压缩的组合：
+```
+Configuration.Initialise()
+  └─ if secret_key == "":
+  │     key := RandomString(16)     // 生成 16 位随机密钥
+  │     this.Get("general.secret_key").Set(key)
+  └─ InitSecretDerivate(this.Get("general.secret_key").String())
+```
 
-**文件**：`server/common/crypto.go`
+**`InitSecretDerivate` 完整逻辑**：`server/common/constants.go:72-79`
 
 ```go
-func EncryptString(secret string, data string) (string, error) {
-    d, _ := compress([]byte(data))              // Zlib 压缩
-    d, _ = EncryptAESGCM([]byte(secret), d)     // AES-GCM 加密
-    return base64.URLEncoding.EncodeToString(d), nil  // URL安全Base64
+func InitSecretDerivate(secret string) {
+    SECRET_KEY = secret
+    SECRET_KEY_DERIVATE_FOR_PROOF     = Hash("PROOF_"+SECRET_KEY, len(SECRET_KEY))
+    SECRET_KEY_DERIVATE_FOR_ADMIN     = Hash("ADMIN_"+SECRET_KEY, len(SECRET_KEY))
+    SECRET_KEY_DERIVATE_FOR_USER      = Hash("USER_"+SECRET_KEY, len(SECRET_KEY))
+    SECRET_KEY_DERIVATE_FOR_HASH      = Hash("HASH_"+SECRET_KEY, len(SECRET_KEY))
+    SECRET_KEY_DERIVATE_FOR_SIGNATURE = Hash("SGN_"+SECRET_KEY, len(SECRET_KEY))
 }
 ```
+
+每个派生密钥通过 `Hash()` → `sha256.New()` → `hashSize()` → `ReversedBaseChange()` 生成，长度等于主密钥长度（`len(SECRET_KEY)`），字符集为 `[a-zA-Z0-9]`。
+
+| 派生密钥 | 前缀 | 用途 | 加密对象 |
+|---------|------|------|---------|
+| `SECRET_KEY_DERIVATE_FOR_USER` | `USER_` | Session Cookie / Share.auth 字段 | 后端连接凭证 |
+| `SECRET_KEY_DERIVATE_FOR_PROOF` | `PROOF_` | Proof Cookie | 已验证凭证列表 |
+| `SECRET_KEY_DERIVATE_FOR_ADMIN` | `ADMIN_` | 管理员会话 | 管理员 Token |
+| `SECRET_KEY_DERIVATE_FOR_HASH` | `HASH_` | WebDAV 用户名哈希 | 防伪造校验码 |
+| `SECRET_KEY_DERIVATE_FOR_SIGNATURE` | `SGN_` | SSO 签名验证 | 属性签名 |
+
+### 2.2 加密算法与签名机制
+
+**完整加密调用链**：`server/common/crypto.go:27-37`
+
+```
+EncryptString(secret, plaintext)
+  ├─ compress([]byte(plaintext))            // L166-172: zlib.NewWriter 压缩
+  ├─ EncryptAESGCM([]byte(secret), compressed)  // L128-144
+  │     ├─ aes.NewCipher(key)               // AES-256 (key=32字节)
+  │     ├─ cipher.NewGCM(block)             // GCM 模式
+  │     ├─ GCMNonce.Next()                  // 生成 12 字节 nonce
+  │     └─ gcm.Seal(nonce, nonce, pt, nil)  // 输出 = nonce || ciphertext || tag
+  └─ base64.URLEncoding.EncodeToString(ciphertext)
+```
+
+**解密调用链**：`server/common/crypto.go:39-53`
+
+```
+DecryptString(secret, ciphertext)
+  ├─ base64.URLEncoding.DecodeString(ciphertext)
+  ├─ DecryptAESGCM([]byte(secret), raw)
+  │     ├─ aes.NewCipher(key)
+  │     ├─ cipher.NewGCM(block)
+  │     ├─ 分离 nonce 和密文
+  │     └─ gcm.Open(nil, nonce, ct, nil)    // 认证+解密
+  └─ decompress(plaintext)                  // zlib 解压
+```
+
+**GCM Nonce 生成器**：`server/common/crypto.go:240-265`
+
+```go
+type NonceGenerator struct {
+    current []byte   // 当前 nonce 状态
+    count   int      // nonce 尺寸（12）
+    *sync.Mutex
+}
+
+// 初始化：使用 crypto/rand 生成首个 nonce
+func NewNonceGenerator(size int) NonceGenerator {
+    firstNonce := make([]byte, size)
+    io.ReadFull(rand.Reader, firstNonce)  // crypto/rand 安全随机源
+    return NonceGenerator{firstNonce, size, &sync.Mutex{}}
+}
+
+// 递增：大端序 +1，避免 nonce 重复
+func (this *NonceGenerator) Next() []byte {
+    this.Lock()
+    for i := len(this.current) - 1; i >= 0; i-- {
+        if this.current[i] < 255 {
+            this.current[i] += 1
+            break
+        }
+        this.current[i] = 0  // 进位
+    }
+    newNonce := this.current
+    this.Unlock()
+    return newNonce
+}
+```
+
+> **注意**：Nonce 生成采用**首随机 + 递增**策略。首次由 `crypto/rand` 生成真随机种子，后续通过大端序递增保证唯一性。Mutex 保证并发安全。AES-GCM 自身提供认证标签（16 字节），因此系统未使用独立的 HMAC 签名函数（`sign()` / `verify()` 在 `crypto.go:184-190` 中为空壳占位）。
+
+**Hash 函数调用链**：`server/common/crypto.go:55-104`
+
+```
+Hash(str, n)
+  ├─ sha256.New()
+  ├─ hasher.Write([]byte(str))
+  ├─ hasher.Sum(nil)                         // 32 字节 SHA-256 摘要
+  └─ hashSize(digest, n)                     // 截取前 n 个字符
+        └─ ReversedBaseChange(Letters, b[i]) // 字节值 → 自定义进制字符串
+```
+
+**随机源对比**：
+
+| 函数 | 随机源 | 用途 | 代码位置 |
+|-----|-------|------|---------|
+| `RandomString(n)` | `crypto/rand`（安全） | 验证码、主密钥生成 | `crypto.go:106-118` |
+| `QuickString(n)` | `math/rand`（非安全） | 非安全场景 | `crypto.go:120-126` |
+| `NewNonceGenerator(size)` | `crypto/rand`（安全） | AES-GCM nonce | `crypto.go:246-251` |
+| `NonceGenerator.Next()` | 确定性递增 | AES-GCM nonce | `crypto.go:253-265` |
 
 ### 2.3 Share 凭证签发流程
 
@@ -89,7 +208,7 @@ func ShareUpsert(ctx *App, res http.ResponseWriter, req *http.Request) {
                 str := ""
                 index := 0
                 for {
-                    cookie, err := req.Cookie(CookieName(index))
+                    cookie, err := req.Cookie(CookieName(index))  // CookieName: "auth", "auth1", "auth2", ...
                     if err != nil { break }
                     index++
                     str += cookie.Value
@@ -105,8 +224,25 @@ func ShareUpsert(ctx *App, res http.ResponseWriter, req *http.Request) {
             }
             return ctx.Share.Backend
         }(),
-        Path: /* 拼接完整路径，考虑父共享嵌套 */,
-        // ... 权限位、密码、过期时间等
+        Path: func() string {
+            leftPath := "/"
+            rightPath := strings.TrimPrefix(NewStringFromInterface(ctx.Body["path"]), "/")
+            if ctx.Share.Id != "" {
+                leftPath = ctx.Share.Path   // 子共享基于父共享路径
+            } else if ctx.Session["path"] != "" {
+                leftPath = EnforceDirectory(ctx.Session["path"])
+            }
+            return leftPath + rightPath
+        }(),
+        Password:     NewStringpFromInterface(ctx.Body["password"]),
+        Users:        NewStringpFromInterface(ctx.Body["users"]),
+        Expire:       NewInt64pFromInterface(ctx.Body["expire"]),
+        Url:          NewStringpFromInterface(ctx.Body["url"]),
+        CanManageOwn: NewBoolFromInterface(ctx.Body["can_manage_own"]),
+        CanShare:     NewBoolFromInterface(ctx.Body["can_share"]),
+        CanRead:      NewBoolFromInterface(ctx.Body["can_read"]),
+        CanWrite:     NewBoolFromInterface(ctx.Body["can_write"]),
+        CanUpload:    NewBoolFromInterface(ctx.Body["can_upload"]),
     }
     model.ShareUpsert(&s)
 }
@@ -115,7 +251,7 @@ func ShareUpsert(ctx *App, res http.ResponseWriter, req *http.Request) {
 **签发关键点**：
 1. **Auth 字段**：存储创建者的加密 Session，包含后端类型、用户名、密码、路径等完整连接信息
 2. **Backend 字段**：通过 `GenerateID(ctx.Session)` 生成，用于标识共享归属
-3. **嵌套共享**：通过共享链接再创建子共享时，直接复用父共享的 `auth` 凭证
+3. **嵌套共享**：通过共享链接再创建子共享时，直接复用父共享的 `auth` 凭证；路径拼接基于父共享的 `ctx.Share.Path`
 4. **密码处理**：使用 bcrypt 哈希存储，`PASSWORD_DUMMY` 占位符用于前端回显
 
 **密码哈希存储**：
@@ -125,46 +261,49 @@ func ShareUpsert(ctx *App, res http.ResponseWriter, req *http.Request) {
 func ShareUpsert(p *Share) error {
     if p.Password != nil {
         if *p.Password == PASSWORD_DUMMY {
-            // 前端回传占位符，保留原密码
             if s, err := ShareGet(p.Id); err == nil {
-                p.Password = s.Password
+                p.Password = s.Password  // 保留原密码
             }
         } else {
-            // 新密码：bcrypt 哈希
             hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(*p.Password), bcrypt.DefaultCost)
             p.Password = NewString(string(hashedPassword))
         }
     }
-    // ... 写入数据库
+    // INSERT INTO Location + INSERT/UPDATE Share
 }
 ```
 
 ### 2.4 Backend ID 生成算法
 
-用于唯一标识某个后端连接会话：
-
-**文件**：`server/common/crypto.go`
+**文件**：`server/common/crypto.go:193-218`
 
 ```go
 func GenerateID(params map[string]string) string {
     p := ""
-    for _, key := range sortedKeys(params) {
+    orderedKeys := make([]string, len(params))
+    for key, _ := range params {
+        orderedKeys = append(orderedKeys, key)
+    }
+    sort.Strings(orderedKeys)  // 字典序排列保证确定性
+
+    for _, key := range orderedKeys {
         switch key {
-        case "password", "path", "session", "timestamp": // 排除敏感/易变字段
+        case "password", "path", "session", "timestamp":  // 排除敏感/易变字段
         default:
             if val := params[key]; val != "" {
-                p += key + "=>" + val + ", "
+                p += key + "=>" + params[key] + ", "
             }
         }
     }
+    if p == "" { return "na" }
     p += "salt=>" + SECRET_KEY  // 混入主密钥防止伪造
-    return Hash(p, 20)
+    return Hash(p, 20)          // SHA-256 → 20字符
 }
 ```
 
 此 ID 用于：
 1. 关联 Share 记录与创建者的后端（`related_backend` 字段）
-2. 判断共享管理权归属（创建者校验）
+2. 判断共享管理权归属（创建者校验：`s.Backend == GenerateID(ctx.Session)`）
 
 ### 2.5 数据库存储结构
 
@@ -174,7 +313,7 @@ func GenerateID(params map[string]string) string {
 CREATE TABLE IF NOT EXISTS Location(
     backend VARCHAR(16), 
     path VARCHAR(512), 
-    PRIMARY KEY(backend, path)
+    CONSTRAINT pk_location PRIMARY KEY(backend, path)
 );
 
 CREATE TABLE IF NOT EXISTS Share(
@@ -193,6 +332,7 @@ CREATE TABLE IF NOT EXISTS Verification(
     code VARCHAR(4), 
     expire DATETIME DEFAULT (datetime('now', '+10 minutes'))
 );
+CREATE INDEX idx_verification ON Verification(code, expire);
 ```
 
 ---
@@ -207,28 +347,24 @@ CREATE TABLE IF NOT EXISTS Verification(
 
 ```go
 func _extractShare(req *http.Request) (Share, error) {
-    // 1. 提取 share_id（URL query 或 path variable）
-    share_id := _extractShareId(req)
+    share_id := _extractShareId(req)         // URL query "share" 或 path variable
     if share_id == "" { return Share{}, nil }
     
-    // 2. 检查共享功能是否启用
     if Config.Get("features.share.enable").Bool() == false {
         return Share{}, NewError("Feature isn't enabled", 405)
     }
 
-    // 3. 从数据库读取 Share 记录
     s, err := model.ShareGet(share_id)
-    if err != nil { return Share{}, nil }
+    if err != nil { return Share{}, nil }     // 查不到→空 Share（非共享请求）
     
-    // 4. 校验是否过期
-    if err = s.IsValid(); err != nil {
+    if err = s.IsValid(); err != nil {        // 过期校验
         return Share{}, err
     }
 
-    // 5. 获取已验证凭证（从 Proof Cookie）
+    // Proof-of-knowledge 一次校验（Cookie 中的已验证凭证）
     var verifiedProof []model.Proof = model.ShareProofGetAlreadyVerified(req)
     
-    // 6. 支持 HTTP Basic Auth（WebDAV 场景）
+    // WebDAV Basic Auth 二次校验
     username, password := parseBasicAuth(req.Header.Get("Authorization"))
     if s.Users != nil && username != "" {
         if v, ok := model.ShareProofVerifierEmail(*s.Users, username); ok {
@@ -241,13 +377,24 @@ func _extractShare(req *http.Request) (Share, error) {
         }
     }
 
-    // 7. 计算剩余需要验证的凭证
     requiredProof := model.ShareProofGetRequired(s)
     remainingProof := model.ShareProofCalculateRemainings(requiredProof, verifiedProof)
     if len(remainingProof) != 0 {
         return Share{}, NewError("Unauthorized Shared space", 400)
     }
-    return s, nil  // 验证通过
+    return s, nil
+}
+```
+
+**`_extractShareId` 的两个来源**：`server/middleware/session.go:190-200`
+
+```go
+func _extractShareId(req *http.Request) string {
+    share := req.URL.Query().Get("share")   // ?share=xxx
+    if share != "" { return share }
+    m := mux.Vars(req)["share"]             // /api/share/{share} 或 /s/{share}
+    if m == "private" { return "" }          // "private" 保留字：忽略
+    return m
 }
 ```
 
@@ -261,16 +408,15 @@ Proof 系统支持两种验证方式，可**组合使用**（需同时满足）�
 
 ```go
 func ShareProofVerifierPassword(hashed string, given string) (string, bool) {
-    // 使用 bcrypt 进行慢哈希比对，防止暴力破解
     if err := bcrypt.CompareHashAndPassword([]byte(hashed), []byte(given)); err != nil {
         return "", false
     }
-    return hashed, true
+    return hashed, true  // 返回哈希值作为 Proof Value
 }
 ```
 
 安全措施：
-- 密码使用 **bcrypt** 算法存储（默认 cost）
+- 密码使用 **bcrypt** 算法存储（默认 cost=10）
 - 验证失败后故意 **Sleep 1秒** 防止爆破（`server/model/share.go:160`）
 - 密码哈希值本身作为 Proof 的 Value，用于后续等价性判断
 
@@ -298,104 +444,49 @@ func ShareProofVerifierEmail(users string, wanted string) (string, bool) {
 
 邮箱验证**两步流程**：
 1. **提交邮箱** → 系统生成 4 位随机验证码 → 发送验证邮件（`server/model/share.go:166-229`）
-2. **提交验证码** → 系统从 `Verification` 表查询 → 匹配后立即删除（一次性使用）
+2. **提交验证码** → 系统从 `Verification` 表查询（需未过期）→ 匹配后立即删除（一次性使用）
 
-验证码存储特性：
-- **有效期**：10 分钟（数据库默认值）
-- **一次性**：使用后立即删除（`server/model/share.go:252-255`）
-- **自动清理**：后台 goroutine 每 6 小时清理过期记录
+验证码生成调用链：`RandomString(4)` → `crypto/rand.Read` → `[a-zA-Z0-9]` 字符集
 
 ### 3.3 Proof 验证控制器
 
 **文件**：`server/ctrl/share.go:106-213`
 
+完整流程：
+
+1. **初始化上下文**：从数据库加载 Share、获取已验证/需要验证的 Proof
+2. **防滥用检查**：verifiedProof > 20 或 requiredProof > 20 → 强制清空 Proof Cookie（`MaxAge: -1`）
+3. **验证链接有效性**：`s.IsValid()` 过期校验
+4. **处理提交的 Proof**：`ShareProofVerifier()` 执行密码/邮箱/验证码验证
+5. **邮箱验证码特殊处理**：发送后返回提示，前端需再次提交验证码
+6. **去重并追加**：`submittedProof.Id = Hash(Key+"::"+Value, 20)`，检查是否已存在
+7. **计算剩余 Proof**：`ShareProofCalculateRemainings()`
+8. **持久化到 Cookie**：`EncryptString(SECRET_KEY_DERIVATE_FOR_PROOF, json.Marshal(verifiedProof))`
+9. **返回结果**：剩余 → 返回下一个需要验证的 Proof；全部通过 → 返回权限信息
+
+**验证通过后返回的权限信息**：
+
 ```go
-func ShareVerifyProof(ctx *App, res http.ResponseWriter, req *http.Request) {
-    // 1. 初始化上下文
-    s, _ := model.ShareGet(share_id)
-    submittedProof := model.Proof{Key: type, Value: value}
-    verifiedProof := model.ShareProofGetAlreadyVerified(req)
-    requiredProof := model.ShareProofGetRequired(s)
-
-    // 2. 防滥用检查
-    if len(verifiedProof) > 20 || len(requiredProof) > 20 {
-        // 强制清空 Proof Cookie
-        http.SetCookie(res, &http.Cookie{
-            Name: COOKIE_NAME_PROOF, Value: "", MaxAge: -1, Path: COOKIE_PATH,
-        })
-        return
-    }
-    
-    // 3. 验证共享链接有效性
-    if err := s.IsValid(); err != nil {
-        SendErrorResult(res, err)
-        return
-    }
-
-    // 4. 处理提交的 Proof
-    submittedProof, err = model.ShareProofVerifier(s, submittedProof)
-    if err != nil {
-        submittedProof.Error = NewString(err.Error())
-        SendSuccessResult(res, submittedProof)
-        return
-    }
-    
-    // 5. 邮箱验证码特殊处理（发送后返回提示）
-    if submittedProof.Key == "code" {
-        submittedProof.Value = ""
-        submittedProof.Message = NewString("We've sent you a message with a verification code")
-        SendSuccessResult(res, submittedProof)
-        return
-    }
-
-    // 6. 将验证通过的 Proof 加入已验证列表
-    if submittedProof.Key != "" {
-        submittedProof.Id = Hash(submittedProof.Key+"::"+submittedProof.Value, 20)
-        // 去重检查
-        if alreadyExist == false {
-            verifiedProof = append(verifiedProof, submittedProof)
-        }
-    }
-
-    // 7. 计算剩余需要验证的 Proof
-    remainingProof = model.ShareProofCalculateRemainings(requiredProof, verifiedProof)
-
-    // 8. 持久化 Proof 到 Cookie
-    cookie := http.Cookie{
-        Name: COOKIE_NAME_PROOF,
-        Value: EncryptString(SECRET_KEY_DERIVATE_FOR_PROOF, json.Marshal(verifiedProof)),
-        Path:     COOKIE_PATH,
-        MaxAge:   60 * 60 * 24 * 30,  // 30 天
-        HttpOnly: true,
-        SameSite: http.SameSiteNoneMode,
-        Secure:   true,
-    }
-    http.SetCookie(res, &cookie)
-
-    // 9. 返回结果
-    if len(remainingProof) > 0 {
-        SendSuccessResult(res, remainingProof[0])  // 返回下一个需要验证的 Proof
-        return
-    }
-    // 全部验证通过 → 返回权限信息
-    SendSuccessResult(res, struct {
-        Id, Path string
-        CanRead, CanWrite, CanUpload bool
-    }{s.Id, s.Path, s.CanRead, s.CanWrite, s.CanUpload})
-}
+SendSuccessResult(res, struct {
+    Id        string `json:"id"`
+    Path      string `json:"path"`
+    CanRead   bool   `json:"can_read"`
+    CanWrite  bool   `json:"can_write"`
+    CanUpload bool   `json:"can_upload"`
+}{s.Id, s.Path, s.CanRead, s.CanWrite, s.CanUpload})
 ```
 
-### 3.4 Proof Cookie 持久化与等价性判断
+> 注意：前端获取此返回值后，在后续所有请求中通过 `?share=xxx` 参数标识共享上下文。
 
-验证通过的 Proof 被加密后存入 Cookie：
+### 3.4 Proof Cookie 持久化与等价性判断
 
 **文件**：`server/model/share.go:291-309`
 
 ```go
 func ShareProofGetAlreadyVerified(req *http.Request) []Proof {
-    c, _ := req.Cookie(COOKIE_NAME_PROOF)
+    c, _ := req.Cookie(COOKIE_NAME_PROOF)  // Cookie name = "proof"
     if c == nil { return []Proof{} }
-    if len(c.Value) > 500 { return []Proof{} }  // 防膨胀
+    if len(c.Value) > 500 { return []Proof{} }  // 防膨胀攻击
     j, err := DecryptString(SECRET_KEY_DERIVATE_FOR_PROOF, c.Value)
     if err != nil { return []Proof{} }
     var p []Proof
@@ -404,17 +495,13 @@ func ShareProofGetAlreadyVerified(req *http.Request) []Proof {
 }
 ```
 
-**Proof 等价性判断**（判断已验证的 Proof 是否满足某一需求）：
-
-**文件**：`server/model/share.go:341-354`
+**Proof 等价性判断**：`server/model/share.go:341-354`
 
 ```go
 func shareProofAreEquivalent(ref Proof, p Proof) bool {
     if ref.Key != p.Key { return false }
-    // 密码：直接比对哈希值
-    if ref.Value != "" && ref.Value == p.Value { return true }
-    // 邮箱：通过 ID 比对，ID = Hash("email::" + 邮箱地址, 20)
-    for _, chunk := range strings.Split(ref.Value, ",") {
+    if ref.Value != "" && ref.Value == p.Value { return true }  // 密码：哈希值直接比对
+    for _, chunk := range strings.Split(ref.Value, ",") {       // 邮箱：ID 比对
         chunk = strings.Trim(chunk, " ")
         if p.Id == Hash(ref.Key+"::"+chunk, 20) {
             return true
@@ -434,7 +521,30 @@ email[hash]
 
 其中 `hash = Hash(email + SECRET_KEY_DERIVATE_FOR_HASH, 10)`，防止伪造用户名。
 
-**文件**：`server/middleware/session.go:222-242`、`server/model/share.go:654-656`
+**用户名解析**：`server/middleware/session.go:222-242`
+
+```go
+username, password := func(authHeader string) (string, string) {
+    decoded, _ := base64.StdEncoding.DecodeString(
+        strings.TrimPrefix(authHeader, "Basic "),
+    )
+    s := bytes.Split(decoded, []byte(":"))
+    usr := regexp.MustCompile(`^(.*)\[([0-9a-zA-Z]+)\]$`).FindStringSubmatch(string(s[0]))
+    if len(usr) != 3 { return "", p }
+    if Hash(usr[1]+SECRET_KEY_DERIVATE_FOR_HASH, 10) != usr[2] {
+        return "", p  // 哈希不匹配→拒绝
+    }
+    return usr[1], p  // 返回真实邮箱
+}(req.Header.Get("Authorization"))
+```
+
+**用户名编码**：`server/model/share.go:654-656`
+
+```go
+func networkDriveUsernameEnc(email string) string {
+    return email + "[" + Hash(email+SECRET_KEY_DERIVATE_FOR_HASH, 10) + "]"
+}
+```
 
 ---
 
@@ -455,6 +565,7 @@ type Share struct {
     Password     *string `json:"password,omitempty"`
     Users        *string `json:"users,omitempty"`
     Expire       *int64  `json:"expire,omitempty"`
+    Url          *string `json:"url,omitempty"`
     CanShare     bool    `json:"can_share"`      // 能否再共享（创建子共享）
     CanManageOwn bool    `json:"can_manage_own"` // 能否管理自己创建的共享（预留）
     CanRead      bool    `json:"can_read"`       // 能否读取文件
@@ -465,6 +576,26 @@ type Share struct {
 
 > **注意**：`CanManageOwn` 权限在数据模型中已定义，但当前代码中未实际使用，属于预留字段。
 
+前端 Metadata 结构体（返回给前端的权限元数据）：
+
+**文件**：`server/common/types.go:164-176`
+
+```go
+type Metadata struct {
+    CanSee             *bool      `json:"can_read,omitempty"`
+    CanCreateFile      *bool      `json:"can_create_file,omitempty"`
+    CanCreateDirectory *bool      `json:"can_create_directory,omitempty"`
+    CanRename          *bool      `json:"can_rename,omitempty"`
+    CanMove            *bool      `json:"can_move,omitempty"`
+    CanUpload          *bool      `json:"can_upload,omitempty"`
+    CanDelete          *bool      `json:"can_delete,omitempty"`
+    CanShare           *bool      `json:"can_share,omitempty"`
+    HideExtension      *bool      `json:"hide_extension,omitempty"`
+    RefreshOnCreate    *bool      `json:"refresh_on_create,omitempty"`
+    Expire             *time.Time `json:"-"`
+}
+```
+
 ### 4.2 权限判定核心函数
 
 **文件**：`server/model/permissions.go:1-33`
@@ -472,26 +603,23 @@ type Share struct {
 ```go
 func CanRead(ctx *App) bool {
     if ctx.Share.Id != "" { return ctx.Share.CanRead }
-    return true  // 非共享上下文：默认允许
+    return true
 }
-
 func CanEdit(ctx *App) bool {
     if ctx.Share.Id != "" { return ctx.Share.CanWrite }
     return true
 }
-
 func CanUpload(ctx *App) bool {
     if ctx.Share.Id != "" { return ctx.Share.CanUpload }
     return true
 }
-
 func CanShare(ctx *App) bool {
     if ctx.Share.Id != "" { return ctx.Share.CanShare }
     return true
 }
 ```
 
-**设计原则**：非共享上下文默认全部允许，共享上下文严格按权限位判定。
+**设计原则**：非共享上下文默认全部允许，共享上下文严格按权限位判定。判定依据是 `ctx.Share.Id` 是否非空——由 `SessionStart` 中间件的 `_extractShare()` 设置。
 
 ### 4.3 前端角色与权限映射
 
@@ -505,24 +633,75 @@ func CanShare(ctx *App) bool {
 | editor | ✅ | ✅ | ✅ | 完全编辑 |
 | uploader | ❌ | ❌ | ✅ | 仅上传（看不到文件） |
 
+**角色→权限映射**：`modal_share.js:329-346`
+
+```javascript
+function roleToShareObj(role) {
+    return {
+        can_read:  role === "viewer" || role === "editor",
+        can_write: role === "editor",
+        can_upload: role === "uploader" || role === "editor",
+    };
+}
+```
+
+**权限→角色反查**：`modal_share.js:348-357`
+
+```javascript
+function shareObjToRole({ can_read, can_write, can_upload }) {
+    if (can_read && !can_write && !can_upload) return "viewer";
+    if (!can_read && !can_write && can_upload) return "uploader";
+    if (can_read && can_write && can_upload) return "editor";
+    return undefined;  // 自定义权限组合无法映射到预设角色
+}
+```
+
 ### 4.4 各 API 对应的权限要求
 
-| API 路由 | 方法 | 所需权限 | 备注 |
-|---------|------|---------|------|
-| `/api/files/ls` | GET | CanRead | 无 CanRead 但有 CanUpload 时返回空列表 |
-| `/api/files/cat` | GET/HEAD | CanRead | 含文件读取、缩略图、下载 |
-| `/api/files/zip` | GET | CanRead | ZIP 打包下载 |
-| `/api/files/unzip` | POST | CanRead + CanUpload | 解压需创建目录和写入文件 |
-| `/api/files/save` | POST/PATCH | CanEdit \|\| CanUpload | CanEdit=覆盖；仅 CanUpload 时禁止覆盖 |
-| `/api/files/mv` | POST | CanEdit | 移动/重命名 |
-| `/api/files/rm` | POST | CanEdit | 删除 |
-| `/api/files/mkdir` | POST | CanUpload | 创建目录 |
-| `/api/files/touch` | POST | CanUpload | 创建空文件 |
-| `/api/files/search` | GET | CanRead | 搜索 |
-| `/api/share` | GET | 需创建者身份 | 共享列表查询 |
-| `/api/share/{id}` | POST | CanManageShare | 创建/更新共享 |
-| `/api/share/{id}` | DELETE | CanManageShare | 删除共享 |
-| `/api/share/{id}/proof` | POST | 公开 | 验证凭证 |
+| API 路由 | HTTP 方法 | 所需权限 | 代码锚点 |
+|---------|----------|---------|---------|
+| `/api/files/ls` | GET | CanRead（无则看 CanUpload） | `files.go:80-88` |
+| `/api/files/cat` | GET/HEAD | CanRead | `files.go:208-212` |
+| `/api/files/zip` | GET | CanRead | `files.go` 下载器 |
+| `/api/files/unzip` | POST | CanRead + CanUpload | `files.go` 解压 |
+| `/api/files/save` | POST/PATCH | CanEdit ∥ CanUpload | `files.go:492-514` |
+| `/api/files/access` | OPTIONS | CanRead→GET, CanEdit→PUT, CanUpload→POST | `files.go:456-471` |
+| `/api/files/mv` | POST | CanEdit | `files.go:737` |
+| `/api/files/rm` | POST | CanEdit | `files.go:779` |
+| `/api/files/mkdir` | POST | CanUpload | `files.go:810` |
+| `/api/files/touch` | POST | CanUpload | `files.go:841` |
+| `/api/files/search` | GET | CanRead | `search.go:16` |
+| `/api/share` | GET | LoggedInOnly | `share.go:13` |
+| `/api/share/{id}` | POST | CanManageShare | `share.go:35` |
+| `/api/share/{id}` | DELETE | CanManageShare | `share.go:96` |
+| `/api/share/{id}/proof` | POST | 公开 | `share.go:106` |
+
+**`FileAccess` 权限探测函数**：`server/ctrl/files.go:443-475`
+
+此函数根据权限位返回允许的 HTTP 方法列表（`Allow` 头），供前端预检：
+
+```go
+func FileAccess(ctx *App, res http.ResponseWriter, req *http.Request) {
+    allowed := []string{}
+    if model.CanRead(ctx) {
+        if perms.CanSee == nil || *perms.CanSee == true {
+            allowed = append(allowed, "GET")
+        }
+    }
+    if model.CanEdit(ctx) {
+        if (perms.CanCreateFile == nil || *perms.CanCreateFile == true) &&
+            (perms.CanCreateDirectory == nil || *perms.CanCreateDirectory == true) {
+            allowed = append(allowed, "PUT")
+        }
+    }
+    if model.CanUpload(ctx) {
+        if perms.CanUpload == nil || *perms.CanUpload == true {
+            allowed = append(allowed, "POST")
+        }
+    }
+    header.Set("Allow", strings.Join(allowed, ", "))
+}
+```
 
 ### 4.5 WebDAV 权限映射
 
@@ -538,182 +717,110 @@ WebDAV 接口（`/s/{share_id}` 路径）仅在共享上下文下可用，权限
 | PUT | CanWrite && CanUpload | 文件上传 |
 | LOCK / UNLOCK | CanWrite && CanUpload | 文件锁操作 |
 
+WebDAV 层面的路径隔离由 `WebdavFs.fullpath()` 实现：
+
+**文件**：`server/model/webdav.go:125-134`
+
 ```go
-func WebdavHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
-    if ctx.Share.Id == "" {
-        http.NotFound(res, req)  // 非共享上下文不可用
-        return
+func (this WebdavFs) fullpath(path string) string {
+    p := filepath.Join(this.chroot, path)
+    if strings.HasSuffix(path, "/") && !strings.HasSuffix(p, "/") {
+        p += "/"
     }
-    canRead := model.CanRead(ctx)
-    canWrite := model.CanEdit(ctx)
-    canUpload := model.CanUpload(ctx)
-    switch req.Method {
-    case "OPTIONS", "HEAD", "GET":
-        if canRead == false { /* 403 */ }
-    case "MKCOL", "DELETE", "COPY", "MOVE", "PROPPATCH":
-        if canWrite == false { /* 403 */ }
-    case "PROPFIND":
-        if canRead == false { /* 403 */ }
-    case "PUT", "LOCK", "UNLOCK":
-        if canWrite == false || canUpload == false { /* 403 */ }
+    if strings.HasPrefix(p, this.chroot) == false {
+        return ""  // 路径逃逸→返回空→os.ErrNotExist
     }
-    // ... 调用 webdav Handler
+    return p
 }
 ```
+
+`chroot` 值来自 `ctx.Share.Path`，在 `WebdavHandler` 中传入 `NewWebdavFs(ctx.Backend, ctx.Share.Backend, ctx.Share.Path, req)`。
 
 ### 4.6 公共站点处理器权限
 
-当启用 `plg_handler_site` 插件时，`/public/{share}/` 路径提供静态站点访问：
+启用 `plg_handler_site` 插件时（`features.site.enable=true`），`/public/{share}/` 提供静态站点访问：
 
 **文件**：`server/plugin/plg_handler_site/index.go:35-83`
 
+- 仅需 `CanRead` 权限
+- 自动索引（autoindex）：`features.site.autoindex=true` 时，目录无 `index.html` 则列出文件
+- CORS：由 `features.site.cors_allow_origins` 控制，支持 `*` 或逗号分隔的 origin 列表
+- 目录访问时若存在 `index.html` 则自动返回
+
+站点列表页 `/public/` 需要 **管理员 Basic Auth**：
+
+**文件**：`server/plugin/plg_handler_site/middleware.go:34-48`
+
 ```go
-func SiteHandler(app *App, w http.ResponseWriter, r *http.Request) {
-    if app.Backend == nil {
-        SendErrorResult(w, ErrNotFound)
-        return
-    }
-    if model.CanRead(app) == false {
-        SendErrorResult(w, ErrPermissionDenied)
-        return
-    }
-    // ... 读取并返回文件
+func basicAdmin(fn HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, w http.ResponseWriter, r *http.Request) {
+        user, pass, ok := r.BasicAuth()
+        if !ok || user != "admin" {
+            w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+        if err := bcrypt.CompareHashAndPassword(
+            []byte(Config.Get("auth.admin").String()), []byte(pass),
+        ); err != nil {
+            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+        fn(ctx, w, r)
+    })
 }
 ```
-
-- 仅需 `CanRead` 权限
-- 自动索引（autoindex）功能也需通过 `CanRead` 检查
-- 目录访问时若存在 `index.html` 则自动返回该文件
 
 ### 4.7 文件列表中的细粒度权限探测
 
-LS 接口不仅返回文件列表，还在 Metadata 中返回前端可用的操作权限：
+LS 接口不仅返回文件列表，还在 Metadata 中返回前端可用的操作权限。权限计算采用**三层叠加**模型：
 
-**文件**：`server/ctrl/files.go:79-191`
+**文件**：`server/ctrl/files.go:79-144`
 
-```go
-func FileLs(ctx *App, res http.ResponseWriter, req *http.Request) {
-    // 1. 基础权限过滤
-    if model.CanRead(ctx) == false {
-        if model.CanUpload(ctx) == false {
-            SendErrorResult(res, ErrPermissionDenied)
-            return
-        }
-        SendSuccessResults(res, make([]FileInfo, 0))  // 纯上传：空列表
-        return
-    }
+1. **后端插件探测**（Backend Auth Middleware）：逐个尝试操作，失败则标记不可用
+2. **共享权限覆盖**（优先级高于插件）：根据 `CanEdit`/`CanUpload`/`CanShare` 批量禁用
+3. **前端 Metadata 输出**：`*bool` 类型，`nil`=允许，`false`=禁止
 
-    // 2. 通过 Authorisation 插件接口逐个探测权限
-    perms := Metadata{}
-    for _, auth := range Hooks.Get.AuthorisationMiddleware() {
-        if err = auth.Ls(ctx, path); err != nil { /* ... */ }
-        if err = auth.Mkdir(ctx, path); err != nil { perms.CanCreateDirectory = NewBool(false) }
-        if err = auth.Touch(ctx, path); err != nil { perms.CanCreateFile = NewBool(false) }
-        if err = auth.Mv(ctx, path, path); err != nil { perms.CanRename = false; perms.CanMove = false }
-        if err = auth.Save(ctx, path); err != nil { perms.CanUpload = NewBool(false) }
-        if err = auth.Rm(ctx, path); err != nil { perms.CanDelete = NewBool(false) }
-        if err = auth.Cat(ctx, path); err != nil { perms.CanSee = NewBool(false) }
-    }
+**共享权限对 Metadata 的覆盖规则**：
 
-    // 3. 共享权限覆盖（优先级高于插件探测）
-    if model.CanEdit(ctx) == false {
-        perms.CanCreateFile = NewBool(false)
-        perms.CanCreateDirectory = NewBool(false)
-        perms.CanRename = NewBool(false)
-        perms.CanMove = NewBool(false)
-        perms.CanDelete = NewBool(false)
-        perms.CanUpload = NewBool(false)
-    }
-    if model.CanUpload(ctx) == false {
-        perms.CanCreateDirectory = NewBool(false)
-        perms.CanRename = NewBool(false)
-        perms.CanMove = NewBool(false)
-        perms.CanDelete = NewBool(false)
-        perms.CanUpload = NewBool(false)
-    }
-    if model.CanShare(ctx) == false {
-        perms.CanShare = NewBool(false)
-    }
-    // ... 返回文件列表和权限元数据
-}
-```
+| 共享权限位 | 禁用的 Metadata 字段 |
+|-----------|---------------------|
+| `CanEdit=false` | CanCreateFile, CanCreateDirectory, CanRename, CanMove, CanDelete, CanUpload |
+| `CanUpload=false` | CanCreateDirectory, CanRename, CanMove, CanDelete, CanUpload |
+| `CanShare=false` | CanShare |
+
+> **继承规则**：共享权限是**目录级**的，作用于 `Share.Path` 及其所有子路径。没有按文件的细粒度权限——子目录/子文件继承父共享的全部权限位。子共享可以进一步限制（不可放宽），通过 `ShareUpsert` 中 `Path = parentShare.Path + rightPath` 拼接更深层路径实现。
 
 ### 4.8 CanEdit 与 CanUpload 的区别
 
-在 `FileSave` 中体现了关键差异：
-
 **文件**：`server/ctrl/files.go:492-514`
-
-```go
-if model.CanEdit(ctx) == false {
-    if model.CanUpload(ctx) == false {
-        SendErrorResult(res, ErrPermissionDenied)
-        return
-    }
-    // 仅 CanUpload：禁止覆盖已存在文件
-    root, filename := SplitPath(path)
-    entries, _ := ctx.Backend.Ls(root)
-    for _, e := range entries {
-        if e.Name() == filename {
-            SendErrorResult(res, ErrConflict)  // HTTP 409 Conflict
-            return
-        }
-    }
-}
-```
 
 | 权限 | 可新建 | 可覆盖 | 可删除 | 可修改 |
 |-----|-------|-------|-------|-------|
 | CanEdit | ✅ | ✅ | ✅ | ✅ |
 | CanUpload | ✅ | ❌ | ❌ | ❌ |
 
-### 4.9 共享管理权判定（CanManageShare）
+仅 CanUpload 时，`FileSave` 会先 `Ls` 目标目录检查同名文件，存在则返回 HTTP 409 Conflict。
 
-`CanManageShare` 中间件控制谁能修改/删除共享链接：
+### 4.9 共享管理权判定（CanManageShare）
 
 **文件**：`server/middleware/session.go:96-158`
 
-```go
-func CanManageShare(fn HandlerFunc) HandlerFunc {
-    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
-        share_id := mux.Vars(req)["share"]
-        s, err := model.ShareGet(share_id)
-        
-        if err == ErrNotFound {
-            // 情况1：ID 尚未使用，任何登录用户都可创建
-            SessionStart(fn)(ctx, res, req)
-            return
-        }
-
-        // 情况2：原始创建者（通过 Backend ID 匹配判断）
-        ctx.Share = Share{}
-        ctx.Session, _ = _extractSession(req, ctx)
-        if s.Backend == GenerateID(ctx.Session) {
-            fn(ctx, res, req)
-            return
-        }
-
-        // 情况3：非创建者但父共享授予了 CanShare 权限
-        ctx.Share, _ = _extractShare(req)  // 提取父共享上下文
-        ctx.Session, _ = _extractSession(req, ctx)
-        if s.Backend == GenerateID(ctx.Session) && s.CanShare == true {
-            fn(ctx, res, req)
-            return
-        }
-
-        SendErrorResult(res, ErrPermissionDenied)
-    })
-}
-```
-
 **三层管理权限逻辑**：
-1. **新 ID** → 任何已登录用户可占用创建
+1. **新 ID**（`ErrNotFound`）→ 任何已登录用户可占用创建
 2. **创建者本人** → 通过 `s.Backend == GenerateID(ctx.Session)` 判断（同一后端连接）
 3. **被授权的子用户** → 需同时满足：通过父共享访问 + 父共享 `CanShare=true`
 
+**嵌套共享的权限继承**：
+
+子共享创建时（`ctx.Share.Id != ""`），继承父共享的 `Auth` 和 `Backend`，路径基于父共享的 `ctx.Share.Path` 拼接。这意味着：
+- 子共享的访问者使用父共享创建者的后端凭证
+- 子共享权限**可以比父共享更严格**（例如父共享是 editor，子共享可以是 viewer）
+- 子共享**不能超越**父共享权限（前端不阻止，但后端权限函数按各自 Share 记录独立判定）
+
 ### 4.10 路径隔离（Chroot）
 
-共享链接访问时，Session 的 path 被强制限定在共享目标范围内，防止路径逃逸：
+共享链接访问时，Session 的 path 被强制限定在共享目标范围内：
 
 **文件**：`server/middleware/session.go:269-291`
 
@@ -723,8 +830,7 @@ if ctx.Share.Id != "" {
     json.Unmarshal([]byte(str), &session)
     
     if IsDirectory(ctx.Share.Path) {
-        // 目录共享：chroot 到该目录
-        session["path"] = ctx.Share.Path
+        session["path"] = ctx.Share.Path    // 目录共享：chroot 到该目录
     } else {
         // 文件共享：仅允许访问该具体文件
         var path string = req.URL.Query().Get("path")
@@ -736,17 +842,12 @@ if ctx.Share.Id != "" {
 }
 ```
 
-后续所有路径通过 `PathBuilder` 拼接时都会检查前缀：
-
-**文件**：`server/ctrl/files.go:1104-1117`
+`PathBuilder` 二次校验：`server/ctrl/files.go:1104-1117`
 
 ```go
 func PathBuilder(ctx *App, path string) (string, error) {
     sessionPath := ctx.Session["path"]
     basePath := filepath.ToSlash(filepath.Join(sessionPath, path))
-    if path[len(path)-1:] == "/" && basePath != "/" {
-        basePath += "/"
-    }
     if strings.HasPrefix(basePath, ctx.Session["path"]) == false {
         return "", ErrFilesystemError  // 路径逃逸检测
     }
@@ -774,57 +875,136 @@ func (s Share) IsValid() error {
 }
 ```
 
-**校验时机**：
-1. `_extractShare()` 提取共享时（`server/middleware/session.go:217`）
-2. `ShareVerifyProof()` 验证凭证时（`server/ctrl/share.go:141`）
+**校验时机**（两次 proof-of-knowledge 二次校验）：
+1. `_extractShare()` 提取共享时（`server/middleware/session.go:217`）— 每次请求
+2. `ShareVerifyProof()` 验证凭证时（`server/ctrl/share.go:141`）— 提交 Proof 时
 
-### 5.2 Proof Cookie 过期
+这意味着即使 Proof Cookie 仍在有效期内，过期链接在步骤 1 即被拦截。
 
-| 属性 | 值 | 说明 |
-|-----|----|------|
-| **MaxAge** | 30 天 | 长期有效，无需频繁验证 |
-| **HttpOnly** | true | 防止 XSS 窃取 |
-| **SameSite** | None | 支持跨站嵌入 iframe |
-| **Secure** | true | 仅 HTTPS 传输 |
-| **大小限制** | 500 字节 | 超过则视为无效（防膨胀） |
-| **数量限制** | 20 个 Proof | 超过则强制清空（防滥用） |
+### 5.2 访客 Cookie 处理
 
-**文件**：`server/ctrl/share.go:180-193`、`server/model/share.go:300`、`server/ctrl/share.go:130`
+共享链接访客涉及两类 Cookie：
 
-### 5.3 Session 凭证过期
+**Proof Cookie**（已验证凭证）：
 
-- 普通用户 Session Cookie 有独立过期时间（配置项控制）
+| 属性 | 值 | 代码位置 |
+|-----|----|---------|
+| Name | `"proof"` | `constants.go:13` |
+| MaxAge | 30 天（2592000 秒） | `share.go:188` |
+| HttpOnly | true | `share.go:190` |
+| SameSite | None | `share.go:191` |
+| Secure | true | `share.go:192` |
+| Path | `/api/` | `constants.go:16` |
+| 大小限制 | 500 字节（超过视为无效） | `share.go:300` |
+| 数量限制 | 20 个 Proof（超过强制清空） | `share.go:130-137` |
+| 加密密钥 | `SECRET_KEY_DERIVATE_FOR_PROOF` | `share.go:184` |
+
+**Session Cookie**（非共享访客不持有）：
+
+共享访客的"会话"不在 Cookie 中，而是通过 `?share=xxx` URL 参数 + Proof Cookie 组合标识。后端从 `Share.auth` 字段解密出创建者的 Session 来建立后端连接。
+
+**登录清除 Proof Cookie**：`server/ctrl/session.go:167-178`
+
+```go
+func SessionLogout(ctx *App, res http.ResponseWriter, req *http.Request) {
+    // 清除所有 auth Cookie
+    index := 0
+    for {
+        _, err := req.Cookie(CookieName(index))
+        if err != nil { break }
+        http.SetCookie(res, &http.Cookie{
+            Name: CookieName(index), Value: "", MaxAge: -1, Path: COOKIE_PATH,
+        })
+        index++
+    }
+    // 清除 admin Cookie
+    http.SetCookie(res, &http.Cookie{
+        Name: COOKIE_NAME_ADMIN, Value: "", MaxAge: -1, Path: COOKIE_PATH_ADMIN,
+    })
+    // 清除 Proof Cookie
+    http.SetCookie(res, &http.Cookie{
+        Name: COOKIE_NAME_PROOF, Value: "", MaxAge: -1, Path: COOKIE_PATH,
+    })
+}
+```
+
+**FileCat 中的下载标记 Cookie**：`server/ctrl/files.go:202-207`
+
+```go
+func FileCat(ctx *App, res http.ResponseWriter, req *http.Request) {
+    http.SetCookie(res, &http.Cookie{
+        Name:   "download",
+        Value:  "",
+        MaxAge: -1,    // 立即过期
+        Path:   "/",
+    })
+    // ... 文件读取逻辑
+}
+```
+
+### 5.3 Proof-of-knowledge 二次校验
+
+共享链接的访问验证分两层：
+
+**第一层（Cookie 内校验）**：`_extractShare()` 中的 `ShareProofGetAlreadyVerified()`
+
+- 从 `proof` Cookie 解密出已验证的 Proof 列表
+- 与 `ShareProofGetRequired()` 对比，计算剩余未验证项
+- 全部通过 → 放行；否则 → 400 错误
+
+**第二层（Basic Auth 旁路校验）**：`_extractShare()` 中的 `parseBasicAuth()`
+
+- 适用于 WebDAV 场景（无浏览器 Cookie）
+- 从 HTTP Authorization 头解析 username/password
+- 分别调用 `ShareProofVerifierEmail()` 和 `ShareProofVerifierPassword()` 即时验证
+- 验证通过的 Proof 合并到 `verifiedProof` 中
+
+这种**双通道校验**设计确保：
+- 浏览器用户：Proof Cookie 持久化，无需重复验证
+- WebDAV 用户：每次请求通过 Basic Auth 重新验证
+
+### 5.4 Session 凭证过期
+
+- 普通用户 Session Cookie 过期时间由 `general.cookie_timeout` 配置控制（`server/ctrl/session.go:115`）
+- Session 本身包含 `timestamp` 字段，`_extractSession` 校验不超过 365 天（`session.go:310`）
 - 创建者的 Session 被加密后存入数据库 `Share.auth` 字段，**无独立过期时间**
-- 主密钥变更会导致所有现存共享的 `auth` 字段无法解密（`server/middleware/session.go:271-274` 返回 `ErrNotAuthorized`）
+- 主密钥变更会导致所有现存共享的 `auth` 字段无法解密（`session.go:270-274` 返回 `ErrNotAuthorized`）
 
-### 5.4 邮箱验证码自动清理
+### 5.5 邮箱验证码定时清理
 
 **文件**：`server/model/index.go:35-46`
 
 ```go
 func init() {
     Hooks.Register.Onload(func() {
-        // ... 初始化数据库
+        // ... 初始化数据库表
         go func() {
-            autovacuum()  // 启动后台清理协程
+            autovacuum()
         }()
     })
 }
 
 func autovacuum() {
-    for {
-        // 删除过期的验证码记录
-        if stmt, err := DB.Prepare("DELETE FROM Verification WHERE expire < datetime('now')"); err == nil {
-            stmt.Exec()
-        }
-        time.Sleep(6 * time.Hour)  // 每 6 小时执行一次
+    if stmt, err := DB.Prepare("DELETE FROM Verification WHERE expire < datetime('now')"); err == nil {
+        stmt.Exec()
     }
+    time.Sleep(6 * time.Hour)  // 每 6 小时执行一次
 }
 ```
 
+> **注意**：原代码中 `autovacuum` 没有循环（仅执行一次+sleep），这是原始实现的缺陷。正确行为应为 `for { ...; time.Sleep(...) }`。
+
 此外，验证码在**成功使用后立即删除**（`server/model/share.go:252-255`），保证一次性使用。
 
-### 5.5 显式撤销（删除共享）
+**Verification 表索引**：`server/model/index.go:30-32`
+
+```sql
+CREATE INDEX idx_verification ON Verification(code, expire)
+```
+
+此索引优化了验证码查询：`SELECT key FROM Verification WHERE code = ? AND expire > datetime('now')`
+
+### 5.6 显式撤销（删除共享）
 
 **文件**：`server/ctrl/share.go:96-104`、`server/model/share.go:141-148`
 
@@ -838,19 +1018,15 @@ func ShareDelete(id string) error {
 
 删除后的影响：
 - 后续 `_extractShare()` 查不到记录 → 返回空 Share → 无法建立共享上下文
-- 用户已持有的 Proof Cookie **不会立即失效**，下次请求时因 Share 不存在而失败
+- 用户已持有的 Proof Cookie **不会立即失效**，下次请求时因 Share 不存在而自然失败
+- WebDAV 缓存文件会在 `webdav_cache.OnEvict` 回调中清理
 
-### 5.6 数据库级联删除
-
-Share 表通过外键关联到 Location 表，支持级联操作：
-
-**文件**：`server/model/index.go:24`
+### 5.7 数据库级联删除
 
 ```sql
 FOREIGN KEY (related_backend, related_path) 
     REFERENCES Location(backend, path) 
-    ON UPDATE CASCADE 
-    ON DELETE CASCADE
+    ON UPDATE CASCADE ON DELETE CASCADE
 ```
 
 当 Location（后端+路径组合）被删除时，相关的所有 Share 记录自动级联删除。
@@ -859,84 +1035,310 @@ FOREIGN KEY (related_backend, related_path)
 
 ## 六、路由与中间件链
 
-### 6.1 共享相关路由配置
+### 6.1 中间件链执行机制
 
-**文件**：`server/routes.go:70-79`
+**文件**：`server/middleware/index.go:21-37`
 
 ```go
-share := r.PathPrefix(WithBase("/api/share")).Subrouter()
+func NewMiddlewareChain(fn HandlerFunc, m []Middleware) http.HandlerFunc {
+    return func(res http.ResponseWriter, req *http.Request) {
+        var f func(*App, http.ResponseWriter, *http.Request) = fn
+        for i := len(m) - 1; i >= 0; i-- {  // 逆序包装
+            f = m[i](f)
+        }
+        app := App{Context: req.Context()}  // 初始化空 App
+        f(&app, &resw, req)
+        req.Body.Close()
+        go logger(&app, &resw, req)  // 异步日志
+    }
+}
+```
 
-// 共享列表：需登录
+执行顺序：**从右到左包装，从左到右执行**。例如 `[A, B, C]` → 请求流 `A→B→C→Handler→C→B→A`。
+
+### 6.2 各中间件功能
+
+**文件**：`server/middleware/http.go`
+
+| 中间件 | 功能 | 代码位置 |
+|-------|------|---------|
+| `ApiHeaders` | Content-Type: json, Cache-Control: no-cache, 透传 X-Request-ID | L14-24 |
+| `StaticHeaders` | Content-Type 按扩展名, Cache-Control: 30 天 | L26-33 |
+| `IndexHeaders` | Content-Type: html, XSS 保护, X-Frame-Options, X-Powered-By | L49-65 |
+| `SecureHeaders` | HSTS(强制SSL时), X-Content-Type-Options, X-XSS-Protection | L67-77 |
+| `SecureOrigin` | Host 白名单校验, XHR/CSRF 检查（`X-Requested-With: XmlHttpRequest`）| L79-105 |
+| `RateLimiter` | 全局令牌桶：10 req/s, burst=1000 | L107-121 |
+| `PublicCORS` | Access-Control-Allow-Origin: *, OPTIONS 预检 | L35-47 |
+| `BodyParser` | JSON body 解析到 `ctx.Body` | `context.go:11-35` |
+| `SessionStart` | 提取 Share + Authorization + Session + Backend | `session.go:57-83` |
+| `LoggedInOnly` | 检查 `ctx.Backend != nil && ctx.Session != nil` | `session.go:18-26` |
+| `CanManageShare` | 共享管理权三层判定 | `session.go:96-158` |
+| `PluginInjector` | 注入插件中间件链 | `index.go:72-76` |
+| `WebdavBlacklist` | 过滤 macOS 系统文件 (.DS_Store, ._*等) | `webdav.go:67-80` |
+
+### 6.3 各路径中间件链对比
+
+| 路径 | 中间件链 | 是否限流 | 是否需登录 | 是否 CSRF |
+|------|---------|---------|-----------|----------|
+| `/api/share` GET | ApiHeaders→SecureHeaders→SecureOrigin→**SessionStart**→**LoggedInOnly**→PluginInjector | ❌ | ✅ | ✅ SecureOrigin |
+| `/api/share/{id}` POST | ApiHeaders→SecureHeaders→SecureOrigin→BodyParser→**CanManageShare**→PluginInjector | ❌ | ✅(隐式) | ✅ |
+| `/api/share/{id}` DELETE | ApiHeaders→SecureHeaders→SecureOrigin→**CanManageShare**→PluginInjector | ❌ | ✅(隐式) | ✅ |
+| `/api/share/{id}/proof` POST | ApiHeaders→SecureHeaders→SecureOrigin→BodyParser→PluginInjector | ❌ | ❌ 公开 | ✅ |
+| `/api/session` POST | ApiHeaders→SecureHeaders→SecureOrigin→**RateLimiter**→BodyParser→PluginInjector | ✅ | ❌ | ✅ |
+| `/api/files/*` | ApiHeaders→SecureHeaders→[SecureOrigin→]SessionStart→LoggedInOnly→PluginInjector | ❌ | ✅ | ✅ |
+| `/s/{share}` (WebDAV GET) | IndexHeaders→SecureHeaders→PluginInjector | ❌ | ❌ | ❌ |
+| `/s/{share}` (WebDAV 其他) | **WebdavBlacklist**→**SessionStart**→PluginInjector | ❌ | ❌ | ❌ |
+| `/public/{share}/` | **SessionStart**→SecureHeaders→cors | ❌ | ❌ | ❌ |
+| `/public/` 列表 | SecureHeaders→**basicAdmin** | ❌ | ✅(Admin) | ❌ |
+
+**关键差异**：
+
+1. **Proof 接口无 SessionStart**：不提取 Session/Share，完全公开
+2. **WebDAV 无 SecureOrigin**：WebDAV 客户端不发送 `X-Requested-With`，CSRF 防护由 Basic Auth 替代
+3. **公共站点无 SecureOrigin**：允许跨域访问（有独立 CORS 中间件）
+4. **限流仅在登录接口**：`RateLimiter` 仅用于 `/api/session` POST（登录）和管理员登录
+5. **匿名访问限流**：共享 Proof 接口和公共站点均**无限流**，依赖 bcrypt 延迟和 Proof 数量限制防滥用
+
+### 6.4 SecureOrigin 的 CSRF 防护逻辑
+
+**文件**：`server/middleware/http.go:79-105`
+
+```go
+func SecureOrigin(fn HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        // 1. Host 白名单
+        if host := Config.Get("general.host").String(); host != "" {
+            if req.Host != host { SendErrorResult(res, ErrNotAllowed); return }
+        }
+        // 2. CSRF 检查（三选一通过）
+        if req.Header.Get("X-Requested-With") == "XmlHttpRequest" {  // 浏览器 XHR
+            fn(ctx, res, req); return
+        }
+        if Config.Get("features.api.enable").Bool() && len(req.Cookies()) == 0 {  // API 模式
+            fn(ctx, res, req); return
+        }
+        Log.Warning("Intrusion detection: %s - %s", RetrievePublicIp(req), req.URL.String())
+        SendErrorResult(res, ErrNotAllowed)
+    })
+}
+```
+
+**WebDAV/公共站点无 CSRF 检查**的原因：这些接口不经过 `SecureOrigin`，而是依赖 Proof Cookie 加密 + Basic Auth 保证安全。
+
+### 6.5 共享相关路由配置
+
+**文件**：`server/routes.go:70-91`
+
+```go
+// API for Shared link
+share := r.PathPrefix(WithBase("/api/share")).Subrouter()
 middlewares = []Middleware{ApiHeaders, SecureHeaders, SecureOrigin, SessionStart, LoggedInOnly, PluginInjector}
 share.HandleFunc("", NewMiddlewareChain(ShareList, middlewares)).Methods("GET")
 
-// 验证 Proof：公开接口
 middlewares = []Middleware{ApiHeaders, SecureHeaders, SecureOrigin, BodyParser, PluginInjector}
 share.HandleFunc("/{share}/proof", NewMiddlewareChain(ShareVerifyProof, middlewares)).Methods("POST")
 
-// 删除共享：需 CanManageShare 权限
 middlewares = []Middleware{ApiHeaders, SecureHeaders, SecureOrigin, CanManageShare, PluginInjector}
 share.HandleFunc("/{share}", NewMiddlewareChain(ShareDelete, middlewares)).Methods("DELETE")
 
-// 创建/更新共享：需 CanManageShare 权限 + BodyParser
 middlewares = []Middleware{ApiHeaders, SecureHeaders, SecureOrigin, BodyParser, CanManageShare, PluginInjector}
 share.HandleFunc("/{share}", NewMiddlewareChain(ShareUpsert, middlewares)).Methods("POST")
+
+// Webdav server / Shared Link
+middlewares = []Middleware{IndexHeaders, SecureHeaders, PluginInjector}
+r.HandleFunc(WithBase("/s/{share}"), NewMiddlewareChain(ServeFrontofficeHandler, middlewares)).Methods("GET")
+
+middlewares = []Middleware{WebdavBlacklist, SessionStart, PluginInjector}
+r.PathPrefix(WithBase("/s/{share}")).Handler(NewMiddlewareChain(WebdavHandler, middlewares))
 ```
-
-### 6.2 文件 API 中间件链
-
-**文件**：`server/routes.go:53-68`
-
-所有文件 API 都经过 `SessionStart` 中间件，会自动提取共享上下文并应用权限限制。
-
-### 6.3 WebDAV 路由
-
-WebDAV 接口专门用于共享链接的网络驱动器访问：
-
-**文件**：`server/routes.go:81-87`
-
-```go
-// WebDAV 接口（仅共享链接可用）
-r.PathPrefix(WithBase("/s/{share}")).Handler(NewMiddlewareChain(
-    WebdavHandler,
-    []Middleware{SessionStart, WebdavBlacklist, PluginInjector},
-))
-```
-
-- 必须通过共享链接访问（`ctx.Share.Id` 非空）
-- 经过 `WebdavBlacklist` 中间件过滤 macOS 系统文件（`.DS_Store`、`._*` 等）
-- 内部按 WebDAV 方法分别校验 `CanRead`/`CanWrite`/`CanUpload` 权限
-
-### 6.4 公共站点处理器路由
-
-启用 `plg_handler_site` 插件后提供静态站点访问：
-
-**文件**：`server/plugin/plg_handler_site/index.go:22-25`
-
-```go
-r.PathPrefix("/public/{share}/").HandlerFunc(NewMiddlewareChain(
-    SiteHandler,
-    []Middleware{SessionStart, SecureHeaders, cors},
-)).Methods("GET", "HEAD")
-```
-
-- 仅支持 GET 和 HEAD 方法
-- 需通过 `SessionStart` 提取共享上下文并验证 `CanRead` 权限
-- 用于将共享目录作为静态网站发布
 
 ---
 
-## 七、安全设计要点总结
+## 七、时序图
+
+### 7.1 共享链接创建时序
+
+```
+创建者浏览器          前端 modal_share.js        API Server              SQLite DB
+    │                      │                        │                       │
+    │  选择角色(viewer/    │                        │                       │
+    │  editor/uploader)    │                        │                       │
+    │─────────────────────>│                        │                       │
+    │                      │  roleToShareObj()       │                       │
+    │                      │  → {can_read,can_write, │                       │
+    │                      │     can_upload}         │                       │
+    │                      │                        │                       │
+    │  填写高级选项        │                        │                       │
+    │  (密码/邮箱/过期等)   │                        │                       │
+    │─────────────────────>│                        │                       │
+    │                      │  POST /api/share/{id}   │                       │
+    │                      │  Body: {id, path,       │                       │
+    │                      │   can_read, can_write,  │                       │
+    │                      │   can_upload, can_share,│                       │
+    │                      │   password?, users?,    │                       │
+    │                      │   expire?}              │                       │
+    │                      │───────────────────────>│                       │
+    │                      │                        │  CanManageShare 中间件 │
+    │                      │                        │  ├─ 若新ID: SessionStart│
+    │                      │                        │  └─ 若已有: 创建者校验  │
+    │                      │                        │                       │
+    │                      │                        │  ShareUpsert()         │
+    │                      │                        │  ├─ bcrypt 哈希密码    │
+    │                      │                        │  ├─ 拼接 Auth=Cookie拼接│
+    │                      │                        │  ├─ Backend=GenerateID │
+    │                      │                        │  ├─ Path=基础路径+子路径│
+    │                      │                        │  └─ UPSERT Share       │
+    │                      │                        │──────────────────────>│
+    │                      │                        │                       │
+    │                      │    200 OK               │                       │
+    │                      │<───────────────────────│                       │
+    │  复制链接到剪贴板     │                        │                       │
+    │<─────────────────────│                        │                       │
+```
+
+### 7.2 访客验证与访问时序
+
+```
+访客浏览器             API Server               SQLite DB           邮件服务器
+    │                      │                        │                   │
+    │  GET /s/{share_id}   │                        │                   │
+    │─────────────────────>│                        │                   │
+    │                      │  SessionStart 中间件    │                   │
+    │                      │  ├─ _extractShareId()   │                   │
+    │                      │  ├─ ShareGet(id)        │                   │
+    │                      │  │─────────────────────>│                   │
+    │                      │  │<────Share record────│                   │
+    │                      │  ├─ IsValid() 过期校验   │                   │
+    │                      │  ├─ ShareProofGetAlreadyVerified()          │
+    │                      │  │  (从 proof Cookie)   │                   │
+    │                      │  └─ 剩余Proof!=0 → 400 │                   │
+    │                      │                        │                   │
+    │  302 重定向到登录页    │                        │                   │
+    │<─────────────────────│                        │                   │
+    │                      │                        │                   │
+    │  POST /api/share/{id}/proof                   │                   │
+    │  {type:"password", value:"xxx"}                │                   │
+    │─────────────────────>│                        │                   │
+    │                      │  ShareVerifyProof()     │                   │
+    │                      │  ├─ ShareGet(id)        │                   │
+    │                      │  ├─ IsValid() 过期校验   │                   │
+    │                      │  ├─ ShareProofVerifier() │                   │
+    │                      │  │  └─ bcrypt.Compare()  │                   │
+    │                      │  ├─ 追加到 verifiedProof │                   │
+    │                      │  ├─ 计算剩余 Proof      │                   │
+    │                      │  └─ 设置 proof Cookie    │                   │
+    │                      │     (EncryptString)     │                   │
+    │                      │                        │                   │
+    │  若还需邮箱验证:       │                        │                   │
+    │  {type:"email", value:"user@co.com"}           │                   │
+    │─────────────────────>│                        │                   │
+    │                      │  ShareProofVerifier()   │                   │
+    │                      │  ├─ 匹配邮箱白名单      │                   │
+    │                      │  ├─ 生成4位验证码        │                   │
+    │                      │  ├─ INSERT Verification │                   │
+    │                      │  │─────────────────────>│                   │
+    │                      │  └─ 发送验证邮件         │                   │
+    │                      │────────────────────────────────────────────>│
+    │                      │                        │                   │
+    │  {key:"code", value:"A3B2"}                    │                   │
+    │─────────────────────>│                        │                   │
+    │                      │  ShareProofVerifier()   │                   │
+    │                      │  ├─ SELECT key FROM     │                   │
+    │                      │  │  Verification WHERE  │                   │
+    │                      │  │  code=? AND expire>now│                   │
+    │                      │  │─────────────────────>│                   │
+    │                      │  ├─ DELETE Verification │  (一次性消费)      │
+    │                      │  │─────────────────────>│                   │
+    │                      │  ├─ 追加 email Proof    │                   │
+    │                      │  └─ 全部通过 → 返回权限  │                   │
+    │                      │     {id, path, can_read,│                   │
+    │                      │      can_write, can_upload}                  │
+    │<─────────────────────│                        │                   │
+    │                      │                        │                   │
+    │  GET /api/files/ls?path=/&share={id}          │                   │
+    │  (携带 proof Cookie)  │                        │                   │
+    │─────────────────────>│                        │                   │
+    │                      │  SessionStart 中间件    │                   │
+    │                      │  ├─ _extractShare()     │                   │
+    │                      │  │  ├─ ShareGet()       │                   │
+    │                      │  │  ├─ IsValid()        │                   │
+    │                      │  │  ├─ Proof Cookie→verifiedProof          │
+    │                      │  │  └─ 剩余Proof==0 ✓   │                   │
+    │                      │  ├─ _extractSession()   │                   │
+    │                      │  │  └─ Decrypt auth→session│                │
+    │                      │  └─ _extractBackend()   │                   │
+    │                      │                        │                   │
+    │                      │  FileLs()               │                   │
+    │                      │  ├─ CanRead(ctx) → true │                   │
+    │                      │  ├─ 权限探测+覆盖        │                   │
+    │                      │  └─ 返回文件列表+Metadata│                   │
+    │<─────────────────────│                        │                   │
+```
+
+### 7.3 嵌套共享创建时序
+
+```
+子用户(通过父共享访问)    API Server               SQLite DB
+    │                      │                        │
+    │  POST /api/share/{new_id}                     │
+    │  share=parent_id     │                        │
+    │  Body: {path, can_read, ...}                  │
+    │─────────────────────>│                        │
+    │                      │  CanManageShare 中间件  │
+    │                      │  ├─ ShareGet(new_id)    │
+    │                      │  │  → ErrNotFound       │
+    │                      │  │  (新ID→走创建者路径)  │  ❌ 不是创建者!
+    │                      │  │                      │
+    │                      │  ├─ _extractSession()   │
+    │                      │  │  (无Share上下文)      │
+    │                      │  │  GenerateID(session)  │
+    │                      │  │  != s.Backend         │
+    │                      │  │                      │
+    │                      │  ├─ _extractShare()     │
+    │                      │  │  (提取父共享上下文)    │
+    │                      │  │  ShareGet(parent_id)  │
+    │                      │  │─────────────────────>│
+    │                      │  │<──parent Share record│
+    │                      │  │  parent.CanShare?     │
+    │                      │  │                      │
+    │                      │  ├─ _extractSession()   │
+    │                      │  │  Decrypt(parent.Auth) │
+    │                      │  │  GenerateID(session)  │
+    │                      │  │  == s.Backend?        │
+    │                      │  │  && parent.CanShare?  │
+    │                      │  │                      │
+    │                      │  └─ ✓ 通过 → 执行 Handler│
+    │                      │                        │
+    │                      │  ShareUpsert()          │
+    │                      │  ├─ Auth = parent.Auth  │  (复用父共享凭证)
+    │                      │  ├─ Backend = parent.Backend│(复用父后端ID)
+    │                      │  ├─ Path = parent.Path + rightPath│
+    │                      │  └─ UPSERT Share        │
+    │                      │───────────────────────>│
+    │                      │                        │
+    │    200 OK            │                        │
+    │<─────────────────────│                        │
+```
+
+---
+
+## 八、安全设计要点总结
 
 | 安全机制 | 实现方式 | 代码位置 |
 |---------|---------|---------|
-| **凭证加密** | AES-256-GCM + Zlib + 分用途派生密钥 | `crypto.go`、`constants.go` |
+| **凭证加密** | AES-256-GCM + Zlib + 分用途派生密钥 | `crypto.go:27-53`、`constants.go:72-79` |
+| **Nonce 唯一性** | crypto/rand 种子 + 大端序递增 + Mutex | `crypto.go:240-265` |
+| **密钥隔离** | 5 种派生密钥用途隔离（USER/PROOF/ADMIN/HASH/SGN） | `constants.go:64-78` |
 | **密码存储** | bcrypt 慢哈希 + 验证失败延迟 1s | `share.go:92-93`、`share.go:160-161` |
-| **路径隔离** | Session path 强制 chroot + PathBuilder 逃逸检测 | `session.go:276-290`、`files.go:1113` |
-| **验证码** | 4 位随机数 + 10 分钟过期 + 一次性消费 | `share.go:183-186`、`share.go:252-255` |
+| **路径隔离** | Session path chroot + PathBuilder 逃逸检测 + WebdavFs.fullpath() | `session.go:276-290`、`files.go:1113`、`webdav.go:125-134` |
+| **验证码** | 4 位 crypto/rand 随机数 + 10 分钟过期 + 一次性消费 + 6h 定时清理 | `share.go:183-186`、`share.go:252-255`、`index.go:41-46` |
 | **Cookie 安全** | HttpOnly + SameSite=None + Secure + 大小/数量限制 | `share.go:188-192`、`share.go:300` |
-| **嵌套共享** | 权限继承（父权限含 CanShare 才可再共享） | `session.go:131-154` |
+| **CSRF 防护** | SecureOrigin 中间件（XHR 检查 + Host 白名单） | `http.go:79-105` |
+| **嵌套共享** | 权限继承（父权限含 CanShare 才可再共享）+ Auth/Backend 复用 | `session.go:131-154`、`share.go:44-65` |
 | **上传保护** | 仅 CanUpload 时禁止覆盖已有文件（409 Conflict） | `files.go:498-513` |
 | **主密钥安全** | Auth 字段加密绑定主密钥，密钥变更则全失效 | `session.go:270-274` |
 | **数据库级联** | Location 删除级联 Share 清理 | `index.go:24` |
-| **防暴力破解** | 密码/邮箱验证失败后 sleep 1 秒 | `share.go:160`、`share.go:173` |
+| **防暴力破解** | 密码/邮箱验证失败后 sleep 1 秒 + bcrypt 慢哈希 | `share.go:160`、`share.go:173` |
+| **WebDAV 用户名防伪造** | email + HMAC 哈希校验码 | `session.go:238`、`share.go:654-656` |
+| **限流** | 全局令牌桶 10 req/s, burst=1000（仅登录接口） | `http.go:107-121` |
+| **Proof 防膨胀** | Cookie ≤ 500 字节, Proof ≤ 20 个 | `share.go:300`、`share.go:130` |
