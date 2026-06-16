@@ -852,3 +852,346 @@ defer func() {
 | `public/assets/pages/filespage/model_files.js:160-165` | 前端 search() 函数 |
 | `public/assets/pages/filespage/ctrl_filesystem.js:75-170` | 前端搜索防抖 + 虚拟滚动 |
 | `public/assets/pages/filespage/helper.js:22-130` | 前端排序实现 |
+
+---
+
+## 16. 异步索引错误重试机制
+
+### 16.1 重试策略设计：基于状态机的时间片轮转
+
+代码中**没有显式的指数退避重试逻辑**，采用"时间片切分 + 状态机轮转"实现隐式重试：
+
+| 错误场景 | 代码位置 | 重试行为 |
+|---------|---------|---------|
+| EXPLORE 阶段某目录 `Backend.Ls()` 失败 | `phase_explore.go:23-25` | `this.CurrentPhase = PHASE_PAUSE` → 休眠一个 CYCLE_TIME（默认 10s）→ 下一循环回到 EXPLORE 阶段再试 |
+| INDEXING 阶段某文件 `Backend.Cat()` 失败 | `phase_utils.go:18-22` | `tx.RemoveAll(path)` 从索引删除该文件 → 该阶段循环终止（`return false`）→ 下一阶段继续 |
+| INDEXING 阶段 SQL 查询失败 | `phase_indexing.go:12-16` | 记录 Warning 日志，`return false` → 本阶段退出，下一循环再试 |
+| SQLite constraint 冲突（路径已存在） | `phase_explore.go:58-73` | 检查 `IndexTimeGet`：若在 SEARCH_REINDEX（默认 24h）内则跳过，否则 `IndexTimeUpdate` 后继续索引 |
+| 单个文件 panic | `daemon.go:140-151` | `defer recover()` 捕获 panic → 记录 Error 日志 → 不影响其他文件 |
+| `createCrawler()` 时 `Backend.Init()` 失败 | `daemon.go:128-133` | 记录 Warning，直接 return → 下次用户操作触发 Hint 时再试 |
+
+### 16.2 重试代价控制：最大进程池 + LRU 淘汰
+
+`daemonState.HintLs`（`daemon.go:117-126`）：
+
+```go
+search_process_max := SEARCH_PROCESS_MAX()  // 默认 5
+if lenIdx > 0 && search_process_max > 0 && lenIdx > (search_process_max-1) {
+    toDel := this.idx[0 : lenIdx-(search_process_max-1)]  // 淘汰最早的 N 个
+    for i := range toDel {
+        toDel[i].Close()  // 关闭 SQLite 连接 + Backend 连接
+    }
+    this.idx = this.idx[lenIdx-(search_process_max-1):]
+}
+```
+
+LRU 策略：`idx[]` 数组按创建时间排序，超过 `SEARCH_PROCESS_MAX` 时淘汰最旧的 Crawler。下次需要时重新创建。
+
+---
+
+## 17. FederatedQueryBuilder 与 Query Plan 优化
+
+### 17.1 结论：**不存在 FederatedQueryBuilder**
+
+代码中没有这个类或类似概念。`ISearch` 接口极其精简：
+
+```go
+type ISearch interface {
+    Query(ctx App, basePath string, term string) ([]IFile, error)
+}
+```
+
+没有 query plan、没有多 backend 联合查询、没有谓词下推、没有 cost-based optimizer。
+
+### 17.2 真实的查询优化点
+
+| 引擎 | 优化手段 | 代码位置 |
+|------|---------|---------|
+| **stateless** | 用 Score 优先队列替代普通 BFS 队列，优先探索"更可能有结果"的目录，减少回溯 | `plg_search_stateless/scoring.go` |
+| **stateless** | 1500ms 硬超时，避免无限遍历 | `plg_search_stateless/config.go` |
+| **sqlitefts** | `path > ? AND path < ?` 利用 SQLite 主键索引做范围扫描，限定搜索前缀 | `indexer/query.go:14-19` |
+| **sqlitefts** | FTS5 内置 `ORDER BY rank LIMIT 50000`，利用 BM25 相关性截断，避免全量排序 | `indexer/query.go:21` |
+| **sqlitefts** | `LIMIT 50000` 硬编码上限，防止结果集过大撑爆内存 | `indexer/query.go:17` |
+| **sqlitefts** | 关键词预处理：`regexp.MustCompile(`(\.|\-)`).ReplaceAllString(q, "\"$1\"")`，避免 `.` `-` 被 FTS5 当作分词符 | `indexer/query.go:11` |
+
+### 17.3 扩展点：注释中提及的 ES/Solr 对接
+
+`server/common/plugin.go:155` 注释：
+
+> "The idea here is to enable different type of usage like leveraging elastic search or solr with custom stuff around it"
+
+意味着架构上预留了扩展点：用户可以实现自己的 `ISearch` 插件，通过 `Hooks.Register.SearchEngine()` 注册后覆盖默认实现。在自定义插件中可以实现 FederatedQuery、ES 聚合查询等复杂逻辑。
+
+---
+
+## 18. 同 backend 同路径冲突解决
+
+### 18.1 入队去重：HintLs 重复路径检测
+
+`daemonState.HintLs`（`daemon.go:99-113`）：
+
+```go
+alreadyHasPath := false
+for j := 0; j < len(this.idx[i].FoldersUnknown); j++ {
+    if this.idx[i].FoldersUnknown[j].Path == path {
+        alreadyHasPath = true
+        break
+    }
+}
+if alreadyHasPath == false {
+    heap.Push(&this.idx[i].FoldersUnknown, &Document{...})
+}
+```
+
+每次 `HintLs` 入队前遍历 `FoldersUnknown` 检查路径是否已存在，避免同一目录重复入队。
+
+### 18.2 数据库层去重：SQLite PRIMARY KEY + ON CONFLICT
+
+`server/plugin/plg_search_sqlitefts/indexer/index.go` 中 `FileCreate` 的 SQL：
+
+```sql
+INSERT OR REPLACE INTO file (path, filename, filetype, type, parent, size, modTime, indexTime)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+```
+
+- `ON CONFLICT DO REPLACE`：同路径新记录覆盖旧记录
+- `phase_explore.go:58-73` 中对 `ErrConstraint` 的特殊处理：若 `IndexTime` 在 24h 内则跳过索引，避免频繁更新
+
+### 18.3 多 goroutine 并发冲突：Crawler.mu + daemonState.mu 双层锁
+
+```go
+// daemonState 级别的全局锁（管理 idx[] 数组增删）
+type daemonState struct {
+    mu sync.RWMutex  // 保护 idx[] 数组和 n 游标
+    idx []Crawler
+}
+
+// Crawler 级别的锁（保护单个 Crawler 的状态）
+type Crawler struct {
+    mu sync.Mutex    // 保护 FoldersUnknown、CurrentPhase、State
+}
+```
+
+- `daemonState.mu`：RWMutex，读锁用于 `GetCrawler/NextCrawler`，写锁用于 `HintLs/createCrawler` 增删 idx
+- `Crawler.mu`：每个 Crawler 独立锁，保护堆操作、状态切换、SQLite 事务
+
+---
+
+## 19. ES 索引同步延迟
+
+### 19.1 结论：**不存在 ElasticSearch 插件**
+
+代码中只有两种内置搜索引擎：
+1. `plg_search_stateless`：无索引，实时遍历
+2. `plg_search_sqlitefts`：SQLite FTS5 全文索引
+
+没有 `plg_search_elasticsearch` 或类似插件。`plugin.go:155` 注释仅作为扩展思路提及，未实现。
+
+### 19.2 sqlitefts 的索引延迟特性
+
+虽然没有 ES，但 sqlitefts 有自己的延迟特征：
+
+| 操作 | 延迟模型 | 延迟量级 |
+|------|---------|---------|
+| `Ls`/`Mkdir` 等目录操作 | 异步 Hint + 等待 EXPLORE 阶段时间片 | 0 ~ CYCLE_TIME*2（0~20s） |
+| `Save`/`Touch` 等文件内容操作 | 异步 Hint + 等待 INDEXING 阶段时间片 | 0 ~ CYCLE_TIME*3（0~30s） |
+| `Rm`/`Mv` 删除/移动 | 同步删除（`HintRm` 直接开事务 `RemoveAll`） | 毫秒级，立即生效 |
+| 搜索时 lazy push | 推入队列后下次时间片才爬 | 0 ~ CYCLE_TIME（0~10s） |
+
+> **关键区别**：删除操作是同步的，新增/修改是异步的。因为删除不需要走时间片，`HintRm` 直接 `GetCrawler → State.Change() → RemoveAll → Commit`。
+
+### 19.3 索引延迟的用户感知
+
+- 搜索结果可能不包含刚刚上传的文件（需要等下一轮 INDEXING）
+- 但刚刚删除的文件不会出现在搜索结果中（立即删除）
+- `SEARCH_REINDEX`（默认 24h）保证最终一致性
+
+---
+
+## 20. 权限缓存失效
+
+### 20.1 后端权限：无缓存
+
+`server/model/permissions.go:7-12`：
+
+```go
+func CanRead(ctx *App) bool {
+    if ctx.Share.Id != "" {
+        return ctx.Share.CanRead   // 直接从 ctx.Share 读，无缓存
+    }
+    return true
+}
+```
+
+每次请求都实时计算，没有缓存层。`ctx.Share` 由 `_extractShare`（`middleware/session.go:17-28`）每次请求从数据库中重新读取。
+
+### 20.2 前端文件列表缓存：基于路径前缀失效
+
+`public/assets/pages/filespage/cache.js:63-77`：
+
+```js
+async remove(path, exact = true) {
+    if (exact) {
+        delete this.data[key];          // 精确删除
+        return;
+    }
+    for (const k in this.data) {
+        if (k.indexOf(key) === 0) {     // 前缀删除：删除该路径下所有缓存
+            delete this.data[k];
+        }
+    }
+}
+```
+
+失效时机（在 `ctrl_filesystem.js` 各操作回调中）：
+- 上传文件后：`cache.remove(currentPath(), false)` → 删除当前目录及其所有子目录缓存
+- 删除文件后：`cache.remove(filePath, true)` → 精确删除 + 父目录前缀删除
+- 移动文件后：`cache.remove(fromPath, false)` + `cache.remove(toPath, false)` → 两端都删
+- 重命名文件后：同上
+
+### 20.3 搜索结果缓存：无缓存
+
+前端 `search()` 函数（`model_files.js:160-165`）直接发 ajax，不走缓存。后端 `ISearch.Query()` 也没有缓存层。
+
+---
+
+## 21. 大 cursor 性能
+
+### 21.1 结论：**不存在数据库 cursor**
+
+搜索接口没有分页 cursor 概念。后端实现：
+
+| 引擎 | 结果集处理 | 内存占用 |
+|------|-----------|---------|
+| stateless | 实时 BFS 遍历，匹配一条 append 一条到 slice，超时直接返回 | 与匹配到的文件数成正比，受 1500ms 限制 |
+| sqlitefts | SQLite `Query` 一次性返回所有匹配行到 `[]IFile`，`LIMIT 50000` 硬限制 | 最多 50000 条记录的内存占用 |
+
+### 21.2 前端虚拟滚动：对抗大结果集
+
+`ctrl_filesystem.js:136-170`：
+
+```js
+const VIRTUAL_SCROLL_MINIMUM_TRIGGER = 100
+if (files.length > 100) {
+    size = Math.min(files.length, BLOCK_SIZE * COLUMN_PER_ROW)
+}
+```
+
+超过 100 条时只渲染可视区 + 上下一屏的 DOM，通过 `ifscroll-before`/`ifscroll-after` 占位元素撑开滚动高度。
+
+### 21.3 潜在性能点
+
+- sqlitefts 单次查询最多 50000 条全部加载到内存，无流式返回
+- 没有 `LIMIT/OFFSET` 参数，用户无法翻页
+- stateless 超时后返回部分结果，可能漏掉深层文件
+
+---
+
+## 22. 缓存预热
+
+### 22.1 结论：**无显式缓存预热机制**
+
+没有 `warmup()`/`preload()`/`preheat()` 方法。但有三种隐式预热：
+
+### 22.2 路径一：用户操作驱动的预热（HintLs）
+
+`server/plugin/plg_search_sqlitefts/crawler/events.go:26-28`：
+
+```go
+func (this FileHook) Ls(ctx *App, path string) error {
+    go this.Daemon.HintLs(ctx, path)  // 用户每浏览一个目录，后台就索引这个目录
+    return nil
+}
+```
+
+用户浏览哪里，后台索引哪里——"浏览即预热"。
+
+### 22.3 路径二：搜索触发的预热
+
+`server/plugin/plg_search_sqlitefts/query.go:24-29`：
+
+```go
+heap.Push(&crwlr.FoldersUnknown, &Document{Path: path, ...})
+```
+
+用户搜索某个路径时，该路径被推入探索队列，下次时间片优先爬取——"搜索即预热"。
+
+### 22.4 路径三：工作流触发的全量预热
+
+`server/plugin/plg_search_sqlitefts/workflow/index.go:48-135` 定义的 `StepIndexer` 工作流：
+
+管理员可在后台配置：
+- 手动触发：点击"Refresh Search Index"按钮
+- 定时触发：配置 cron 表达式周期性全量爬取
+
+工作流模式下，不按时间片轮转，启动 `SEARCH_PROCESS_PAR` 个 goroutine 并发跑完整个目录树，用 `sync.Cond` 协调 inflight 计数，直到 `FoldersUnknown` 为空。
+
+---
+
+## 23. 降级策略可见性
+
+### 23.1 降级策略清单
+
+| 降级场景 | 触发条件 | 降级行为 | 用户可见性 | 代码位置 |
+|---------|---------|---------|-----------|---------|
+| **stateless 超时降级** | `SEARCH_TIMEOUT`（默认 1500ms）到了 | 返回已探索到的部分结果 | **透明**：用户拿到部分结果，无任何提示 | `plg_search_stateless/index.go:24-26` |
+| **sqlitefts 查询失败降级** | SQLite 查询出错（锁、损坏等） | 返回空 `[]IFile` + `ErrNotReachable` | **半透明**：用户看到空搜索结果，前端不弹错误 | `indexer/query.go:21-24` |
+| **SEARCH_ENABLE=false 降级** | 管理员关闭全文搜索 | 回退到 stateless 引擎（仅文件名匹配） | **透明**：用户可能觉得搜索不准，但看不到提示 | `plg_search_sqlitefts/index.go:152-173` |
+| **索引内容转换失败降级** | PDF/Office 解析失败、格式不支持 | 只索引文件名，不索引内容 | **透明**：该文件只能靠文件名搜到 | `phase_utils.go:25-27` |
+| **单目录 Ls 失败降级** | 网络波动、权限不足导致某目录打不开 | 跳过该目录，切到 PAUSE 阶段 | **透明**：该目录下文件搜不到，无提示 | `phase_explore.go:23-25` |
+| **前端 indexedDB 降级** | Firefox 隐私模式、浏览器不支持 | 回退到内存缓存（InMemoryCache） | **透明**：刷新页面缓存失效 | `cache.js:227-233` |
+| **Crawler 池满降级** | 活跃 Crawler 超过 `SEARCH_PROCESS_MAX` | LRU 淘汰最早的 Crawler，关闭其 SQLite + Backend 连接 | **透明**：下次用到时重新创建，可能有延迟 | `daemon.go:117-126` |
+
+### 23.2 唯一用户可见的降级提示
+
+前端搜索框 placeholder 在 `enable_search=false` 时不会显示。`ctrl_submenu.js:240`：
+
+```html
+<button data-action="search" class=${getConfig("enable_search") ? "" : "hidden"}>
+```
+
+管理员关闭搜索功能时，搜索按钮直接隐藏——这是唯一可见的降级信号。
+
+---
+
+## 24. 完整关键文件速查表（最终版）
+
+| 文件 | 作用 |
+|------|------|
+| `server/common/types.go:43-50` | `IFile`、`ISearch` 接口定义 |
+| `server/common/plugin.go:141-166` | SearchEngine + AuthorisationMiddleware Hook |
+| `server/common/backend.go` | 全局 Backend Driver，存储后端注册表 |
+| `server/common/crypto.go:193-218` | `GenerateID()`，Crawler/索引 ID 生成 |
+| `server/middleware/session.go:57-83` | SessionStart，建立 App.Backend 绑定 |
+| `server/model/files.go:9-51` | `NewBackend()`，按 session 初始化具体 backend |
+| `server/model/permissions.go` | `CanRead()`，统一读权限检查 |
+| `server/ctrl/search.go` | HTTP 搜索控制器 |
+| `server/ctrl/files.go:99-105` | AuthorisationMiddleware 授权链调用点 |
+| `server/ctrl/files.go:1104-1117` | `PathBuilder()`，chroot 路径构建 |
+| `server/plugin/plg_search_stateless/index.go` | 无状态搜索实现 |
+| `server/plugin/plg_search_stateless/config.go` | `SEARCH_TIMEOUT` 配置（默认 1500ms） |
+| `server/plugin/plg_search_stateless/scoring.go` | 目录探索评分 + 文件名匹配算法 |
+| `server/plugin/plg_search_sqlitefts/index.go` | sqlitefts 插件入口，注册 Hook，启动后台爬虫 |
+| `server/plugin/plg_search_sqlitefts/config/configuration.go` | 所有搜索相关配置项 |
+| `server/plugin/plg_search_sqlitefts/query.go` | sqlitefts 查询入口 |
+| `server/plugin/plg_search_sqlitefts/crawler/daemon.go` | Daemon 多 Crawler 管理 + LRU 淘汰 + panic recover |
+| `server/plugin/plg_search_sqlitefts/crawler/events.go` | FileHook 文件操作监听，触发 Hint |
+| `server/plugin/plg_search_sqlitefts/crawler/phase.go` | 四阶段状态机调度 |
+| `server/plugin/plg_search_sqlitefts/crawler/types.go` | `HeapDoc` 优先队列 + `Document` 结构 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_explore.go` | EXPLORE 阶段：遍历目录树 + 冲突重试 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_indexing.go` | INDEXING 阶段：提取文件内容 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_maintain.go` | MAINTAIN 阶段：增量重索引 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_utils.go` | `updateFile()`/`updateFolder()` 同步逻辑 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_pause.go` | PAUSE 阶段：错误后重试等待 |
+| `server/plugin/plg_search_sqlitefts/converter/index.go` | 按 MIME 分派 textify 转文本 |
+| `server/plugin/plg_search_sqlitefts/indexer/index.go` | SQLite 表结构 + Manager 接口 |
+| `server/plugin/plg_search_sqlitefts/indexer/query.go` | FTS5 查询 SQL |
+| `server/plugin/plg_search_sqlitefts/indexer/error.go` | 索引错误类型 |
+| `server/plugin/plg_search_sqlitefts/workflow/index.go` | 工作流主动索引 StepIndexer |
+| `server/plugin/plg_search_example/index.go` | 最简搜索插件示例 |
+| `server/pkg/textify/` | txt/pdf/office 文本提取 |
+| `server/routes.go:68` | `/api/files/search` 路由注册 |
+| `public/assets/pages/filespage/model_files.js:160-165` | 前端 search() 函数 |
+| `public/assets/pages/filespage/ctrl_filesystem.js:75-170` | 前端搜索防抖 + 虚拟滚动 |
+| `public/assets/pages/filespage/helper.js:22-130` | 前端排序实现 |
+| `public/assets/pages/filespage/cache.js` | 前端 ls 缓存（IndexedDB → 内存缓存降级） |
