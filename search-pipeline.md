@@ -454,26 +454,401 @@ ctrl.FileSearch (ctrl/search.go:10)
 
 ---
 
-## 6. 关键文件速查表
+---
+
+## 7. 异步索引机制（Searchable Indexing）详解
+
+### 7.1 触发路径一：用户操作驱动（被动索引（FileHook
+
+| 触发源 | 代码位置 | 调用链 |
+|--------|---------|-------|
+| 用户浏览目录 | `server/ctrl/files.go:99-105` | `FileLs` → `for auth := range Hooks.Get.AuthorisationMiddleware() { auth.Ls(ctx, path) }` → `FileHook.Ls` → `go Daemon.HintLs`
+
+### 7.2 触发路径二：工作流触发（主动索引
+
+`server/plugin/plg_search_sqlitefts/workflow/index.go` 定义了 `StepIndexer` 工作流动作，管理员可在后台配置定时/手动触发全量索引：
+
+```go
+func (this StepIndexer) Execute(params, input) (map[string]string, error) {
+    // 1. 解密 token → session
+    // 2. NewBackend(app, session) 建立独立 backend
+    // 3. GetCrawler(app, true) 取/建 Crawler
+    // 4. heap.Push(&crwlr.FoldersUnknown, 根路径)
+    // 5. 启动 N 个 goroutine 并发：DiscoverPop → Backend.Ls → DiscoverPush，直到 FoldersUnknown 清空
+    //    用 sync.Cond 协调 inflight 计数
+}
+```
+
+工作流路径与后台常驻后台爬虫的区别：工作流是"跑完整个目录树，不按时间片轮转，直到全部索引所有内容；常驻爬虫按时间片切分（CYCLE_TIME 秒）轮换阶段，避免长时间占用。
+
+### 7.3 触发路径三：搜索时惰性触发
+
+`server/plugin/plg_search_sqlitefts/query.go:24-29`
+
+用户搜索时，把当前搜索 `path` 也推入探索队列：
+
+```go
+heap.Push(&crwlr.FoldersUnknown, &Document{Path: path, ...})
+```
+
+这是一种"搜索即索引"的惰性策略：用户搜什么路径，后台下次时间片就优先爬什么路径。
+
+### 7.4 目录探索优先队列（HeapDoc）排序规则
+
+`server/plugin/plg_search_sqlitefts/crawler/types.go:30-61`
+
+```go
+type HeapDoc []*Document
+
+func (h HeapDoc) Less(i, j int) bool {
+    if h[i].Priority != 0 || h[j].Priority != 0 {
+        return h[i].Priority < h[j].Priority  // 显式 Priority 优先
+    }
+    // 否则按"距 InitialPath 的相对深度越浅越优先
+    scoreA := len(strings.Split(h[i].Path, "/")) / len(strings.Split(h[i].InitialPath, "/"))
+    scoreB := len(strings.Split(h[j].Path, "/")) / len(strings.Split(h[j].InitialPath, "/"))
+    return scoreA < scoreB
+}
+```
+
+优先队列上限：`MAX_HEAP_SIZE = 100000`，超过则静默丢弃。
+
+---
+
+## 8. 跨 backend 联合 query
+
+### 8.1 真实的"跨多 backend"的真实含义
+
+代码里**没有单请求内并发查询多个 backend**机制。每个 HTTP 请求绑定一个 backend（由 session 决定。
+
+**多 backend 共存体现在：
+
+1. **多用户多 session 场景**：每个用户 session 不同 → `GenerateID(session) 不同 → 不同 Crawler → 不同 SQLite 文件
+2. **同一用户多连接场景**：同一用户分别登录到不同存储类型不同 session["type"] 不同 → 不同 Crawler
+3. **共享索引模式**：`SEARCH_SHARED_INDEX=true` 时所有用户共用同一个 `fts.sql`，但仍按 session 区分 backend
+
+### 8.2 Crawler ID 生成算法
+
+`server/common/crypto.go:193-218` 的 `GenerateID(session)`：
+
+```go
+func GenerateID(params map[string]string) string {
+    orderedKeys := sort(所有 session key)
+    for key := range orderedKeys {
+        switch key {
+        case "password", "path", "session", "timestamp":
+            // 排除这些字段
+        default:
+            p += key + "=>" + params[key] + ", "
+        }
+    }
+    p += "salt=>" + SECRET_KEY
+    return Hash(p, 20)
+}
+```
+
+**同路径不同 backend 的语义由 ID 由 session 中除 password/path/session/timestamp 之外所有字段（包括 type/hostname/url 等）联合哈希生成。两个 session 只要连接参数（不同 → 不同 ID → 不同 Crawler/索引。
+
+---
+
+## 9. 同路径不同 backend 的语义
+
+### 9.1 路径是**相对 backend 根的逻辑路径
+
+```
+backend 根可能完全不同物理存储上：
+- backend = S3：`/docs/report.pdf → S3 bucket 内的路径
+- backend = local：`/docs/report.pdf → 本地文件系统路径
+
+### 9.2 chroot 路径修正机制
+
+搜索时路径处理：
+
+1. **入参**：`ctrl.PathBuilder(ctx, req.URL.Query().Get("path")`（`server/ctrl/files.go:1104-1117`
+
+```go
+basePath := filepath.Join(session["path"], userQueryPath))
+if strings.HasPrefix(basePath, session["path"]) == false {
+    return ErrFilesystemError  // 禁止跳出 chroot
+}
+```
+
+2. **出参**：`FPath: "/" + strings.TrimPrefix(原始绝对路径, session["path"])
+```
+
+用户只能看到相对于 chroot 后的相对路径。
+
+### 9.3 sqlitefts 路径前缀范围查询
+
+`server/plugin/plg_search_sqlitefts/indexer/query.go:14-19`
+
+```sql
+WHERE path > ? AND path < ?   -- 即 [path, path~) 利用字符串排序实现前缀匹配
+```
+
+利用 SQLite 的 path 索引做前缀扫描，高效限定搜索范围。
+
+---
+
+## 10. 全文搜索引擎对接
+
+### 10.1 文件内容提取 pipeline
+
+`server/plugin/plg_search_sqlitefts/crawler/phase_utils.go:14-33`
+
+```
+updateFile(path, backend, tx)
+    ├─ backend.Cat(path)           ← 从 backend 取原始字节流
+    ├─ converter.Convert(path, reader)  ← 按 MIME 类型转纯文本
+    │     ├─ text/plain / text/org / text/markdown / application/x-form → textify.Txt
+    │     ├─ application/pdf → textify.PDF
+    │     └─ application/excel / word / powerpoint → textify.Office
+    │     └─ 其他类型 → 返回 ErrNotImplemented（只索引文件名
+    └─ tx.FileContentUpdate(path, convertedText)  ← 写入 FTS5 content 列
+    └─ tx.IndexTimeUpdate(path, now)      ← 标记已索引
+```
+
+### 10.2 FTS5 虚拟表与触发器
+
+`server/plugin/plg_search_sqlitefts/indexer/index.go:82-93`
+
+```sql
+CREATE VIRTUAL TABLE file_index USING fts5(
+    path UNINDEXED,        -- path 不参与分词索引
+    filename,              -- 文件名
+    filetype,              -- 文件扩展名
+    content,               -- 全文内容
+    tokenize = 'porter'    -- porter 词干提取（英文）
+);
+
+-- 3 个触发器：file 表的增删改 → 自动同步 file_index 的元数据列
+```
+
+### 10.3 可索引扩展名与大小限制
+
+`server/plugin/plg_search_sqlitefts/config/configuration.go`
+
+- `INDEXING_EXT`：默认 `org,txt,docx,pdf,md,form,xlsx,pptx`
+- `MAX_INDEXING_FSIZE`：默认 512MB
+- `SEARCH_EXCLUSION`：默认排除 `node_modules,bower_components,.cache,.npm,.git`
+
+---
+
+## 11. 统一权限过滤
+
+### 11.1 搜索前：整体权限检查
+
+`server/ctrl/search.go:16`
+
+```go
+if model.CanRead(ctx) == false {
+    SendErrorResult(res, ErrPermissionDenied)
+    return
+}
+```
+
+`server/model/permissions.go:7-12`
+
+```go
+func CanRead(ctx *App) bool {
+    if ctx.Share.Id != "" {       // 共享链接场景
+        return ctx.Share.CanRead   // 按共享链接授权
+    }
+    return true                   // 登录用户默认有读权限
+}
+```
+
+### 11.2 文件操作级别的授权中间件链
+
+`server/ctrl/files.go:99-104`（以 `FileLs` 为例：
+
+```go
+for _, auth := range Hooks.Get.AuthorisationMiddleware() {
+    if err = auth.Ls(ctx, path); err != nil {
+        SendErrorResult(res, err)
+        return
+    }
+}
+```
+
+`FileHook` 就注册在这条链上——它**不做真正授权检查**（永远返回 nil），只异步触发 Hint。真正的权限过滤由其他 `IAuthorisation` 插件（如 `plg_authorisation_example` 自定义实现。
+
+### 11.3 搜索结果的结果本身不做逐文件权限
+
+搜索结果本身不做逐文件权限检查——结果过滤——只做整体 `CanRead` 检查。搜索结果直接从索引里返回所有匹配结果，依赖：
+- chroot 路径前缀范围（path < ? AND path < ?）天然隔离
+- 共享链接场景下 `ctx.Session["path"]` 前缀裁剪
+
+---
+
+## 12. 分页与排序抽象
+
+### 12.1 后端不支持分页——全部返回
+
+`ISearch.Query()` 返回完整 `[]IFile`，无 `limit/offset` 参数。sqlitefts 查询内 `LIMIT 50000` 是硬编码上限，非用户可控分页。
+
+### 12.2 前端防抖 + 虚拟滚动分页
+
+`public/assets/pages/filespage/ctrl_filesystem.js:79-92`
+
+```js
+if (state.search) {
+    return rxjs.timer(450).pipe(          // 450ms 防抖
+        rxjs.switchMap(() => search(state.search)),  // 新请求取消旧请求
+        ...
+    )
+}
+```
+
+`public/assets/pages/filespage/ctrl_filesystem.js:136-170` 虚拟滚动：
+
+```js
+VIRTUAL_SCROLL_MINIMUM_TRIGGER = 100
+if (files.length > 100) {
+    size = Math.min(files.length, BLOCK_SIZE * COLUMN_PER_ROW)
+}
+```
+
+超过 100 条时只渲染可视区 + 上下一屏的 DOM。
+
+### 12.3 排序：前端二次排序（后端只做后端相关性排序
+
+| 引擎 | 后端排序 | 前端排序 |
+|------|---------|---------|
+| stateless | 目录探索 Score 优先（类 BFS 深度优先 + 启发式评分
+| sqlitefts | FTS5 BM25 `rank` 排序
+| 通用（非搜索场景 `sort` 时前端才做 `sort(files, type, order)，支持 name/date/size/type 四种排序
+（搜索结果**不做前端排序**，保持后端返回的相关性顺序。
+
+`public/assets/pages/filespage/helper.js:22-130` 前端排序规则：
+
+- `sortByType`：目录优先 → 隐藏文件置底 → 扩展名 → 文件名
+- `sortByName`：目录优先 → 隐藏文件置底 → 文件名
+- `sortByDate`：修改时间
+- `sortBySize`：目录优先 → 大小
+
+---
+
+## 13. 查询缓存与失效
+
+### 13.1 无服务端查询缓存
+
+搜索结果不做服务端缓存。每次请求都实时：
+- stateless：实时 BFS 遍历
+- sqlitefts：实时查 SQLite
+
+### 13.2 索引失效机制（触发重索引）：
+
+1. **文件变更触发失效**：
+   - `HintFile` → `tx.IndexTimeClear(path)` → 下次 INDEXING 阶段重新提取内容
+
+2. **定时失效**：
+   `SEARCH_REINDEX`（默认 24 小时）MAINTAIN 阶段：
+
+```go
+// phase_maintain.go
+tx.FindBefore(now - SEARCH_REINDEX 小时前)
+```
+
+找出超过 24h 的条目 → 重新 `updateFile`/updateFolder` 对比 backend 实际状态。
+
+3. **用户操作触发失效**：
+
+| 操作 | 失效动作 |
+|------|---------|
+| Save/Touch | IndexTimeClear → 重提取内容
+| Rm | RemoveAll → 从索引删除
+| Mv | 旧路径 RemoveAll + 新路径 HintLs
+
+### 13.3 前端 ls 缓存
+
+`public/assets/pages/filespage/model_files.js:84-100` 的 `ls()` 有 indexedDB 缓存（仅用于文件列表缓存），但 `search()` 无缓存。
+
+---
+
+## 14. 超时、部分失败与 Fallback
+
+### 14.1 stateless 超时 graceful degrade
+
+`server/plugin/plg_search_stateless/index.go:24-26`
+
+```go
+MAX_SEARCH_TIME := SEARCH_TIMEOUT()  // 默认 1500ms
+for start := time.Now(); time.Since(start) < MAX_SEARCH_TIME; {
+    // 探索一个目录一个目录地遍历
+}
+return files, nil  // 超时直接返回已找到结果，不报错
+```
+
+超时不是错误——返回已探索到部分结果。
+
+### 14.2 sqlitefts 查询失败 fallback
+
+`server/plugin/plg_search_sqlitefts/indexer/query.go:21-24`
+
+```go
+rows, err := this.db.Query(...)
+if err != nil {
+    Log.Warning("search::query DBQuery (%s)", err.Error())
+    return files, ErrNotReachable  // 返回空结果 + ErrNotReachable
+}
+```
+
+### 14.3 索引阶段的错误处理：
+
+- `backend 某个目录 `Ls` 失败 → 跳过该目录，切到 PHASE_PAUSE，下次再试
+- 单个文件 `Cat`/内容转换失败 → 跳过该文件，继续下一个
+- SQLite constraint 冲突 → 视为已存在，检查 `ErrConstraint`，跳过
+- 单个文件处理 panic → `defer recover()` 记录日志，不影响其他文件
+
+`server/plugin/plg_search_sqlitefts/crawler/daemon.go:140-151` 中的 panic recover：
+
+```go
+defer func() {
+    if r := recover(); r != nil {
+        Log.Error("plg_search_sqlitefs::panic backend="%s" recover="%s"", name, r)
+    }
+}()
+```
+
+---
+
+## 15. 完整补充关键文件速查表（补充）
 
 | 文件 | 作用 |
 |------|------|
 | `server/common/types.go:43-50` | `IFile`、`ISearch` 接口定义 |
 | `server/common/plugin.go:152-166` | SearchEngine Hook 注册/获取 |
 | `server/common/backend.go` | 全局 Backend Driver，存储后端注册表 |
+| `server/common/crypto.go:193-218` | `GenerateID()`，Crawler/索引 ID 生成 |
 | `server/middleware/session.go:57-83` | SessionStart，建立 App.Backend 绑定 |
 | `server/model/files.go:9-51` | `NewBackend()`，按 session 初始化具体 backend |
+| `server/model/permissions.go` | `CanRead()`，统一读权限检查 |
 | `server/ctrl/search.go` | HTTP 搜索控制器 |
+| `server/ctrl/files.go:99-105` | AuthorisationMiddleware 授权链调用点 |
+| `server/ctrl/files.go:1104-1117` | `PathBuilder()`，chroot 路径构建 |
 | `server/plugin/plg_search_stateless/index.go` | 无状态搜索实现 |
+| `server/plugin/plg_search_stateless/config.go` | `SEARCH_TIMEOUT` 配置（默认 1500ms |
 | `server/plugin/plg_search_stateless/scoring.go` | 目录探索评分 + 文件名匹配算法 |
 | `server/plugin/plg_search_sqlitefts/index.go` | sqlitefts 插件入口，注册 Hook，启动后台爬虫 |
+| `server/plugin/plg_search_sqlitefts/config/configuration.go` | 所有搜索相关配置项 |
+| `server/plugin/plg_search_sqlitefts/query.go` | sqlitefts 查询入口 |
 | `server/plugin/plg_search_sqlitefts/crawler/daemon.go` | Daemon 多 Crawler（多 backend）管理 |
 | `server/plugin/plg_search_sqlitefts/crawler/events.go` | FileHook 文件操作监听，触发 Hint |
 | `server/plugin/plg_search_sqlitefts/crawler/phase.go` | 四阶段状态机调度 |
+| `server/plugin/plg_search_sqlitefts/crawler/types.go` | `HeapDoc` 优先队列 + `Document` 结构 |
 | `server/plugin/plg_search_sqlitefts/crawler/phase_explore.go` | EXPLORE 阶段：遍历目录树 |
 | `server/plugin/plg_search_sqlitefts/crawler/phase_indexing.go` | INDEXING 阶段：提取文件内容 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_maintain.go` | MAINTAIN 阶段：增量重索引 |
 | `server/plugin/plg_search_sqlitefts/crawler/phase_utils.go` | `updateFile()` 内容转换与入库 |
+| `server/plugin/plg_search_sqlitefts/crawler/phase_pause.go` | PAUSE 阶段 |
+| `server/plugin/plg_search_sqlitefts/converter/index.go` | 按 MIME 分派 textify 转文本 |
 | `server/plugin/plg_search_sqlitefts/indexer/index.go` | SQLite 表结构 + Manager 接口 |
 | `server/plugin/plg_search_sqlitefts/indexer/query.go` | FTS5 查询 SQL |
+| `server/plugin/plg_search_sqlitefts/indexer/error.go` | 索引错误类型 |
+| `server/plugin/plg_search_sqlitefts/workflow/index.go` | 工作流主动索引 StepIndexer |
+| `server/pkg/textify/` | txt/pdf/office 文本提取 |
 | `server/routes.go:68` | `/api/files/search` 路由注册 |
-| `public/assets/pages/filespage/model_files.js:160-165` | 前端 `search()` 函数，发起搜索请求 |
+| `public/assets/pages/filespage/model_files.js:160-165` | 前端 search() 函数 |
+| `public/assets/pages/filespage/ctrl_filesystem.js:75-170` | 前端搜索防抖 + 虚拟滚动 |
+| `public/assets/pages/filespage/helper.js:22-130` | 前端排序实现 |
