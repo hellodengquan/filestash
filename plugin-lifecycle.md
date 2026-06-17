@@ -70,6 +70,50 @@ func InitLogger() (err error) {
 
 **无回滚动作**：失败即退出，不做资源清理回滚（因为还没分配什么资源）。
 
+### InitLogger 与 systemd journal 输出
+
+Filestash 的日志系统有**双写机制**——每个日志方法同时写入文件和 stdout：
+
+```go
+// log.go:34-42
+func (l *log) Info(format string, v ...interface{}) {
+    if l.info && l.enable {
+        message := fmt.Sprintf("%s SYST INFO ", l.now())
+        message = fmt.Sprintf(message+format+"\n", v...)
+        logfile.WriteString(message)                     // 写文件
+        fmt.Print(strings.Replace(message, "%", "%%", -1)) // 写 stdout
+    }
+}
+```
+
+`Log.Stdout()` 方法（`log.go:74`）更直接——不受日志级别控制，始终同时写文件和 stdout，用于审计和 HTTP 请求日志：
+
+```go
+// middleware/telemetry.go:90
+Log.Stdout("HTTP %3d %3s %6.1fms %s %s", point.Status, point.Method, point.Duration, ...)
+
+// ctrl/session.go:60
+Log.Stdout("AUDIT action[fail] backend[%s] user[%s] target[%s]", session["type"], ...)
+```
+
+**与 systemd journal 的关系**：
+
+当 Filestash 在 systemd 单元下运行时，stdout 会被 journald 自动捕获。`docker-compose.yml` 中的 `restart: always` 策略也是基于容器运行时检测 stdout/stderr 停流来判定进程退出的。
+
+| 日志通道 | 持久化位置 | systemd journal 可见 | 说明 |
+|----------|-----------|---------------------|------|
+| `logfile.WriteString()` | `data/state/log/access.log` | ✗ | 仅文件，journal 不可见 |
+| `fmt.Print()` (stdout) | systemd journal / Docker logs | ✓ | 会被 journald 捕获 |
+| `slog.Printf()` (stderr) | systemd journal / Docker logs | ✓ | 仅 InitLogger 失败时使用 |
+
+**运维配置建议**：
+
+1. **systemd 部署**：创建 `.service` 文件时配置 `StandardOutput=journal` + `StandardError=journal`（默认值），日志自动进入 journal。可用 `journalctl -u filestash` 查看。
+
+2. **Docker 部署**（当前 Dockerfile 方式）：`CMD ["/app/filestash"]` 直接运行，stdout/stderr 被 Docker 日志驱动捕获。`docker-compose.yml` 使用默认的 `json-file` 日志驱动。
+
+3. **日志轮转**：`access.log` 以 `O_APPEND` 模式写入，不做轮转。需要在部署层配置 logrotate（systemd 场景）或 Docker 日志驱动 max-size（容器场景）。
+
 ---
 
 ## 三、编译期内置插件的注册
@@ -159,6 +203,77 @@ if HasPlugin("plg_starter_https", "plg_starter_httpsfs", "plg_starter_web") {
 ```
 
 **部署层面的兼容**：多协议多端口不能同时启用（单例限制）。如果需要同时支持 HTTP 和 HTTPS，需要在 Starter 插件内部自行实现（例如 HTTPS Starter 再启一个 HTTP 重定向端口），或者通过反向代理（Nginx/Caddy）在前端做协议终结。
+
+### 最后 import 胜出的运维确认机制
+
+由于 Starter 单例的"最后注册者胜出"规则，运维人员需要确认实际生效的是哪个 Starter。以下是三种确认方式：
+
+**方式 1：`/about` 页面查看插件列表**
+
+`AboutHandler`（`ctrl/about.go:76`）渲染的页面展示四个插件类别，其中 STANDARD 列表包含所有内置插件名。但此页面**不能直接告诉你哪个 Starter 胜出**——它只列出所有被编译进二进制的插件，不区分"注册了"和"胜出了"。
+
+```
+STANDARD [plg_starter_http plg_security_svg plg_image_light ...]
+```
+
+**方式 2：启动日志确认**
+
+每个 Starter 在执行时都会写日志，包含协议标识：
+
+```go
+// plg_starter_http/index.go:19
+Log.Info("[http] starting ...")
+
+// plg_starter_https/index.go:22
+Log.Info("[https] starting ...%s", domain)
+
+// plg_starter_http2/index.go:41
+Log.Info("[https] starting ...%s", domain)
+```
+
+启动后检查日志中的协议标识即可确认：
+
+```bash
+# Docker 部署
+docker logs filestash 2>&1 | grep -E '\[http[s]?\] starting'
+
+# systemd 部署
+journalctl -u filestash | grep -E '\[http[s]?\] starting'
+```
+
+**方式 3：`HasPlugin()` 代码检测**
+
+`HasPlugin()` 函数检测的是"是否编译进二进制"，而非"是否胜出"。它遍历 `listOfPlugins` 四个列表（OSS / Enterprise / Custom / Apps），只要存在就返回 true。由于同一二进制中可能同时包含多个 Starter，`HasPlugin("plg_starter_http")` 和 `HasPlugin("plg_starter_https")` 都可能返回 true。
+
+SDK 中利用此特性判断协议（`pkg/sdk/utils.go:66`）：
+
+```go
+if HasPlugin("plg_starter_https", "plg_starter_httpsfs", "plg_starter_web") {
+    scheme = "https"
+}
+```
+
+这个逻辑有一个**隐含假设**：如果 HTTPS Starter 被编译进来了，它就是胜出者。在当前代码中这成立（`plg_starter_http` 在 import 列表最后），但如果有人修改了 import 顺序，此假设会失效。
+
+**方式 4：源码确认（最可靠）**
+
+直接检查 `server/plugin/index.go` 中 Starter 的 import 顺序：
+
+```go
+// plugin/index.go 中的 import 列表
+_ "github.com/mickael-kerjean/filestash/server/plugin/plg_starter_http"  // 第 43 行，最后
+```
+
+Go 编译器保证同一包内的 `init()` 按 import 在源码中的出现顺序执行。Starter 是"后写覆盖"模式，所以**源码 import 列表中最后一个 Starter 包即为胜出者**。
+
+**运维确认的推荐流程**：
+
+```
+1. 检查 /about 页面 → 确认哪些 Starter 被编译
+2. 检查启动日志 → 确认实际执行的是哪个
+3. 如果日志缺失 → 检查源码 plugin/index.go 的 import 顺序
+4. 自动化检测 → curl /healthz 确认端口和协议
+```
 
 ---
 
@@ -530,7 +645,64 @@ func New(wasm []byte, opts ...Option) (*Runtime, error) {
 
 **加固建议**：通过 `Option` 注入 `wazero.RuntimeConfig` 设置 `WithMemoryCapacity(pageLimit)`，或在 `ModuleConfig` 中设置 `WithMemoryLimits`。
 
-### 7.4 Backend 隔离
+### 7.4 wazero memory.grow 在 cgroup 下的隔离
+
+wazero 是纯 Go 实现的 WASM 运行时，WASM 线性内存本质上是 Go 堆上的 `[]byte` 切片。当 WASM 模块执行 `memory.grow` 指令时，wazero 通过 Go 的 `make([]byte, newCap)` 扩展内存，底层调用 `runtime.mallocgc`。
+
+**cgroup 内存限制的交互链路**：
+
+```
+WASM memory.grow 指令
+    ↓ wazero 内部调用 Go make([]byte, size)
+    ↓ Go runtime.mallocgc 在堆上分配
+    ↓ Linux 内核检查 cgroup memory.limit_in_bytes（v1）或 memory.max（v2）
+    ↓ 如果超出限制：
+        ├─ cgroup v1: 触发 OOM killer → SIGKILL 进程
+        └─ cgroup v2: 根据 memory.oom_group 配置决定是杀死进程还是让分配失败
+```
+
+**关键行为**：
+
+1. **Go 不感知 cgroup 内存限制**：Go 的内存分配器通过 `mmap` 向操作系统申请内存，cgroup 限制在内核层生效。Go runtime 的 `GOGC` 和 `runtime.ReadMemStats()` 不受 cgroup 限制影响——它们只看到 Go 堆的使用量，看不到 cgroup 的上限。
+
+2. **WASM 内存增长不会收到友好错误**：当 cgroup 内存耗尽时，不会返回 Go 的 `error`，而是直接触发内核 OOM killer 发送 `SIGKILL`。`Runtime.Call()` 的互斥锁无法保护这种情况——进程直接被杀死，不会执行 `defer` 或 `OnQuit` 回调。
+
+3. **Filestash 的 Dockerfile 没有设置内存限制**（`docker/Dockerfile`），`docker-compose.yml` 也没有 `mem_limit`。默认情况下 Docker 容器继承宿主机的全部可用内存，WASM 插件可以无限制地消耗内存。
+
+**容器部署下的防护配置**：
+
+```yaml
+# docker-compose.yml 建议添加
+services:
+  app:
+    deploy:
+      resources:
+        limits:
+          memory: 512M        # 限制容器总内存
+        reservations:
+          memory: 128M
+```
+
+或 K8s 场景：
+
+```yaml
+resources:
+  limits:
+    memory: "512Mi"
+  requests:
+    memory: "128Mi"
+```
+
+**注意**：设置 cgroup 内存限制后，Go runtime 自身的内存开销（GC 元数据、goroutine 栈等）也计入限额。建议为 Go 运行时预留至少 64MB，WASM 插件可用内存 = 容器限制 - Go runtime 开销 - Filestash 业务内存。
+
+**`/debug/memory` 端点**（`routes.go:146`）提供运行时内存统计，可用于监控：
+
+```
+GET /debug/memory
+→ Alloc / TotalAlloc / Sys / NumGC
+```
+
+### 7.5 Backend 隔离
 
 Backend 插件在创建连接时通过 `model.NewBackend()` 进行白名单校验（`model/files.go:9`）：
 
@@ -765,6 +937,77 @@ Hooks.Register.OnConfig(func() {
 - OnConfig 内不要调用 `Config.Save()`，会导致递归触发
 - OnConfig 在启动时的 `Config.Load()` 中就会触发一次，那时 Onload 可能还没执行，所以 OnConfig 回调不要依赖 Onload 中初始化的状态
 
+### 8.8 四条优先级链的环境变量加载延迟
+
+配置注入四层优先级中涉及的环境变量分布在三个不同阶段加载，存在延迟差异：
+
+| 环境变量 | 所在阶段 | 作用域 | 加载时机 | 失败后果 |
+|----------|----------|--------|----------|----------|
+| `FILESTASH_PORT` | 第 4 层 `defaultValue()` | 影响硬编码 Default | `NewConfiguration()` 即 `init()` 阶段 | 使用代码中的硬编码默认值 8334 |
+| `FILESTASH_PATH` | `constants.go init()` | 影响路径常量 | `init()` 阶段，在 `NewConfiguration()` 之前 | 默认 `data/` |
+| `ADMIN_PASSWORD` | 第 1 层 `Initialise()` | 覆盖 Value | `Config.Load()` 之后 | admin 密码为空 |
+| `APPLICATION_URL` | 第 1 层 `Initialise()` | 覆盖 Value | `Config.Load()` 之后 | host 为空 |
+| `CONFIG_SECRET` | `config_state.go LoadConfig()` | 配置加密密钥 | `Config.Load()` 内部 | 使用 `general.secret_key` 派生 |
+| `CONFIG_ENCRYPT` | `config_state.go LoadConfig()` | 是否加密配置 | `Config.Load()` 内部 | 默认 true |
+
+**加载延迟的关键问题**：
+
+`FILESTASH_PORT` 通过 `defaultValue()` 设置的是 `Default` 字段（第 4 层），而 `ADMIN_PASSWORD` 通过 `Initialise()` 设置的是 `Value` 字段（第 1 层）。由于 `Interface()` 返回 `Value` 优先于 `Default`，当 config.json 中已有 `port` 的持久化值时，`FILESTASH_PORT` 环境变量**不会生效**——它在第 4 层，被第 2 层的 config.json Value 覆盖。
+
+```
+# 场景：config.json 中 port=8334，但环境变量 FILESTASH_PORT=9000
+Config.Get("general.port").Int()
+→ Value = 8334 (来自 config.json)     ← 优先返回
+→ Default = 9000 (来自 FILESTASH_PORT) ← 被忽略
+→ 结果：8334
+```
+
+**正确的端口覆盖方式**：不是通过 `FILESTASH_PORT` 环境变量（它只影响 Default），而是直接修改 config.json 或通过管理后台设置。
+
+**`CONFIG_SECRET` 的特殊延迟**：此环境变量在 `LoadConfig()` 中使用（`config_state.go:44`），用于解密配置文件中的加密字段。如果设置了 `CONFIG_SECRET` 但忘记在 `Initialise()` 之前提供，解密会失败并记录 Warning 日志，但不会中断启动——加密字段会保留密文。
+
+### 8.9 OnConfig 回调的卸载
+
+**当前不支持卸载**。`OnConfig` 的注册表是包级切片 `configChange []func()`（`plugin.go:286`），只有 `append` 操作，没有删除或清空机制：
+
+```go
+// plugin.go:286-294
+var configChange []func()
+
+func (this Register) OnConfig(fn func()) {
+    configChange = append(configChange, fn)
+}
+func (this Get) OnConfig() []func() {
+    return configChange
+}
+```
+
+同样的模式适用于所有追加型钩子：`Onload`、`OnQuit`、`Middleware`、`ProcessFileContentBeforeSend`、`HttpEndpoint`、`AuthorisationMiddleware`、`FrontendOverrides`、`XDGOpen`、`WorkflowTrigger`、`WorkflowAction`。
+
+**不可卸载的影响**：
+
+1. **OnConfig 回调无法撤回**：如果插件在 `OnConfig` 中注册了定时任务或打开了资源，无法在"关闭插件"时清理
+2. **重复注册无防护**：如果 `OnConfig` 回调本身再次调用 `Hooks.Register.OnConfig()`，会在下次配置变更时导致双重执行
+3. **插件启用/禁用只能走软开关**：回调始终存在，只能在回调内部通过 `plugin_enable()` 判断是否执行实际逻辑
+
+**如果要实现卸载，需要改造**：
+
+```go
+// 方案：返回取消函数
+func (this Register) OnConfig(fn func()) func() {
+    configChange = append(configChange, fn)
+    idx := len(configChange) - 1
+    return func() {
+        configChange[idx] = nil  // 置空，执行时跳过
+    }
+}
+
+// 消费侧增加 nil 检查
+for _, fn := range Hooks.Get.OnConfig() {
+    if fn != nil { fn() }
+}
+```
+
 ---
 
 ## 九、错误回收
@@ -816,7 +1059,73 @@ Discovery 失败  → Log.Error 写日志 → os.Exit(1)
 
 由于 `Log.SetVisibility()` 在 `Config.Load()` 中才被调用，如果 `InitConfig` 在 `Config.Load()` 之前失败（比如 `NewConfiguration()` 阶段），日志级别默认全部关闭，`Log.Error` 不会有输出。这是一个潜在的调试盲区。
 
-### 9.2 外部插件发现 — 单插件失败不阻断
+### 9.2 check 退出码 1 与健康检查接入
+
+`check()` 调用 `os.Exit(1)` 后，进程以退出码 1 终止。各部署层对此的接入方式：
+
+**Docker 场景**：
+
+`docker-compose.yml` 中配置了 `restart: always`，Docker 守护进程检测到容器非零退出码后自动重启。重启间隔遵循指数退避（100ms, 200ms, 400ms...最大 1 分钟）。
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    restart: always   # 任何退出码都重启
+```
+
+**K8s 场景**：
+
+Pod 的 `restartPolicy` 默认为 `Always`，kubelet 检测到容器退出码非零后按 BackOff 策略重启。但仅靠退出码不够——进程可能在启动后期卡死（如 WASM 死锁），此时退出码不会触发。
+
+K8s 推荐配合存活探针使用：
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8334
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+**`/healthz` 端点**（`ctrl/report.go:30`）是 Filestash 内置的健康检查，执行三项检查：
+
+1. **CHECK 1**：打开并读取 `config.json`，验证文件可访问
+2. **CHECK 2**：HTTP GET 自身的 `/about` 页面，验证 HTTP 服务正常
+3. **CHECK 3**：验证 `general.secret_key` 长度 = 16 且 `auth.admin` 长度 = 60（bcrypt 哈希）
+
+返回格式：
+
+| 状态 | HTTP 状态码 | 响应体 |
+|------|------------|--------|
+| 通过 | 200 | `{"status": "pass"}` |
+| 配置未完成 | 200 | `{"status": "transcient", ...}` |
+| 配置损坏 | 503 | `{"status": "error", "reason": "configuration_error", ...}` |
+| 文件不可读 | 500 | `{"status": "error", "reason": "fopen_error"}` |
+| HTTP 自检失败 | 500 | `{"status": "error", "reason": "endpoint_error"}` |
+
+**systemd 场景**：
+
+```ini
+[Unit]
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/app/filestash
+Restart=on-failure          # 非零退出码时重启
+RestartSec=5s
+
+# 可选：配合健康检查
+ExecStartPost=/bin/sleep 2
+ExecStartPost=curl -sf http://localhost:8334/healthz
+```
+
+**注意**：`check()` 触发的 `os.Exit(1)` 发生在 HTTP 服务器启动之前，`/healthz` 端点尚未就绪。所以健康检查只能覆盖运行时故障（如后端连接池耗尽），无法覆盖启动阶段故障。启动阶段的故障完全依赖退出码。
+
+### 9.3 外部插件发现 — 单插件失败不阻断
 
 ```go
 // discovery.go:28-31
@@ -831,7 +1140,7 @@ for _, entry := range entries {
 
 单个 zip 解析失败只记录日志，不影响其他插件。
 
-### 9.3 WASM 调用错误回收
+### 9.4 WASM 调用错误回收
 
 **Middleware 插件**（`adapter/middleware.go:26-36`）：
 
@@ -859,7 +1168,7 @@ func (this *workflowActionState) Execute(params, input map[string]string) (map[s
 }
 ```
 
-### 9.4 WASM 运行时错误类型
+### 9.5 WASM 运行时错误类型
 
 ```go
 // adapter/runtime/error.go
@@ -868,7 +1177,7 @@ var ErrNoExport = errors.New("plugin: export not found")
 
 当 WASM 模块缺少指定导出函数时，`Call()` 返回 `ErrNoExport`，中间件适配器对此做特殊处理（视为"放行"）。
 
-### 9.5 Backend 错误回收
+### 9.6 Backend 错误回收
 
 Backend 的错误通过 `IBackend` 接口方法返回 `error`，由上层统一转换为 `AppError`：
 
@@ -895,7 +1204,7 @@ func SendErrorResult(res http.ResponseWriter, err error) {
 }
 ```
 
-### 9.6 安全错误回收
+### 9.7 安全错误回收
 
 `plg_security_svg`（`plugin/plg_security_svg/index.go`）展示了安全插件的错误回收模式：
 
@@ -922,7 +1231,7 @@ Hooks.Register.ProcessFileContentBeforeSend(func(reader io.ReadCloser, ctx *App,
 - `bool = false`：不修改内容，继续执行下一个钩子
 - `error != nil`：处理失败，中断请求链，返回错误给客户端
 
-### 9.7 ProcessFileContentBeforeSend 三态审计
+### 9.8 ProcessFileContentBeforeSend 三态审计
 
 `ProcessFileContentBeforeSend` 钩子的返回值 `(reader io.ReadCloser, changed bool, err error)` 构成了完整的三态语义，在 `ctrl/files.go:300` 中被消费：
 
@@ -967,6 +1276,43 @@ for _, obj := range Hooks.Get.ProcessFileContentBeforeSend() {
 | 任何插件 | 内部错误 | 错误态 | 返回错误，中断请求 |
 
 **fileMutation 标志**：当任意一个钩子返回 `changed=true` 时，`fileMutation` 被设为 true。这个标志影响后续逻辑——如果内容被修改过，范围请求（Range）的缓存策略会调整。
+
+### 9.9 ProcessFileContentBeforeSend 三态的性能开销
+
+每个注册的钩子在**每次文件读取请求**中都会被调用（`ctrl/files.go:300`），无论它是否处理该文件类型。这意味着穿透态（最常见的返回路径）的开销直接影响所有文件请求的延迟。
+
+**各插件的穿透态开销分析**：
+
+| 插件 | 穿透态判断逻辑 | 开销量级 | 热路径调用次数 |
+|------|---------------|----------|---------------|
+| `plg_image_light` | MIME 前缀检查 + SVG 例外 + 缩略图/尺寸参数检查 | ~5 个字符串比较 + `GetMimeType()` | 每次文件请求 |
+| `plg_image_c` | MIME 前缀检查 + 缩略图参数 + size 参数 + raw 列表查找 | ~5 个字符串比较 + `contains()` | 每次文件请求 |
+| `plg_image_ascii` | URL Query `ascii` 参数检查 | 1 个 map lookup | 每次文件请求 |
+| `plg_video_transcoder` | `transcode=hls` 参数 + MIME 前缀检查 | 2 个字符串比较 | 每次文件请求 |
+| `plg_security_svg` | MIME 精确匹配 `image/svg+xml` + 配置读取 | 1 个字符串比较 + `Config.Get()` | 每次文件请求 |
+
+**穿透态的总开销**：假设所有 5 个钩子都注册，每次文件请求至少执行：
+
+1. 5 × `GetMimeType()` 调用（涉及 path 后缀到 MIME 的映射查找）
+2. ~20 个字符串比较
+3. 1 × `Config.Get()` 调用（SVG 插件的 `disable_svg()` 检查，包含 `sync.RWMutex` 锁）
+4. 1 × URL Query 参数解析
+
+**变更态的额外开销**：
+
+| 操作 | 开销 | 来源插件 |
+|------|------|----------|
+| `io.ReadAll(reader)` | O(file_size) 内存 | SVG 安全过滤 |
+| `os.OpenFile()` + `io.Copy()` + CGO 调用 | O(file_size) 磁盘 I/O + CPU | 图片转码 |
+| `ffmpeg` 子进程 | O(file_size) 进程创建 + 转码 CPU | 视频转码 |
+| `image.Decode()` + `Image2ASCIIString()` | O(pixels) CPU | ASCII 转换 |
+
+**性能优化建议**：
+
+1. **短路 MIME 检查**：在循环开始前一次性获取 MIME 类型，传入所有钩子，避免每个钩子重复调用 `GetMimeType()`
+2. **将 `Config.Get()` 缓存**：SVG 插件的 `disable_svg()` 每次请求都读配置，可以改为 OnConfig 时缓存布尔值
+3. **减少注册数量**：如果不需要某个转码插件，从 `plugin/index.go` 中移除 import，减少穿透态调用次数
+4. **变更态请求异步化**：对于视频转码等耗时操作，可考虑先返回占位内容，后台完成转码后通知前端
 
 ---
 
@@ -1079,6 +1425,56 @@ func init() {
 **方案 5：zip 文件替换 + 下次请求重新读取**
 
 `PluginStaticHandler`（`ctrl/plugin.go:35`）每次请求都从 zip 文件实时读取内容（`zip.OpenReader`），所以替换 zip 文件后，**下一次静态资源请求**就会返回新内容。但 WASM 运行时是在 `Discovery()` 阶段编译和实例化的，进程内缓存，不会随 zip 文件替换而自动更新。
+
+### 10.5 五种替代方案的迁移路径
+
+从"无卸载能力"到"完全热插拔"，5 种方案逐层递进。实际迁移时应根据插件类型选择合适方案：
+
+**迁移矩阵**：
+
+| 插件类型 | 方案 1 (配置开关) | 方案 2 (Onload 延迟) | 方案 3 (前端刷新) | 方案 4 (进程重启) | 方案 5 (zip 替换) |
+|----------|:-:|:-:|:-:|:-:|:-:|
+| 内置 Backend | ✓ | — | — | ✓ | — |
+| 内置 Middleware | ✓ | — | — | ✓ | — |
+| 内置 Starter | — | — | — | ✓ | — |
+| 外部 WASM middleware | ✓ | ✓ | — | ✓ | — |
+| 外部 WASM workflow | ✓ | ✓ | — | ✓ | — |
+| 外部 xdg-open | — | — | ✓ | ✓ | ✓ |
+| 外部 CSS/patch | ✓ | — | ✓ | ✓ | ✓ |
+
+**从方案 1 迁移到方案 4 的路径**：
+
+```
+阶段 1: 配置开关软启停（零停机）
+    ↓ 确认所有插件都有 plugin_enable() 检查
+    ↓ 管理员通过后台开关启用/禁用
+阶段 2: 前端插件热更新（零停机）
+    ↓ 替换 state/plugins/ 下的 zip 文件
+    ↓ 用户刷新浏览器页面
+阶段 3: 进程重启（秒级停机）
+    ↓ docker restart / k8s rollout restart
+    ↓ 新的 Discovery() 加载最新 zip
+    ↓ 新的 WASM Runtime 实例化
+```
+
+**内置插件的迁移特殊性**：
+
+内置插件无法通过方案 5 更新。如果要更新内置插件的行为，需要：
+
+1. **修改源码 + 重新编译**：最直接，但需要 CI/CD 流水线
+2. **同名外部插件覆盖**：某些钩子（如 `CSS`、`StaticPatch`）支持幂等覆盖，可以通过外部 zip 提供同名 ID 的覆盖
+3. **通过 `FrontendOverrides` / `StaticPatch` 前端覆盖**：不修改后端逻辑，仅覆盖前端行为
+
+**外部 WASM 插件的安全迁移流程**：
+
+```
+1. 上传新版 zip 到 state/plugins/
+2. 旧 zip 保留（用于回滚），改名为 .zip.bak
+3. 触发进程重启（docker restart）
+4. 验证 /healthz 端点返回 pass
+5. 验证 /api/plugin 返回新版信息
+6. 如果异常，恢复旧 zip 并重启
+```
 
 ---
 
