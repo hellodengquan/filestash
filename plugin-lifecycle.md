@@ -44,6 +44,32 @@ Filestash 的插件系统分为**两条互补的加载管线**：
 - **步骤 7** 是所有插件"二次初始化"的时机——`init()` 仅注册钩子，`Onload` 才执行依赖配置的逻辑。
 - **步骤 12** 阻塞运行，直到收到 `SIGTERM`/`SIGINT` 信号（`withSignal()` 函数）。
 
+### InitLogger 失败回滚机制
+
+`InitLogger()` 在 `common/log.go:16` 中定义，只做一件事：打开日志文件句柄：
+
+```go
+func InitLogger() (err error) {
+    logfile, err = os.OpenFile(GetAbsolutePath(LOG_PATH, "access.log"), os.O_APPEND|os.O_WRONLY|os.O_CREATE, os.ModePerm)
+    if err != nil {
+        slog.Printf("ERROR log file: %+v", err)   // 回退到标准库 slog 输出
+        return err
+    }
+    logfile.WriteString("")
+    return nil
+}
+```
+
+**失败回滚路径**：
+
+1. 打开日志文件失败时，用标准库 `log` 包输出一条错误到 stderr（避免依赖自身日志系统导致递归失败）
+2. 返回 `error` 给调用者
+3. `cmd/main.go` 中的 `check(err, "could not init logger")` 捕获错误后调用 `os.Exit(1)` 退出
+
+**关键设计**：`Log` 结构体的 `debug/info/warn/error` 四个布尔标志默认都是 `false`（Go 零值），所以即使 `logfile` 为 nil，在 `Log.SetVisibility()` 被调用之前，`Log.Error()` 不会触发 `logfile.WriteString`，不会 panic。但 `InitLogger` 失败后进程会直接退出，不会走到设置日志级别的步骤。
+
+**无回滚动作**：失败即退出，不做资源清理回滚（因为还没分配什么资源）。
+
 ---
 
 ## 三、编译期内置插件的注册
@@ -110,6 +136,29 @@ func init() {
 ```
 
 Starter 是**单例**——`starter_process` 变量只保留最后一个注册值（`plugin.go:110`），不像其他钩子是追加模式。
+
+### Starter 单例多实例兼容
+
+Filestash 内置了多个 Starter 实现：
+
+| Starter 插件 | 协议 | 特性 |
+|--------------|------|------|
+| `plg_starter_http` | HTTP | 默认，纯 HTTP |
+| `plg_starter_https` | HTTPS | 自签名证书 |
+| `plg_starter_http2` | HTTPS + HTTP/2 | Let's Encrypt 自动证书 |
+| `plg_starter_tor` | Tor | 洋葱服务 |
+
+**竞争规则**：所有 Starter 都通过 `Hooks.Register.Starter(fn)` 注册到同一个 `starter_process` 变量，由于 `init()` 执行顺序由 Go 编译时的 import 顺序决定，**最后被 import 的 Starter 生效**。在 `server/plugin/index.go` 中，`plg_starter_http` 排在 import 列表的后面，所以默认 HTTP Starter 生效。
+
+**检测机制**：`HasPlugin(list ...string)` 函数（`ctrl/about.go:50`）可以检测某个插件是否被编译进二进制。SDK 中用它判断协议（`pkg/sdk/utils.go:66`）：
+
+```go
+if HasPlugin("plg_starter_https", "plg_starter_httpsfs", "plg_starter_web") {
+    scheme = "https"
+}
+```
+
+**部署层面的兼容**：多协议多端口不能同时启用（单例限制）。如果需要同时支持 HTTP 和 HTTPS，需要在 Starter 插件内部自行实现（例如 HTTPS Starter 再启一个 HTTP 重定向端口），或者通过反向代理（Nginx/Caddy）在前端做协议终结。
 
 ---
 
@@ -453,7 +502,35 @@ export async function load(mime) {
    err := rt.Call(r.Context(), "middleware", middlewareKey{}, &middlewareState{r: r, w: w, next: &callNext})
    ```
 
-### 7.3 Backend 隔离
+### 7.3 wazero 沙箱内存上限
+
+**当前实现：无显式内存限制**。
+
+`runtime.New()`（`adapter/runtime/runtime.go:21`）创建 wazero Runtime 时使用默认配置，未调用 `WithMemoryLimit` 或 `WithMemoryCapacity`：
+
+```go
+func New(wasm []byte, opts ...Option) (*Runtime, error) {
+    ctx := context.Background()
+    wrt := wazero.NewRuntime(ctx)           // 无内存上限配置
+    wasi_snapshot_preview1.MustInstantiate(ctx, wrt)
+    // ...
+    mod, err := wrt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig())  // 默认 ModuleConfig
+    // ...
+}
+```
+
+**实际内存上限取决于**：
+
+1. **wazero 默认行为**：默认使用 `MemoryPages` 默认值（通常 64 页 = 4MB），但支持动态增长（`memory.grow` 指令），理论上限受限于宿主进程的可用内存
+2. **Go GC 回收**：WASM 线性内存是 Go 堆上分配的 `[]byte`，受 Go 运行时管理
+3. **互斥锁串行调用**：`Runtime.mu sync.Mutex` 确保同一时间只有一个请求在执行插件逻辑，间接限制了并发内存使用
+4. **宿主写入保护**：`mem.Write(outPtr, outCap, raw)` 会检查 `outCap` 是否足够，缓冲区溢出时返回 0（WASM 侧需自行处理）
+
+**安全影响**：恶意 WASM 插件可以通过循环调用 `memory.grow` 耗尽宿主内存，触发 OOM。由于有互斥锁，最坏情况是每次请求分配一块内存然后释放（或被 GC 回收），不会出现并发内存爆炸，但单次调用仍可能消耗大量内存。
+
+**加固建议**：通过 `Option` 注入 `wazero.RuntimeConfig` 设置 `WithMemoryCapacity(pageLimit)`，或在 `ModuleConfig` 中设置 `WithMemoryLimits`。
+
+### 7.4 Backend 隔离
 
 Backend 插件在创建连接时通过 `model.NewBackend()` 进行白名单校验（`model/files.go:9`）：
 
@@ -546,6 +623,148 @@ WASM 插件不直接读取 `Config`，而是通过宿主导出函数间接获取
 - **Middleware 插件**：通过 `req_header_get` 读取请求头中的配置信息
 - **Workflow Action 插件**：通过 `workflow_params_get` 获取执行参数
 
+### 8.6 四条配置注入路径的优先级
+
+配置系统共有四层注入机制，按优先级从高到低排列：
+
+**第 1 层：启动期环境变量覆盖（最高优先级）**
+
+在 `Config.Initialise()`（`config.go:241`）中硬编码检查两个环境变量，直接调用 `.Set()` 写入 `Value`：
+
+```go
+if env := os.Getenv("ADMIN_PASSWORD"); env != "" {
+    shouldSave = true
+    this.Get("auth.admin").Set(env)
+}
+if env := os.Getenv("APPLICATION_URL"); env != "" {
+    shouldSave = true
+    _ = this.Get("general.host").Set(env).String()
+}
+```
+
+- 特点：直接改写 Value，触发持久化保存
+- 只覆盖特定字段（admin password 和 host）
+
+**第 2 层：配置文件持久化值**
+
+`Config.Load()`（`config.go:186`）从 `config.json` 读取，通过 `flattenJSON` 扁平化后逐字段写入 `Value`：
+
+```go
+for path, value := range flattenJSON("", raw) {
+    el := this.Get(path)
+    if el.currentElement != nil && el.currentElement.Value != value {
+        el.currentElement.Value = value
+    }
+}
+```
+
+- 特点：管理员在后台保存的配置持久化到磁盘
+- 每次启动或配置变更时加载
+
+**第 3 层：插件 Schema 默认值**
+
+插件通过 `Schema()` 回调设置 `Default` 字段，仅当 `Default` 为 `nil` 时才生效：
+
+```go
+// config.go:411-427
+func (this *ConfigElement) Default(value interface{}) *ConfigElement {
+    shouldSave := this.currentElement.Default == nil
+    if shouldSave {
+        this.currentElement.Default = value   // 只在首次设置 Default
+    }
+    if shouldSave {
+        this.cfg.Save()                       // 首次设置时持久化
+    }
+    return this
+}
+```
+
+- 特点：插件声明式注入配置项，不会覆盖已存在的默认值
+- 通常在 `Onload` 回调中调用
+
+**第 4 层：硬编码默认值（最低优先级）**
+
+在 `NewConfiguration()`（`config.go:62`）中定义的 `FormElement.Default`，包含 `defaultValue()` 函数检查的环境变量：
+
+```go
+FormElement{Name: "port", Type: "number", Default: defaultValue(8334, "FILESTASH_PORT")}
+
+func defaultValue[T string | int | bool](dval T, envName string) T {
+    if val := os.Getenv(envName); val != "" {
+        // ... 转换类型后返回环境变量值
+    }
+    return dval
+}
+```
+
+- 特点：编译期确定，永远存在，作为兜底
+- `defaultValue()` 机制允许环境变量影响默认值（注意是 Default 字段，不是 Value）
+
+**最终取值逻辑**（`config.go:475`）：
+
+```go
+func (this *ConfigElement) Interface() interface{} {
+    if el.Value == nil {
+        return el.Default    // Value 为空时才回退到 Default
+    }
+    return el.Value
+}
+```
+
+> **注意**：`defaultValue()` 函数设置的是 `Default` 字段，而 `Initialise()` 中的环境变量设置的是 `Value` 字段。两者不在同一层。
+
+**执行时序总结**：
+```
+NewConfiguration() → 设置硬编码 Default（含 defaultValue 环境变量）
+    ↓
+Config.Load()     → 从 config.json 读入 Value
+    ↓
+Config.Initialise() → ADMIN_PASSWORD / APPLICATION_URL 环境变量覆盖 Value
+    ↓
+Onload 回调       → 插件 Schema() 可能补充新 Default
+    ↓
+运行时读取        → Value 优先，Default 兜底
+```
+
+### 8.7 OnConfig 事件顺序
+
+**触发点**（两处）：
+
+1. **启动时**：`Config.Load()` 末尾（`config.go:215`），配置首次加载完成后触发
+2. **运行时**：管理员保存配置时，`PrivateConfigUpdateHandler` → `SaveConfig(b)` → `Config.Load()` → 再次触发
+
+**执行顺序**：
+
+按 `Hooks.Get.OnConfig()` 返回的切片顺序**线性同步执行**，顺序等于注册顺序（`append` 追加模式）：
+
+```go
+// config.go:215
+for _, fn := range Hooks.Get.OnConfig() {
+    fn()
+}
+```
+
+**注册顺序**由两个因素决定：
+- **内置插件**：按 `server/plugin/index.go` 中的 `import` 顺序，Go `init()` 按 import 顺序执行
+- **外部插件**：按 `extension.Discovery()` 遍历目录的字母序，逐个注册
+
+**典型用法**（`plg_widget_favourite/index.go:26`）：
+
+```go
+Hooks.Register.OnConfig(func() {
+    if PluginEnable() {
+        // 配置变更后重新初始化数据库连接
+    } else {
+        // 功能关闭时清理资源
+    }
+})
+```
+
+**注意事项**：
+- OnConfig 是同步执行的，插件如果做耗时操作会阻塞配置保存响应
+- OnConfig 内不要调用 `Config.Save()`，会导致递归触发
+- OnConfig 在启动时的 `Config.Load()` 中就会触发一次，那时 Onload 可能还没执行，所以 OnConfig 回调不要依赖 Onload 中初始化的状态
+
 ---
 
 ## 九、错误回收
@@ -562,6 +781,40 @@ func check(err error, msg string) {
 ```
 
 `InitLogger`、`InitConfig`、`Discovery`、`InitPluginList`、`workflow.Init` 任一失败，进程直接退出。
+
+### check 严格失败的告警链路
+
+`check()` 函数（`cmd/main.go:52`）是启动阶段的唯一错误收口：
+
+```go
+func check(err error, msg string) {
+    if err == nil { return }
+    Log.Error(msg, err.Error())   // 写错误日志
+    os.Exit(1)                    // 硬退出
+}
+```
+
+**告警链路只有两级**：
+
+1. **日志层**：通过 `Log.Error()` 写入日志文件和 stdout（如果日志系统已经初始化的话）
+   - 如果是 `InitLogger` 自身失败，`Log.Error` 的级别标志还是 `false`，不会输出任何内容
+   - 此时由 `InitLogger` 内部的 `slog.Printf` 兜底输出到 stderr
+
+2. **进程退出码**：`os.Exit(1)` 返回非零退出码
+   - 由容器编排系统（Docker/K8s）、systemd、supervisord 等部署层捕获并触发重启/告警
+
+**无内置告警**：没有 webhook、email、短信等告警机制。生产环境依赖外部监控系统（Prometheus + Alertmanager / Datadog / 云监控）通过进程存活探针或日志采集发现异常。
+
+**失败顺序敏感**：
+
+```
+InitLogger 失败 → slog 输出 stderr → os.Exit(1)
+InitConfig 失败 → Log.Error 写日志 → os.Exit(1)
+Discovery 失败  → Log.Error 写日志 → os.Exit(1)
+...
+```
+
+由于 `Log.SetVisibility()` 在 `Config.Load()` 中才被调用，如果 `InitConfig` 在 `Config.Load()` 之前失败（比如 `NewConfiguration()` 阶段），日志级别默认全部关闭，`Log.Error` 不会有输出。这是一个潜在的调试盲区。
 
 ### 9.2 外部插件发现 — 单插件失败不阻断
 
@@ -665,8 +918,55 @@ Hooks.Register.ProcessFileContentBeforeSend(func(reader io.ReadCloser, ctx *App,
 ```
 
 返回值 `(io.ReadCloser, bool, error)` 的含义：
-- `bool = true`：插件已处理该文件，后续 `ProcessFileContentBeforeSend` 钩子不再执行
-- `bool = false`：继续执行下一个钩子
+- `bool = true`：插件已修改文件内容，用新的 `reader` 替换，继续执行后续钩子
+- `bool = false`：不修改内容，继续执行下一个钩子
+- `error != nil`：处理失败，中断请求链，返回错误给客户端
+
+### 9.7 ProcessFileContentBeforeSend 三态审计
+
+`ProcessFileContentBeforeSend` 钩子的返回值 `(reader io.ReadCloser, changed bool, err error)` 构成了完整的三态语义，在 `ctrl/files.go:300` 中被消费：
+
+```go
+for _, obj := range Hooks.Get.ProcessFileContentBeforeSend() {
+    f, changed, err := obj(file, ctx, &res, req)
+    if err != nil {
+        Log.Debug("cat::hooks '%s'", err.Error())
+        SendErrorResult(res, err)
+        return                     // 状态1：错误 → 中断请求
+    } else if changed {
+        file = f
+        fileMutation = true        // 状态2：变更 → 替换内容，继续链
+    }
+    // 状态3：穿透 → 不替换，继续下一个钩子（隐式）
+}
+```
+
+**三态定义与处理逻辑**：
+
+| 状态 | 条件 | 行为 | 审计含义 |
+|------|------|------|----------|
+| **错误态** | `err != nil` | 立即调用 `SendErrorResult`，中断整个请求链 | 插件处理失败，返回错误给客户端 |
+| **变更态** | `err == nil && changed == true` | 用新的 `reader` 替换原 `file`，设置 `fileMutation = true`，继续执行下一个钩子 | 插件已修改内容（转码、过滤、加水印等） |
+| **穿透态** | `err == nil && changed == false` | 不替换 reader，继续下一个钩子 | 插件判断不需要处理，原样放行 |
+
+**审计链特性**：
+
+1. **短路特性**：错误态是硬终止，后续钩子和业务逻辑都不执行
+2. **级联修改**：变更态的输出作为下一个钩子的输入，多个插件可以形成处理管道（例如：先转码再加水印）
+3. **顺序敏感**：钩子按注册顺序执行，前面的插件先看到原始内容。注册顺序 = import 顺序（内置）+ 目录字母序（外部）
+4. **副作用累积**：除了 reader 替换，插件还可以修改响应头（如 `Content-Type`、`Content-Security-Policy`），这些副作用会累积
+
+**典型插件的三态使用模式**：
+
+| 插件 | 触发条件 | 状态 | 行为 |
+|------|----------|------|------|
+| `plg_video_transcoder` | `?transcode=hls` + video/* | 变更态 | 替换为 HLS playlist |
+| `plg_security_svg` | image/svg+xml | 变更态 | 设置 CSP 头，过滤 XML entity |
+| `plg_image_light` | image/* + thumbnail | 变更态 | 生成缩略图 |
+| `plg_image_light` | 非图片或不需要转码 | 穿透态 | 原样返回 reader |
+| 任何插件 | 内部错误 | 错误态 | 返回错误，中断请求 |
+
+**fileMutation 标志**：当任意一个钩子返回 `changed=true` 时，`fileMutation` 被设为 true。这个标志影响后续逻辑——如果内容被修改过，范围请求（Range）的缓存策略会调整。
 
 ---
 
@@ -732,6 +1032,54 @@ func (r *Runtime) Close() {
 
 例如 `plg_security_svg` 在 `Onload` 中闭包捕获了 `disable_svg` 函数，该函数每次调用都会通过 `Config.Get()` 读取最新配置值，因此配置变更可以立即生效。
 
+### 10.4 外部插件无卸载的替代方案
+
+由于外部插件没有 `Unload` / `Reload` 机制（`extension` 包只有 `Discovery()` 和 `All()`，没有 `Undiscovery()`），实际项目中通过以下方案变相实现"软卸载"和"热更新"：
+
+**方案 1：配置开关软启停（最常用）**
+
+每个插件都有自己的 `plugin_enable` 检查函数，在钩子入口处判断是否启用：
+
+```go
+// plg_video_transcoder/config.go:17
+plugin_enable = func() bool {
+    return Config.Get("features.video.enable_transcoder").Schema(...).Bool()
+}
+```
+
+钩子函数第一行就检查开关，未启用时直接返回穿透态（`return reader, false, nil`）或不注册路由。管理员通过后台修改配置 → `OnConfig` 触发 → 插件内部重新读取 → 立即生效，无需重启。
+
+**方案 2：Onload 延迟注册**
+
+部分插件在 `Onload` 回调中才注册钩子（而不是 `init()` 中），这样可以根据配置决定是否注册：
+
+```go
+// plg_video_transcoder/index.go:22
+func init() {
+    Hooks.Register.Onload(func() {
+        if !plugin_enable() || !isActive() {
+            return              // 配置关闭 → 不注册任何钩子
+        }
+        Hooks.Register.ProcessFileContentBeforeSend(createPlaylist)
+        Hooks.Register.HttpEndpoint(...)
+    })
+}
+```
+
+但这种方式有局限——Onload 只在启动时执行一次，运行时关闭配置不会自动"反注册"已注册的钩子。
+
+**方案 3：前端插件刷新页面即重载**
+
+前端插件（`xdg-open` 类型）通过 `/api/plugin` 接口暴露，前端 `plugin.js` 按需动态 `import()`。用户刷新浏览器页面就会重新拉取插件列表和加载 JS 模块，天然支持热更新。只要后端 zip 文件更新 + 刷新页面，前端插件就生效。
+
+**方案 4：重启进程**
+
+对于必须重启的变更（如新增/删除 WASM 中间件插件），通过进程管理器（systemd / docker restart / k8s rolling update）重启。Filestash 启动速度快（秒级），业务中断时间短。
+
+**方案 5：zip 文件替换 + 下次请求重新读取**
+
+`PluginStaticHandler`（`ctrl/plugin.go:35`）每次请求都从 zip 文件实时读取内容（`zip.OpenReader`），所以替换 zip 文件后，**下一次静态资源请求**就会返回新内容。但 WASM 运行时是在 `Discovery()` 阶段编译和实例化的，进程内缓存，不会随 zip 文件替换而自动更新。
+
 ---
 
 ## 十一、前端插件加载链路
@@ -758,8 +1106,11 @@ func (r *Runtime) Close() {
 | 插件钩子注册表 | `server/common/plugin.go` | 全文 |
 | 钩子类型定义 | `server/common/types.go` | 13-120 |
 | 启动编排 | `cmd/main.go` | 25-58 |
+| check 严格失败 | `cmd/main.go` | 52-57 |
+| withSignal 信号处理 | `cmd/main.go` | 60-68 |
 | 外部插件发现 | `server/pkg/extension/discovery.go` | 15-80 |
 | WASM 运行时 | `server/pkg/extension/adapter/runtime/runtime.go` | 全文 |
+| WASM 内存接口 | `server/pkg/extension/adapter/runtime/memory.go` | 全文 |
 | WASM 中间件适配 | `server/pkg/extension/adapter/middleware.go` | 全文 |
 | WASM Workflow 适配 | `server/pkg/extension/adapter/workflow.go` | 全文 |
 | 中间件链构建 | `server/middleware/index.go` | 21-37 |
@@ -768,11 +1119,20 @@ func (r *Runtime) Close() {
 | 插件路由 | `server/routes.go` | 158-176 |
 | 配置系统 | `server/common/config.go` | 全文 |
 | 配置变更钩子触发 | `server/common/config.go` | 215 |
+| 配置加密/解密 | `server/common/config_state.go` | 全文 |
+| defaultValue 环境变量默认值 | `server/common/config.go` | 506-522 |
+| Initialise 环境变量覆盖 | `server/common/config.go` | 241-260 |
 | Backend Driver | `server/common/backend.go` | 全文 |
 | Backend 创建与白名单 | `server/model/files.go` | 9-50 |
 | 认证中间件调度 | `server/ctrl/session.go` | 220-487 |
 | 错误类型体系 | `server/common/error.go` | 全文 |
 | 响应封装 | `server/common/response.go` | 全文 |
+| ProcessFileContentBeforeSend 调用点 | `server/ctrl/files.go` | 300-310 |
 | 前端插件模型 | `public/assets/model/plugin.js` | 全文 |
 | 内置插件清单 | `server/plugin/index.go` | 全文 |
 | 常量/路径 | `server/common/constants.go` | 全文 |
+| InitLogger 日志初始化 | `server/common/log.go` | 16-24 |
+| HasPlugin 插件存在检测 | `server/ctrl/about.go` | 50-74 |
+| Starter 注册 | `server/common/plugin.go` | 110-116 |
+| OnConfig 注册 | `server/common/plugin.go` | 288-293 |
+| 插件静态资源处理器 | `server/ctrl/plugin.go` | 35-72 |
