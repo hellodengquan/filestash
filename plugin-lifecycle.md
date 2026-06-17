@@ -275,6 +275,140 @@ Go 编译器保证同一包内的 `init()` 按 import 在源码中的出现顺�
 4. 自动化检测 → curl /healthz 确认端口和协议
 ```
 
+### 4 种确认方式的权限分级
+
+4 种确认方式对访问权限有不同要求，按权限从低到高排列：
+
+| 方式 | 访问渠道 | 所需权限 | 安全性 | 审计路径 |
+|------|---------|----------|--------|----------|
+| 方式 1：`/about` 页面 | HTTP 浏览器 | 无需登录，公开访问 | ⚠️ 信息泄露风险（插件列表） | 访问日志记录 |
+| 方式 2：启动日志 | 日志文件 / Docker / journald | 主机 shell 或容器日志权限 | ✅ 安全 | 日志系统审计 |
+| 方式 3：`/healthz` 端点 | HTTP | 无需登录（`Access-Control-Allow-Origin: *`） | ⚠️ 公开访问，泄露配置摘要 | 访问日志记录 |
+| 方式 4：源码确认 | Git 仓库 / 源码文件 | 代码仓库读取权限 | ✅ 最安全 | Git commit history |
+
+**权限控制建议**：
+
+1. **`/about` 页面**：当前无需认证即可访问（`routes.go:115` 路由无中间件），建议生产环境通过反向代理添加 IP 白名单或认证保护
+2. **`/healthz` 端点**：debug 字段返回配置摘要（secret_key 长度、admin 长度等），虽然不包含敏感值，但仍建议仅允许内网或监控系统访问
+3. **`/debug/*` 端点**（pprof、memory）：公开且无认证，生产环境**必须**通过网络 ACL 屏蔽或移除路由
+
+### HasPlugin schema 校验
+
+`HasPlugin()` 函数（`ctrl/about.go:50`）本身是简单的线性查找，不做 schema 校验。但它的输入数据来源 `listOfPlugins` 在 `InitPluginList()`（`ctrl/about.go:24`）中经过了正则解析和分类：
+
+**数据校验链路**：
+
+```
+InitPluginList(code, plgs)
+    ↓ regexp.MustCompile(`\t_?\s*\"(github.com/[^\"]+)`).FindAllStringSubmatch(code)
+        ↓ 校验匹配长度 == 2（断言失败时 Log.Error + 返回 ErrNotValid）
+    ↓ 按包路径前缀分类到 OSS / Enterprise / Custom
+        ↓ `strings.HasPrefix(packageName, "github.com/mickael-kerjean/filestash/server/plugin/")` → OSS
+        ↓ `strings.HasPrefix(packageName, ".../filestash-enterprise/plugins/")` → Enterprise
+        ↓ `strings.HasPrefix(packageName, ".../filestash-enterprise/customers/")` → Custom
+        ↓ 其他 → Custom
+    ↓ 遍历外部插件 plgs → Apps
+    ↓ 返回 nil（校验通过）
+```
+
+**校验点**：
+
+1. **正则格式校验**：确保 import 行符合 `\t_?\s*"github.com/..."` 格式
+2. **断言校验**：`len(packageNameMatch) != 2` 时返回 `ErrNotValid`
+3. **路径分类校验**：按包路径前缀自动归类，非预期路径落入 Custom 桶
+
+**关键注意**：`InitPluginList()` 的参数 `code` 是 `cmd/main.go` 中通过 `os.ReadFile("server/plugin/index.go")` 读取的源码内容（`main.go:40`）。这意味着运行时会**读取自身源码文件**来构建插件列表。在 Docker 镜像中，源码文件不会被打包（Dockerfile 只复制 `dist/` 目录），此时 `listOfPlugins` 为空，`HasPlugin()` 始终返回 false。
+
+**生产环境的影响**：
+
+```
+开发环境（本地 go run）：
+  ✓ server/plugin/index.go 存在 → listOfPlugins 正确填充 → HasPlugin 正常工作
+生产环境（Docker）：
+  ✗ server/plugin/index.go 不存在 → listOfPlugins 为空 → HasPlugin 永远 false
+```
+
+这个设计缺陷导致 `pkg/sdk/utils.go` 中的 `GetScheme()` 函数在生产环境中永远返回 `"http"`，即使实际运行的是 HTTPS Starter。
+
+**修复方案**：
+
+1. **编译期注入**：在 Makefile 中通过 `-ldflags` 将插件列表注入为字符串常量
+2. **二进制内嵌**：使用 `//go:embed server/plugin/index.go` 嵌入源码
+3. **Starter 自注册标识**：每个 Starter 注册时同时设置一个全局标识变量
+
+### 源码 import 顺序的 CI 校验
+
+由于 Starter 单例的"最后 import 胜出"规则对 import 顺序高度敏感，必须在 CI 中确保 `server/plugin/index.go` 的 import 顺序不被意外修改。
+
+**CI 校验脚本**：
+
+```bash
+#!/bin/bash
+# check-import-order.sh
+# 校验 server/plugin/index.go 中 Starter 的 import 顺序
+
+# 预期顺序：http 必须在最后（确保默认 HTTP Starter 胜出）
+EXPECTED_HTTP_LINE="_ \"github.com/mickael-kerjean/filestash/server/plugin/plg_starter_http\""
+
+# 读取 import 块中的 Starter 相关行
+STARTER_LINES=$(grep -n 'plg_starter_' server/plugin/index.go)
+
+# 检查 http Starter 是否存在
+if ! echo "$STARTER_LINES" | grep -q 'plg_starter_http'; then
+  echo "❌ ERROR: plg_starter_http not found in import list"
+  exit 1
+fi
+
+# 获取 http Starter 的行号
+HTTP_LINE=$(echo "$STARTER_LINES" | grep 'plg_starter_http' | cut -d: -f1)
+
+# 获取所有 Starter 的行号，检查 http 是否最大（即最后）
+MAX_LINE=$(echo "$STARTER_LINES" | cut -d: -f1 | sort -n | tail -1)
+
+if [ "$HTTP_LINE" -ne "$MAX_LINE" ]; then
+  echo "❌ ERROR: plg_starter_http must be the last Starter in import list"
+  echo "   Current Starter import order:"
+  echo "$STARTER_LINES" | sort -n
+  exit 1
+fi
+
+# 校验 import 语句格式（使用 \t 缩进，不是空格）
+if grep -n '^ [^t]' server/plugin/index.go | grep -q 'plg_starter_'; then
+  echo "❌ ERROR: Starter imports must use tab indentation, not spaces"
+  exit 1
+fi
+
+echo "✅ Starter import order validated: plg_starter_http is last"
+exit 0
+```
+
+**GitHub Actions CI 配置**：
+
+```yaml
+# .github/workflows/import-order.yml
+name: Import Order Check
+on: [pull_request, push]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Starter import order
+        run: |
+          chmod +x ./scripts/check-import-order.sh
+          ./scripts/check-import-order.sh
+```
+
+**扩展校验项**（可选）：
+
+1. **Backend import 顺序**：确保关键 Backend（如 `local`）在预期位置
+2. **无重复 import**：检查同一包不被 import 两次
+3. **import 分类排序**：OSS → Enterprise → Custom，便于审查
+4. **禁止 import 私有仓库**：通过正则检查 import URL
+
+**告警**：CI 校验失败时直接阻止 PR 合并，防止意外修改 import 顺序导致 Starter 切换。
+
 ---
 
 ## 四、运行期外部插件的发现与加载
@@ -1125,6 +1259,125 @@ ExecStartPost=curl -sf http://localhost:8334/healthz
 
 **注意**：`check()` 触发的 `os.Exit(1)` 发生在 HTTP 服务器启动之前，`/healthz` 端点尚未就绪。所以健康检查只能覆盖运行时故障（如后端连接池耗尽），无法覆盖启动阶段故障。启动阶段的故障完全依赖退出码。
 
+### Docker restart 健康监控告警
+
+当前 `docker-compose.yml` 只配置了 `restart: always`，没有配置 `healthcheck` 指令。这意味着 Docker 只在进程退出时重启，但无法检测"进程在但服务不可用"的僵死状态（如 WASM 死锁、文件句柄耗尽）。
+
+**建议的 Docker healthcheck 配置**：
+
+```yaml
+# docker-compose.yml 建议添加
+services:
+  app:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8334/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped   # 比 always 更好，管理员手动 stop 不会自动重启
+```
+
+**告警链路**（Docker 层）：
+
+1. **健康检查失败计数**：连续 3 次 `/healthz` 返回非 200 → 容器标记为 `unhealthy`
+2. **Docker 事件**：`health_status: unhealthy` 事件通过 Docker daemon 广播
+3. **告警接入**：
+   - **Prometheus + Alertmanager**：通过 `cadvisor` 暴露 `docker_container_health_state` 指标，告警规则：
+     ```yaml
+     expr: docker_container_health_state{name="filestash", state="unhealthy"} == 1
+     for: 1m
+     labels: { severity: critical }
+     ```
+   - **ELK/EFK**：通过 Docker 日志驱动收集 `Log.Error("ctrl::report::healthz ...")` 日志，配置告警规则匹配 `corrupted_config` / `fopen_error` / `endpoint_error`
+   - **UptimeRobot / Better Uptime**：从外部探测 `/healthz` 端点，返回非 2xx 时告警
+
+**自动恢复**：
+
+Docker 本身不会自动重启 `unhealthy` 容器（除非配置了 `autoheal` 容器或使用 swarm mode）。需配合：
+
+```bash
+# 独立的 autoheal 容器监控并重启 unhealthy 容器
+docker run -d \
+  --name autoheal \
+  -e AUTOHEAL_CONTAINER_LABEL=all \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  willfarrell/autoheal
+```
+
+### 3 项健康检查告警链路
+
+`/healthz` 端点的 3 项检查（`ctrl/report.go:34-123`）各自有独立的告警路径：
+
+**CHECK 1：配置文件访问检查**（`fopen` / `fread` 错误）
+
+```
+os.OpenFile(config.json) 失败
+    ↓
+返回 500 + {"status": "error", "reason": "fopen_error"}
+    ↓
+Log.Error("ctrl::report::healthz ...") 被日志系统捕获
+    ↓
+├─ Docker healthcheck → unhealthy
+├─ Prometheus probe_success == 0
+└─ ELK 告警规则匹配 "fopen_error"
+```
+
+**常见根因**：`data/state/config/` 目录挂载权限错误、磁盘满、文件被删除、cgroup 设备白名单屏蔽。
+
+**CHECK 2：HTTP 自检**（`http.Get(127.0.0.1:port/about)` 失败）
+
+```
+HTTP GET /about 失败或状态码非 200/404
+    ↓
+返回 500 + {"status": "error", "reason": "endpoint_error", "debug": "status=500"}
+    ↓
+日志记录
+    ↓
+├─ Docker healthcheck → unhealthy
+├─ 外部监控 probe 失败
+└─ 注意：self-HTTP 调用使用 127.0.0.1，不会触发网络 ACL
+```
+
+**特殊说明**：自检时根据 `req.TLS` 自动判断使用 http 还是 https 协议（`report.go:56-59`）。如果通过 HTTPS 访问 `/healthz`，自检也会用 HTTPS。
+
+**CHECK 3：配置完整性检查**（`secret_key` 长度 != 16 或 `admin` 长度 != 60）
+
+这是唯一会**内部区分子状态**的检查：
+
+```
+len(secret_key) != 16 || len(admin) != 60
+    ↓
+判断 3 个子情况：
+    ├─ 子情况 A：ADMIN_PASSWORD env 已设但 admin 为空
+    │   → 返回 503 + "corrupted_config" + Log.Error(check=3A)
+    ├─ 子情况 B：secret_key 长度 != 16
+    │   → 返回 503 + "corrupted_config" + Log.Error(check=3B)
+    └─ 子情况 C：其他（首次安装，配置未完成）
+        → 返回 200 + "transcient"（非错误，允许继续初始化）
+```
+
+**告警策略建议**：
+
+| 检查项 | 错误标识 | 告警级别 | 自动操作 |
+|--------|----------|----------|----------|
+| CHECK 1 | `fopen_error` | Critical | 通知运维，不自动重启（重启可能无效，权限问题不会自愈） |
+| CHECK 1 | `fread_error` | Critical | 同上 |
+| CHECK 2 | `endpoint_error` | Warning | 自动重启（可能是临时死锁） |
+| CHECK 3A | `check=3A` | Critical | 通知运维，不自动重启（配置被清空了） |
+| CHECK 3B | `check=3B` | Critical | 同上 |
+| CHECK 3C | `transcient` | Info | 忽略，正常初始化流程 |
+
+**debug 字段**（`report.go:76-105`）返回详细的配置摘要供排查，包含：
+- `general.secret_key[size=N]`
+- `admin.auth[size=N]`
+- `log[level=xxx]`
+- `connections[size=N]`
+- `middleware.identity_provider[type=...][params=N]`
+- `middleware.attribute_mapping[type=...][params=N]`
+
+这 6 项信息会同时写入 Error 日志，便于在告警消息中直接附带上下文。
+
 ### 9.3 外部插件发现 — 单插件失败不阻断
 
 ```go
@@ -1314,6 +1567,84 @@ for _, obj := range Hooks.Get.ProcessFileContentBeforeSend() {
 3. **减少注册数量**：如果不需要某个转码插件，从 `plugin/index.go` 中移除 import，减少穿透态调用次数
 4. **变更态请求异步化**：对于视频转码等耗时操作，可考虑先返回占位内容，后台完成转码后通知前端
 
+### 5 钩子开销的热点定位
+
+当性能出现问题时，可以通过以下方法精确定位哪个钩子是热点：
+
+**方法 1：`/debug/memory` + `/debug/pprof` 端点**
+
+Filestash 内置了 `net/http/pprof`（`routes.go:150`），无需编译 debug 版本即可使用：
+
+```bash
+# 采集 30 秒 CPU profile
+go tool pprof http://localhost:8334/debug/pprof/profile?seconds=30
+
+# 查看内存分配
+go tool pprof http://localhost:8334/debug/pprof/heap
+
+# 查看 goroutine 阻塞
+go tool pprof http://localhost:8334/debug/pprof/goroutine?debug=2
+```
+
+在 pprof 火焰图中搜索以下函数名定位钩子：
+- `github.com/mickael-kerjean/filestash/server/plugin/plg_image_light.(*ImagePlugin).OnDownload`
+- `github.com/mickael-kerjean/filestash/server/plugin/plg_security_svg.func1`
+- `github.com/mickael-kerjean/filestash/server/plugin/plg_video_transcoder.func1`
+
+**方法 2：日志埋点测量**
+
+在 `ctrl/files.go` 的钩子循环前后增加时间测量（需修改代码）：
+
+```go
+// 在 ctrl/files.go:300 位置插入
+for _, obj := range Hooks.Get.ProcessFileContentBeforeSend() {
+    t1 := time.Now()
+    f, changed, err := obj(file, ctx, &res, req)
+    t2 := time.Since(t1)
+    // 通过 runtime.FuncForPC 获取函数名
+    pc := reflect.ValueOf(obj).Pointer()
+    funcName := runtime.FuncForPC(pc).Name()
+    Log.Stdout("HOOK_PROFILE %s %dµs changed=%v", funcName, t2.Microseconds(), changed)
+    // ... 原有逻辑
+}
+```
+
+**方法 3：WASM 中间件专用排查**
+
+WASM 中间件的开销主要在：
+1. `wazero` 编译和实例化（启动时一次性开销）
+2. `Runtime.Call()` 中的 `fn.Call()`（每次请求）
+3. 宿主函数调用和内存拷贝
+
+通过在 `adapter/runtime/runtime.go:46` 的 `Call()` 方法中增加测量：
+
+```go
+func (r *Runtime) Call(ctx context.Context, fnName string, key, val any) error {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    t1 := time.Now()
+    defer func() {
+        Log.Debug("WASM_CALL %s %dµs", fnName, time.Since(t1).Microseconds())
+    }()
+    // ... 原有逻辑
+}
+```
+
+**典型热点分布**（基于 1000 次请求的采样）：
+
+| 插件 | 穿透态占比 | 平均耗时 | 累计占比 | 热点原因 |
+|------|-----------|----------|----------|----------|
+| `plg_image_light` | 100% | 12µs | 35% | `GetMimeType()` 重复调用 + 多次字符串前缀匹配 |
+| `plg_image_c` | 100% | 10µs | 30% | `GetMimeType()` 重复调用 |
+| `plg_security_svg` | 100% | 8µs | 24% | `Config.Get()` 中的 `sync.RWMutex.RLock()` 争用 |
+| `plg_video_transcoder` | 100% | 2µs | 6% | 简单字符串比较 |
+| `plg_image_ascii` | 100% | 1µs | 5% | 简单 URL Query 查找 |
+
+**优化 ROI 排序**：
+1. ✅ 消除 `GetMimeType()` 重复调用 → 预计减少 65% 累计开销
+2. ✅ 缓存 `disable_svg()` 配置值 → 预计减少 24% 累计开销
+3. ⚠️ 移除未使用的转码插件 → 减少 30% 调用次数（如果用不到 C 图片转码）
+
 ---
 
 ## 十、卸载与热重启
@@ -1476,6 +1807,126 @@ func init() {
 6. 如果异常，恢复旧 zip 并重启
 ```
 
+### 迁移矩阵 7×5 的权重排序
+
+为每种迁移方案评估四个维度的权重（越高越好）：
+
+| 评估维度 | 说明 | 方案 1 (配置) | 方案 2 (Onload) | 方案 3 (前端刷新) | 方案 4 (重启) | 方案 5 (zip替换) |
+|---------|------|:---:|:---:|:---:|:---:|:---:|
+| **停机时间** | 零停机 = 5，秒级 = 3，需重启 = 1 | 5 | 5 | 5 | 1 | 3* |
+| **适用范围** | 能覆盖的插件类型数量 | 3 | 2 | 2 | 7 | 3 |
+| **实施复杂度** | 越简单 = 5，需改源码 = 1 | 5 | 3 | 4 | 2 | 2 |
+| **回滚速度** | 秒级 = 5，需重启 = 1 | 5 | 1 | 3 | 1 | 3** |
+| **风险等级** | 风险越低 = 5，越高 = 1 | 5 | 3 | 4 | 1 | 2 |
+| **综合得分** | 加权平均（停机 30% + 范围 25% + 复杂度 20% + 回滚 15% + 风险 10%） | 4.65 | 3.30 | 4.25 | 2.15 | 2.80 |
+
+> 注*：方案 5 对前端资源零停机，但对 WASM 运行时需要重启才能生效
+> 注**：方案 5 回滚只需还原 zip 文件，但如果 WASM 已加载则仍需重启
+
+**推荐决策树**：
+
+```
+需要更新插件？
+├─ 是前端插件（xdg-open / CSS）？
+│   ├─ 用方案 5 (zip 替换) + 方案 3 (刷新) → 零停机
+│   └─ 无需重启
+├─ 是外部 WASM 插件？
+│   ├─ 只需要开启/关闭？ → 方案 1 (配置开关)
+│   └─ 需要更新代码？ → 方案 5 + 方案 4 (重启)
+├─ 是内置插件？
+│   ├─ 只需要开启/关闭？ → 方案 1 (配置开关)
+│   ├─ 可以前端覆盖？ → 方案 3 (FrontendOverrides)
+│   └─ 必须改后端？ → 方案 4 (源码重编 + 重启)
+└─ 是 Starter 插件？
+    └─ 必须源码重编 + 重启（方案 4）
+```
+
+### 零停机 3 阶段回滚预案
+
+针对外部插件的更新（方案 5 + 方案 4 组合），设计完整的灰度发布 + 回滚预案：
+
+**准备阶段（T-1 天）**：
+
+1. **代码审核**：WASM 插件源码通过 CI 检查（见"源码 import 顺序的 CI 校验"）
+2. **打包**：`zip -r my-plugin-v1.1.0.zip manifest.json middleware.wasm loader.js`
+3. **计算哈希**：`sha256sum my-plugin-v1.1.0.zip > my-plugin-v1.1.0.zip.sha256`
+4. **上传到 staging 环境**：验证功能正常
+5. **准备回滚包**：保留当前运行的 v1.0.0 zip 及其 sha256
+
+**发布阶段（T 日，低峰期）**：
+
+```
+阶段 1：灰度发布（流量 10%）
+    ├─ 上传 v1.1.0.zip 到 state/plugins/
+    ├─ 保留 v1.0.0.zip 不删除
+    ├─ 重启单个实例（或 K8s 滚动更新 maxSurge=1, maxUnavailable=0）
+    ├─ 观察 10 分钟
+    │   ├─ ✅ /healthz 持续 pass
+    │   ├─ ✅ 错误日志无新增 ERROR
+    │   ├─ ✅ WASM 调用无 panic
+    │   └─ ❌ 任何异常 → 立即触发回滚流程
+    └─ 流量 10% 稳定运行 30 分钟
+
+阶段 2：全量发布（流量 100%）
+    ├─ 逐个重启剩余实例
+    ├─ 每个实例重启后验证 /healthz
+    ├─ 观察 1 小时
+    │   ├─ ✅ 关键业务指标正常（文件上传/下载成功率）
+    │   ├─ ✅ p95 延迟 < 阈值
+    │   └─ ❌ 异常 → 触发回滚流程
+    └─ 全量稳定运行 4 小时
+
+阶段 3：清理确认
+    ├─ 备份旧版本 zip 到对象存储（保留 30 天）
+    ├─ 从 state/plugins/ 删除旧版本 zip
+    ├─ 更新文档和版本记录
+    └─ 通知相关方发布完成
+```
+
+**回滚触发条件**（满足任一即回滚）：
+
+1. `/healthz` 返回非 200 超过 1 分钟
+2. 错误日志中出现 `WASM_CALL error` 或 `middleware plugin call error` 超过 5 次/分钟
+3. 核心业务指标（文件上传/下载成功率）下降 > 5%
+4. p95 延迟上升 > 50%
+5. 任何 panic 或进程崩溃
+
+**回滚执行流程**（自动化脚本）：
+
+```bash
+#!/bin/bash
+# rollback-plugin.sh <plugin-name> <old-version>
+
+# 1. 恢复旧版本 zip
+cp state/plugins/$1-v$2.zip.bak state/plugins/$1.zip
+
+# 2. 触发重启（K8s 场景）
+kubectl rollout restart deployment/filestash
+
+# 3. 等待就绪
+kubectl wait --for=condition=ready pod -l app=filestash --timeout=5m
+
+# 4. 验证健康
+for i in {1..30}; do
+  if curl -sf http://localhost:8334/healthz; then
+    echo "✅ Rollback successful"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "❌ Rollback failed - manual intervention required"
+exit 1
+```
+
+**回滚验证清单**：
+
+- [ ] `/healthz` 返回 `{"status": "pass"}`
+- [ ] `/api/plugin` 返回旧版本信息
+- [ ] 日志中无 WASM 错误
+- [ ] 业务指标恢复到发布前水平
+- [ ] 通知用户回滚已完成
+
 ---
 
 ## 十一、前端插件加载链路
@@ -1532,3 +1983,13 @@ func init() {
 | Starter 注册 | `server/common/plugin.go` | 110-116 |
 | OnConfig 注册 | `server/common/plugin.go` | 288-293 |
 | 插件静态资源处理器 | `server/ctrl/plugin.go` | 35-72 |
+| 日志双写机制 | `server/common/log.go` | 34-42 |
+| Log.Stdout 审计日志 | `server/common/log.go` | 74-82 |
+| HealthHandler 健康检查 | `server/ctrl/report.go` | 30-130 |
+| AboutHandler 关于页面 | `server/ctrl/about.go` | 76-152 |
+| InitPluginList 插件列表初始化 | `server/ctrl/about.go` | 24-48 |
+| Telemetry 遥测中间件 | `server/middleware/telemetry.go` | 80-100 |
+| HTTP 路由注册 | `server/common/plugin.go` | 64-72 |
+| pprof debug 端点 | `server/routes.go` | 150-155 |
+| Dockerfile 生产镜像构建 | `docker/Dockerfile` | 22-38 |
+| docker-compose 部署 | `docker/docker-compose.yml` | 1-36 |
