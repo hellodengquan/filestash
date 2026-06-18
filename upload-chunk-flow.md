@@ -1347,7 +1347,416 @@ UploadPoolSize: this.Get("general.upload_pool_size").Int(),
 
 ---
 
-## 十一、关键文件索引
+## 十一、多 Backend 故障切换时半完成分片归属判定
+
+Filestash 所谓「故障切换」在实际代码中表现为：**HTTP 请求跨多次传输之间 backend 参数变更**（用户重新登录到不同账号、后端配置变更、分享链接 session 变更等）。归属判定完全依赖 cacheKey 的 hash 生成规则，不依赖 backend_id。
+
+### 11.1 归属判定的核心：cacheKey 生成规则
+
+**代码位置**: `server/ctrl/files.go:543-546`, `server/common/crypto.go:193-218`
+
+```go
+// FileSave 中的 cacheKey (files.go:543-546)
+cacheKey := map[string]string{
+    "path":    path,
+    "session": GenerateID(ctx.Session),   // ← 归属判定的核心
+}
+```
+
+**GenerateID 的 hash 算法**（`crypto.go:193-218`）：
+```go
+func GenerateID(params map[string]string) string {
+    p := ""
+    orderedKeys := make([]string, len(params))
+    for key, _ := range params {
+        orderedKeys = append(orderedKeys, key)
+    }
+    sort.Strings(orderedKeys)
+
+    for _, key := range orderedKeys {
+        switch key {
+        case "password":  // ← 故意排除
+        case "path":      // ← 故意排除
+        case "session":   // ← 故意排除
+        case "timestamp": // ← 故意排除（登录时间戳）
+        default:
+            if val := params[key]; val != "" {
+                p += key + "=>" + params[key] + ", "
+            }
+        }
+    }
+    p += "salt=>" + SECRET_KEY  // ← 绑定服务端密钥
+    return Hash(p, 20)          // ← 20 位 SHA1 截断
+}
+```
+
+### 11.2 Session map 中的字段来源
+
+Session 是 `map[string]string`，存储于加密 Cookie 中。字段因 backend 类型而异：
+
+| Backend | Session 中典型字段 |
+|---------|------------------|
+| **S3** | `type`, `access_key_id`, `secret_access_key`, `endpoint`, `region`, `path` |
+| **FTP** | `type`, `hostname`, `port`, `username`, `path`, `tls` |
+| **Local** | `type`, `path` |
+| **分享链接** | `type`, `hostname`, `username`, `path`（来自 `Share.Auth` 解密） |
+
+### 11.3 归属判定矩阵
+
+GenerateID 故意排除了 `password/path/session/timestamp` 四个字段，因此判定规则如下：
+
+| 场景 | 可变参数 | hash 是否相同 | cacheKey 是否命中 | 断点续传效果 |
+|------|---------|-------------|------------------|------------|
+| **同一用户同路径续传** | 无 | ✅ 相同 | ✅ 命中 | ✅ 正常断点恢复 |
+| **密码变更**（同账号） | `password` | ✅ 相同 | ✅ 命中 | ✅ 断点恢复（password 被排除） |
+| **登录时间不同**（Cookie 刷新） | `timestamp` | ✅ 相同 | ✅ 命中 | ✅ 断点恢复（timestamp 被排除） |
+| **切不同 S3 Region 的 bucket** | `region` | ❌ 不同 | ❌ 未命中 | ❌ 无法续传 |
+| **切不同 S3 Access Key**（同 bucket） | `access_key_id` | ❌ 不同 | ❌ 未命中 | ❌ 无法续传 |
+| **S3 endpoint 变更** | `endpoint` | ❌ 不同 | ❌ 未命中 | ❌ 无法续传 |
+| **FTP 切不同用户**（同主机） | `username` | ❌ 不同 | ❌ 未命中 | ❌ 无法续传 |
+| **FTP 切不同主机**（同用户） | `hostname` | ❌ 不同 | ❌ 未命中 | ❌ 无法续传 |
+| **目标路径不同** | `path` | ✅ 相同（path 被排除） | ❌ 未命中 | ❌ cacheKey.path 不同 |
+| **切不同类型 backend**（S3→FTP） | `type` | ❌ 不同 | ❌ 未命中 | ❌ 无法续传 |
+| **同分享链接不同用户打开** | - | ✅ 相同 | ✅ 命中 | ✅ 断点恢复 |
+
+### 11.4 完整归属判定链路
+
+```
+每个请求到达 FileSave
+        │
+        ▼
+SessionStart 中间件 (session.go:57-82)
+  ├──► _extractSession(req, ctx)
+  │       ├──► 分享链接场景: ctx.Share.Auth 解密 → session map
+  │       └──► 普通登录场景: Authorization Cookie 解密 → session map
+  │               ├──► DecryptString(SECRET_KEY_DERIVATE_FOR_USER, auth)
+  │               └──► json.Unmarshal → map[type,hostname,username,...]
+  │
+  └──► _extractBackend(req, ctx)
+          └──► model.NewBackend(ctx, session)   (model/files.go:9-51)
+                  ├──► isAllowed() ← 匹配 Config.Conn 白名单
+                  │       ├──► 检查 type
+                  │       ├──► 检查 hostname/path
+                  │       └──► 检查 url
+                  └──► Backend.Get(session["type"]).Init(session, ctx)
+        │
+        ▼
+FileSave 内部 (files.go:479+)
+        │
+        ├──► cacheKey.path = PathBuilder(ctx, query.path)  ← 目标路径规范化
+        │
+        ├──► cacheKey.session = GenerateID(ctx.Session)
+        │       ├──► 排序 session 所有 key
+        │       ├──► 排除: password / path / session / timestamp
+        │       ├──► 拼接: key1=>val1, key2=>val2, ...
+        │       ├──► 追加: salt=>SECRET_KEY
+        │       └──► SHA1 → 20 位 hash
+        │
+        ├──► HEAD:  chunkedUploadCache.Get(cacheKey) → 返回 offset
+        ├──► POST:  chunkedUploadCache.Set(cacheKey, uploader)
+        └──► PATCH: chunkedUploadCache.Get(cacheKey) → Next(reader)
+```
+
+### 11.5 故障切换的边界场景分析
+
+**场景 A：用户重新登录到同一后端（密码变更）**
+- GenerateID：排除了 `password` → hash 不变
+- cacheKey：`path` + 相同 session hash → 命中缓存
+- **后果**：断点续传可用，上传继续 ✓
+
+**场景 B：管理员修改了 SECRET_KEY**
+```go
+// crypto.go:216 → hash 输入变了
+p += "salt=>" + SECRET_KEY  // 新密钥
+```
+- GenerateID：所有旧 session hash 失效
+- cacheKey：**所有断点缓存无法命中**
+- **后果**：所有进行中的上传必须从头开始
+
+**场景 C：同路径不同账号同时上传**
+```
+用户A上传 /a.txt  → cacheKey = { "/a.txt", hash(sessionA) }
+用户B上传 /a.txt  → cacheKey = { "/a.txt", hash(sessionB) }
+```
+- hash 不同 → 两个独立的 chunkedUpload 实例
+- **后果**：互不干扰，各自 offset 独立管理 ✓
+
+**场景 D：用户上传中 session 超时（>1 年）**
+```go
+// session.go:310-312
+if t.Add(24 * 365 * time.Hour).Before(time.Now()) {
+    return session, ErrNotAuthorized  // session 校验失败
+}
+```
+- SessionStart 中间件返回 ErrNotAuthorized → **FileSave 根本不执行**
+- 但旧缓存 chunkedUploadCache 中仍存在（直到 24h 超时）
+- **后果**：缓存泄漏直到被 OnEvict 清理
+
+### 11.6 归属判定的安全边界
+
+**❌ 未校验 backend 对象一致性**：
+```go
+// files.go:578-585 (POST 创建时)
+ctx.Context = context.Background()
+b, err := ctx.Backend.Init(ctx.Session, ctx)  // ← 用当前 session 新建 backend
+uploader := createChunkedUploader(b.Save, path, size)
+
+// files.go:623-628 (PATCH 写入时)
+c := chunkedUploadCache.Get(cacheKey)  // ← 只看 cacheKey
+uploader := c.(*chunkedUpload)         // ← 直接取 uploader.fn
+uploader.Next(reader)                  // ← 写入到创建时的 backend
+```
+
+**安全隐患**：创建 uploader 时的 backend（`b.Save`）被闭包捕获。如果攻击者在 POST→PATCH 之间通过某种方式篡改 session（获取合法新 session 且 hash 碰撞），不会影响已创建的 uploader，仍然写入到原始 backend。但 cacheKey 相同意味着 session 内容等价，实际风险有限。
+
+---
+
+## 十二、上传失败后客户端续传 retry 的完整代码挂载点
+
+Retry 链路是一个 **前后端深度耦合的状态机**，跨越 UI 层、Worker 调度层、TUS 协议层、Virtual Layer 层。
+
+### 12.1 Retry 完整链路全景图
+
+```
+  用户点击 $retry 按钮
+        │ (UI层)
+        ▼
+  updateDOMWithStatus($task, "error")
+        │ ctrl_upload.js:240-249
+        ▼
+  exec.retry()   ← Worker.retry() 被覆盖为动态方法
+        │
+        │ ┌──────────────────────────────────────────┐
+        │ │ run() 时动态绑定 (ctrl_upload.js:353-360) │
+        │ │  this.retry = () => {                     │
+        │ │     virtual.before();                     │
+        │ │     return executeJob();  ← prepareJob    │
+        │ │  }                                        │
+        │ └──────────────────────────────────────────┘
+        ▼
+  virtual.before()    ← model_virtual_layer.js:149-154
+        │
+        │ stateAdd(virtualFiles$, basepath, { loading: true })
+        │ statePop(mutationFiles$, basepath, filename)
+        ▼
+  prepareJob(file, path, virtual)  ← ctrl_upload.js:363-466
+        │
+        ├──► [Step 1] 分片策略判定
+        │       chunkSize === 0 → 不分片，直接 POST
+        │       numberOfChunks === 1 → 不分片，直接 POST
+        │
+        ├──► [Step 2] HEAD 断点查询
+        │       executeHttp(HEAD /api/files/save?path=xxx)
+        │       │ (Tus-Resumable: 1.0.0)
+        │       │
+        │       ├──► 命中 + upload-length === file.size
+        │       │       offset = resp.headers["upload-offset"]
+        │       │       uploadURL = apiURL  (复用)
+        │       │
+        │       └──► 404 / 大小不匹配
+        │               offset = 0, uploadURL = ""
+        │
+        ├──► [Step 3] offset === 0 ? → POST 新建上传会话
+        │       executeHttp(POST /api/files/save?path=xxx)
+        │       │ (Upload-Length: file.size)
+        │       │
+        │       ├──► 成功: uploadURL = resp.headers.location
+        │       └──► 失败: virtual.afterError() + throw err
+        │
+        └──► [Step 4] 循环 PATCH 分片上传
+                for (i = Math.ceil(offset/chunkSize); i < numberOfChunks; i++)
+                    executeHttp(PATCH uploadURL, { Upload-Offset: offset, Body: chunk })
+                    │
+                    ├──► 成功: offset += chunkSize
+                    │
+                    └──► 失败:
+                          ├──► err === ABORT_ERROR → return (静默)
+                          └──► 其他 err → virtual.afterError() + throw err
+        │
+        ▼ (所有分片成功后)
+  virtual.afterSuccess()  ← model_virtual_layer.js:160-168
+        │
+        ├──► removeLoading(virtualFiles$, basepath, filename)
+        ├──► fscache().update(basepath, ...)  ← 更新目录缓存
+        └──► hooks.mutation.emit({ op: "save", path })
+        │
+        ▼
+  updateDOMWithStatus($task, "done")  ← ctrl_upload.js:289-295
+```
+
+### 12.2 UI 层挂载点：$retry 按钮的事件绑定
+
+**代码位置**：`public/assets/pages/filespage/ctrl_upload.js:227-251`
+
+```javascript
+case "error":
+    const $retry = assert.type($iconRetry.cloneNode(true), HTMLElement);
+    updateDOMGlobalTitle($page, t("Error"));
+    updateDOMTaskProgress($task, t("Error"));
+    updateDOMGlobalSpeed(nworker, 0);
+    updateDOMTaskSpeed($task, 0);
+
+    $task.removeAttribute("data-path");
+    $task.removeAttribute("data-status");
+    $task.classList.remove("todo_color");
+    $task.classList.add("error_color");
+    $task.firstElementChild.nextElementSibling.nextElementSibling.firstElementChild.remove();
+    $task.firstElementChild.nextElementSibling.nextElementSibling.appendChild($retry);
+
+    $retry.onclick = async () => {
+        executeMutation("todo");     // UI: 标题 "Running..."
+        executeMutation("doing");    // UI: 进度条 0%, 替换为 $stop
+        try {
+            await exec.retry();      // ← 核心调用：Worker 的 retry 方法
+            executeMutation("done"); // UI: 显示 Done
+        } catch (err) {
+            executeMutation("error"); // UI: 继续显示 retry 按钮
+        }
+    };
+```
+
+**关键细节**：
+- 只有 `processWorkerQueue` 的 `try/catch` 捕获到异常才会进入 `"error"` 状态（`ctrl_upload.js:293-294`）
+- ABORT_ERROR（用户点击 $stop）被 `prepareJob` 的 catch 静默吞掉，**不会**进入 error 状态
+
+### 12.3 Worker 层挂载点：run() 中动态覆盖 retry()
+
+**代码位置**：`public/assets/pages/filespage/ctrl_upload.js:335-360`
+
+```javascript
+function workerImplFile({ progress, speed }) {
+    return new class Worker extends IExecutor {
+        constructor() {
+            super();
+            this.xhr = null;
+        }
+
+        cancel() { this.xhr?.abort(); }
+
+        async run({ file, path, virtual }) {
+            const _file = await file();  // ← 解析 File 对象引用（只执行一次）
+            const executeJob = () => this.prepareJob({ file: _file, path, virtual });
+
+            // ★ 关键：run() 执行时才覆盖 retry()
+            // 捕获 _file、path、virtual 的闭包
+            this.retry = () => {
+                virtual.before();    // ← 重新添加 virtualFiles$ 标记
+                return executeJob(); // ← 复用同一个 _file 对象
+            };
+
+            return executeJob();     // ← 首次执行
+        }
+    };
+}
+```
+
+**为什么这样设计**：
+1. `_file` 在首次 run() 时通过 `await file()` 计算一次，之后 retry 直接复用（避免重新读取拖拽列表）
+2. `virtual` 对象也在闭包中捕获，retry 时同一个 SaveVL 实例继续工作
+3. IExecutor 的基类 `retry() { throw "NOT_IMPLEMENTED" }` 是抽象方法，run() 执行前调用 retry 会崩溃
+
+### 12.4 Virtual Layer 挂载点：before/afterSuccess/afterError
+
+**代码位置**：`public/assets/pages/filespage/model_virtual_layer.js:145-177`
+
+```javascript
+export function save(path, size) {
+    const [basepath, filename] = extractPath(path);
+    const file = { name: filename, type: "file", size, time: new Date().getTime() };
+
+    return new class SaveVL extends IVirtualLayer {
+        before() {  // ← retry 时调用: 重新加入 UI
+            stateAdd(virtualFiles$, basepath, { ...file, loading: true });
+            statePop(mutationFiles$, basepath, filename);
+        }
+
+        async afterSuccess() {  // ← 成功时: 移除 loading, 刷新目录
+            if (basepath === currentPath()) removeLoading(virtualFiles$, basepath, filename);
+            await fscache().update(basepath, ({ files = [], ...rest }) => ({
+                files: files.concat([file]), ...rest,
+            }));
+            hooks.mutation.emit({ op: "save", path: basepath });
+        }
+
+        async afterError() {  // ← 失败时: 从虚拟列表移除
+            statePop(virtualFiles$, basepath, filename);
+            return rxjs.EMPTY;
+        }
+    }();
+}
+```
+
+**调用时机表**：
+
+| 状态 | before() | afterSuccess() | afterError() |
+|------|----------|---------------|--------------|
+| **首次上传** | workers$ 入队前 | 所有 PATCH 成功后 | 任意 step 失败 |
+| **retry 开始** | $retry.onclick 中 | retry 成功后 | retry 失败后 |
+| **用户 cancel** | - | - | -（ABORT_ERROR 静默吞掉） |
+
+### 12.5 TUS 协议层断点恢复挂载点
+
+**前端 HEAD 查询**：`ctrl_upload.js:397-412`
+```javascript
+try {
+    const resp = await executeHttp.call(this, apiURL, {
+        method: "HEAD", headers: { ...tusHeaders },
+    });
+    // ★ 安全性校验：必须文件大小匹配
+    if (file.size === parseInt(resp.headers["upload-length"])) {
+        const tmp = parseInt(resp.headers["upload-offset"]);
+        if (tmp > 0) {
+            offset = tmp;          // ← 恢复断点
+            uploadURL = apiURL;    // ← 复用 URL（POST 没调）
+        }
+    }
+} catch (err) {}  // ← 空 catch：HEAD 失败静默降级为 offset=0 从头传
+```
+
+**后端 HEAD 处理**：`files.go:554-567`
+```go
+if proto == "tus" && req.Method == http.MethodHead {
+    c := chunkedUploadCache.Get(cacheKey)
+    if c == nil {
+        SendErrorResult(res, ErrNotFound)  // 404 → 前端降级
+        return
+    }
+    offset, length := c.(*chunkedUpload).Meta()
+    h.Set("Upload-Offset", fmt.Sprintf("%d", offset))  // ← 返回断点
+    h.Set("Upload-Length", fmt.Sprintf("%d", length))  // ← 返回总大小
+    res.WriteHeader(http.StatusNoContent)
+    return
+}
+```
+
+**后端 POST 创建时的清理挂载**：`files.go:568-571`
+```go
+if proto == "tus" && req.Method == http.MethodPost {
+    // ★ 关键：POST 新建前先删旧缓存
+    if c := chunkedUploadCache.Get(cacheKey); c != nil {
+        chunkedUploadCache.Del(cacheKey)
+        // ↑ 旧缓存（及其中的 offset/stream）被丢弃，从头开始
+    }
+    ...
+}
+```
+> 触发时机：HEAD 返回 404 或大小不匹配时，前端走 offset === 0 → POST。如果旧缓存还在（但大小不匹配），POST 会先清理。
+
+### 12.6 各失败场景下的 Retry 行为
+
+| 失败场景 | 前端 catch 路径 | virtual.afterError() | retry 时 HEAD 结果 | 是否真正断点续传 |
+|---------|---------------|---------------------|------------------|--------------|
+| **网络中断（单分片 PATCH）** | prepareJob → HTTP 错误 → catch throw | ✅ 调用 | ✅ 命中缓存，返回 offset | ✅ 从断点续传 |
+| **Close() 失败（Backend.Save 合并错误）** | 最后一片 PATCH → 400 → throw | ✅ 调用 | ✅ 命中缓存（Close 失败但 cache 未删） | ⚠️ 返回 offset = totalSize，边界问题 |
+| **24h 超时缓存被清理** | - | - | ❌ 404 → offset=0 | ❌ 从头传 |
+| **SECRET_KEY 变更** | - | - | ❌ 404（cacheKey.session 变了） | ❌ 从头传 |
+| **用户切换 backend 账号** | - | - | ❌ 404（cacheKey.session 变了） | ❌ 从头传 |
+| **用户点击 $stop（abort）** | ABORT_ERROR → 静默 return | ❌ 不调用 | ✅ 命中缓存（如未超时） | ⚠️ 刷新页面后才可用，本次 UI 已移除 |
+| **后端进程崩溃重启** | - | - | ❌ 404（内存清零） | ❌ 从头传 |
+
+---
+
+## 十三、关键文件索引
 
 | 文件 | 作用 | 核心行号 |
 |------|------|----------|
@@ -1371,6 +1780,9 @@ UploadPoolSize: this.Get("general.upload_pool_size").Int(),
 | `server/routes.go` | API 路由注册（RateLimiter 挂载点） | 53-68 |
 | `server/middleware/http.go` | RateLimiter 令牌桶实现 | 107-121 |
 | `server/common/constants.go` | 启动时 TMP_PATH 清理逻辑 | 54-55 |
+| `server/common/crypto.go` | GenerateID hash 算法（归属判定核心） | 193-218 |
+| `server/middleware/session.go` | SessionStart 中间件、_extractSession/_extractBackend | 57-82, 262-319 |
+| `server/model/files.go` | NewBackend 构造器（白名单校验+backend.Init） | 9-51 |
 | `server/plugin/plg_backend_local/index.go` | Local Backend Save 实现（O_TRUNC 风险） | 124-134 |
 | `server/plugin/plg_backend_s3/index.go` | S3 Backend Save（s3manager）+ threadSize 控制 | 87-97, 569-587 |
 | `server/plugin/plg_backend_ftp/index.go` | FTP Backend Save + Execute 自动重连（丢数据风险） | 80-103, 363-399 |
