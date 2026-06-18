@@ -1058,3 +1058,275 @@ str, err = DecryptString(SECRET_KEY_DERIVATE_FOR_USER, ctx.Authorization)
 2. **利用 AuthorisationMiddleware 插件**：在每次请求时向外部认证服务（如 LDAP/IdP）验证用户是否仍有效，但当前插件只在 `Ls`/`Cat` 等操作上检查，不在 SessionStart 上检查
 3. **缩短 cookie_timeout**：将默认 1 周缩短到数小时，缩小攻击窗口
 4. **增加 session_id 概念**：在 session map 中嵌入随机 ID，管理员可按 ID 撤销
+
+---
+
+## 十、添加会话黑名单功能：最小改动方案代码核对
+
+### 10.1 前置结论：StorageEngine 接口与现有存储结构
+
+**Filestash 不存在 `StorageEngine` / `IStorage` 抽象接口。**
+
+当前持久化层在 `server/model/index.go:10-38` 直接暴露全局变量 `DB *sql.DB`（SQLite3），所有 CRUD 操作在 `model` 包内直接使用 `DB.Prepare()` + `stmt.Exec()`。
+
+现有数据表：
+| 表名 | 用途 | 位置 |
+|---|---|---|
+| `Location` | 共享链接关联的后端+路径 | `index.go:20` |
+| `Share` | 共享链接主体（含完整加密会话快照 `auth` 字段） | `index.go:24` |
+| `Verification` | 邮件验证码临时表（带过期时间） | `index.go:28-32` |
+
+**因此，无需新增接口，只需在 `server/model/index.go` 的 `init()` 中新增 `RevokedSession` 表，并在 `server/model/` 包新增查询/写入/删除函数。**
+
+---
+
+### 10.2 黑名单键的选择：`GenerateID` vs `session_id` vs `完整 params 哈希`
+
+| 方案 | 粒度 | 优点 | 缺点 |
+|---|---|---|---|
+| **`GenerateID(session)`**（推荐用于"用户级踢人"） | **用户+后端**（排除 password/path/timestamp，含 username/hostname/type） | 同一用户所有路径所有 Cookie 全部失效，管理员只需知道用户名即可 | 无法精细到单个设备/单个会话；用户重新登录新密码同样被踢 |
+| **新增随机 `session_id` 字段** | 单条会话（单设备单浏览器） | 最精细，可踢出单个泄露的会话 | 需要修改 SessionAuthenticate 写入 session_id，修改量略大 |
+| **完整 params 哈希（AppCache key）** | 精确到密码+路径 | 与 AppCache key 对齐 | 同用户不同密码/路径各自独立，管理员难操作 |
+
+**最小改动推荐**：以 `GenerateID(session)` 作为黑名单主键。理由：
+1. 无需修改现有 Cookie 内容（不用加 session_id 字段）
+2. 现有 `GenerateID()` 函数已存在于 `server/common/crypto.go:193-218`
+3. 语义自然："踢出某个用户在某个后端的所有会话"
+
+---
+
+### 10.3 鉴权全流程需要同步修改的代码点
+
+#### 10.3.1 数据层改动（server/model/）
+
+**改动点 1：`server/model/index.go` 的 `init()` 内**
+
+在现有 `CREATE TABLE IF NOT EXISTS Verification` 之后追加：
+```sql
+CREATE TABLE IF NOT EXISTS RevokedSession(
+    gen_id VARCHAR(40) PRIMARY KEY,
+    revoked_at DATETIME DEFAULT (datetime('now')),
+    until DATETIME DEFAULT (datetime('now', '+365 days'))
+)
+CREATE INDEX IF NOT EXISTS idx_revoked_until ON RevokedSession(until)
+```
+
+并在 `autovacuum()`（`index.go:41-46`）中增加过期清理：
+```go
+if stmt, err := DB.Prepare("DELETE FROM RevokedSession WHERE until < datetime('now')"); err == nil {
+    stmt.Exec()
+}
+```
+
+**改动点 2：在 `server/model/share.go` 或新建 `server/model/session.go` 增加 3 个函数**
+
+```go
+// 检查是否在黑名单（每请求调用一次，需高性能）
+func IsSessionRevoked(genID string) (bool, error)
+
+// 管理员加入黑名单
+func RevokeSession(genID string, durationHours int) error
+
+// 管理员撤销黑名单（可选）
+func UnrevokeSession(genID string) error
+```
+
+性能考虑：`IsSessionRevoked` 在 `SessionStart` 中每请求一次，建议用内存布隆过滤器或 `sync.Map` 做一级缓存，SQLite 查询兜底。
+
+#### 10.3.2 鉴权中间件改动（server/middleware/session.go）
+
+**改动点 3：`_extractSession` 函数末尾（`middleware/session.go:306-314`）**
+
+在 timestamp 校验通过后、`return session, err` 之前插入黑名单检查：
+
+```go
+// 位置：在 timestamp 校验之后
+if ctx.Share.Id == "" {   // 共享链接走另一套路径，不检查用户级黑名单
+    genID := GenerateID(session)
+    if revoked, err := model.IsSessionRevoked(genID); err != nil {
+        return session, ErrInternal
+    } else if revoked {
+        Log.Warning("middleware::session 'revoked session gen_id=%s'", genID)
+        RecoverFromBadCookie(res)   // ← 注意：_extractSession 不直接拿 res，需要调整签名
+        return session, ErrSessionRevoked
+    }
+}
+```
+
+**问题**：`_extractSession` 当前签名是 `func _extractSession(req, ctx) (map, error)`，拿不到 `res`。两个选项：
+- **选项 A（最小签名变更）**：给 `_extractSession` 加一个 `res http.ResponseWriter` 参数
+- **选项 B（更干净）**：把黑名单校验移到 `SessionStart` 中，在 `_extractSession` 返回之后、`_extractBackend` 之前。
+
+**推荐选项 B**，因为：
+1. 不改 `_extractSession` 签名
+2. 黑名单检查逻辑独立，未来容易替换为布隆过滤器
+
+位置：`SessionStart` 函数 `middleware/session.go:66-78`：
+```go
+if ctx.Session, err = _extractSession(req, ctx); err != nil {
+    RecoverFromBadCookie(res)
+    SendErrorResult(res, err)
+    return
+}
+// ← 在这里插入黑名单检查
+if ctx.Share.Id == "" && len(ctx.Session) > 0 {
+    genID := GenerateID(ctx.Session)
+    if revoked, err := model.IsSessionRevoked(genID); err == nil && revoked {
+        RecoverFromBadCookie(res)
+        SendErrorResult(res, ErrSessionRevoked)   // 需新增错误类型
+        return
+    }
+}
+```
+
+**改动点 4：新增错误类型 `ErrSessionRevoked`**
+
+在 `server/common/error.go` 或相关位置：
+```go
+var ErrSessionRevoked = NewError("This session has been revoked by an administrator", 401)
+```
+状态码选择 401（而非 403），因为语义是"认证失效，需要重新登录"，前端会自动跳转登录页。
+
+#### 10.3.3 SessionTry 容错路径（server/middleware/session.go:85-94）
+
+`SessionTry` 忽略所有错误（全部 `_`）。它用于 `SessionLogout` 的后台关连接 goroutine。
+
+**判断：不需要改。** 理由：
+- `SessionTry` 不处理真实业务请求，只是尝试关连接
+- 即使是已撤销的会话，关连接操作本身不泄露数据，反而是安全的
+- 如果加黑名单检查，可能导致 `SessionLogout` 的后台关连接跳过（因为此时 Cookie 可能已被清除，genID 都拿不到）
+
+#### 10.3.4 共享链接路径（_extractSession 的 Share 分支）
+
+**判断：不需要加黑名单检查。** 理由：
+- 共享链接的 `ctx.Share.Auth` 是创建者的加密会话快照，通过 `DecryptString(SECRET_KEY_DERIVATE_FOR_USER, ctx.Share.Auth)` 解密
+- 如果创建者的会话被撤销，共享链接也应该失效，因为共享链接本质上是"创建者身份的受限代理"
+- 但共享链接有自己的 `Share.IsValid()` 机制（密码/过期时间），管理员删共享链接即可
+- 如果业务要求"用户被踢出后其所有共享链接也失效"，可在 `_extractShare` 之后、`_extractSession` 之前检查创建者的 genID 是否在黑名单
+
+**可选改动**（如果业务要求）：在 `Share` 表新增 `owner_gen_id VARCHAR(40)` 字段，创建时记录 `GenerateID(创建者的 session)`，在 `ShareGet` 返回时检查。超出最小改动范围。
+
+#### 10.3.5 AdminOnly 中间件（server/middleware/session.go:28-55）
+
+AdminOnly 独立使用 `AdminToken`，不经过 `SessionStart`，也不使用 `GenerateID`。
+
+**判断：需要独立考虑，但属于管理员体系的另一个问题。** 如果只实现用户级踢人，暂时不需要动。
+
+#### 10.3.6 新增管理后台 API 路由（server/routes.go）
+
+在 `admin` 子路由（`routes.go:35-50`）新增：
+
+```go
+middlewares = []Middleware{ApiHeaders, AdminOnly, SecureOrigin, BodyParser, PluginInjector}
+admin.HandleFunc("/session/revoke", NewMiddlewareChain(AdminSessionRevoke, middlewares)).Methods("POST")
+admin.HandleFunc("/session/revoke/{gen_id}", NewMiddlewareChain(AdminSessionUnrevoke, middlewares)).Methods("DELETE")
+admin.HandleFunc("/session/revoked", NewMiddlewareChain(AdminSessionRevokedList, middlewares)).Methods("GET")
+```
+
+对应的 handler 在 `server/ctrl/admin.go` 新增：
+- `AdminSessionRevoke`：从 body 读 `gen_id` + `duration_hours`，调用 `model.RevokeSession`
+- `AdminSessionUnrevoke`：从 path 读 gen_id，调用 `model.UnrevokeSession`
+- `AdminSessionRevokedList`：列出黑名单内所有条目
+
+**额外挑战**：管理员怎么知道 gen_id？GenerateID 需要知道 username/hostname/type 等字段。需要前端页面根据审计日志（现有 `/admin/api/audit`）推导，或在审计日志中直接记录 gen_id。
+
+#### 10.3.7 审计日志改动（可选但推荐）
+
+现有审计日志在 `server/ctrl/admin.go` 的 `FetchAuditHandler`。如果审计日志中不含 gen_id，管理员无法知道要踢谁。
+
+**改动点**：在登录成功处（`ctrl/session.go` 的 `SessionAuthenticate` 末尾）写入审计日志时带上 gen_id。
+
+---
+
+### 10.4 AppCache 命中后是否需要黑名单校验？
+
+#### 10.4.1 执行顺序回顾
+
+```
+SessionStart:
+  _extractShare       → 解析共享链接
+  _extractAuthorization → 读 Cookie / Bearer Header
+  _extractSession     → 解密 + timestamp 校验  ← 【黑名单检查放在这里】
+  _extractBackend     → model.NewBackend → Backend.Init
+                         → 各后端插件的 AppCache.Get(params)  【AppCache 命中】
+```
+
+AppCache 读取发生在 `_extractBackend`（第 4 步），**在黑名单检查之后**。
+
+#### 10.4.2 语义边界分析
+
+**场景**：用户 A 被管理员加入黑名单。此时有一个用户 A 的并发请求 C 正在进行中：
+
+| 时间 | 请求 C 的步骤 | 黑名单已生效？ | 行为 |
+|---|---|---|---|
+| T1 | `_extractSession` 解密 session | 否 | 解密通过 |
+| T2 | 管理员将 gen_id_A 加入黑名单 | 是 | 已写入 DB |
+| T3 | `_extractBackend` 从 SftpCache 取出旧连接 | 是（但 AppCache 不查） | 拿到连接对象 |
+| T4 | handler 执行 Ls/Cat 等操作 | 是 | 操作正常完成 |
+
+**在当前执行顺序下（黑名单在 `_extractSession` 之后立即检查），如果黑名单检查在 T1 通过，即使 T2 加入黑名单，T3-T4 仍正常执行**——这是请求级快照语义的固有特性，不是漏洞。
+
+**但如果考虑极端情况**：将黑名单检查移到 AppCache 命中之后（即 `_extractBackend` 返回后），能否更早拦截？
+
+**结论：不需要在 AppCache 命中后再加检查。** 理由 3 条：
+
+**理由 1：请求级快照语义一致性**
+- 一旦请求通过 `SessionStart`（`_extractSession` + `_extractBackend`），其身份应该在整个请求中保持一致
+- 在 handler 执行中间突然改变身份会造成难以调试的部分成功/部分失败
+- 当前设计保证：要么请求在 SessionStart 阶段就被拒绝（401），要么请求按已确立的身份完整执行
+
+**理由 2：AppCache 是性能优化，不影响认证结果**
+- AppCache 只是"有 params → 拿旧连接"的缓存，不会跳过认证
+- 要命中 AppCache，必须先通过 `_extractSession` 的解密 + timestamp + 黑名单检查 → 然后才能带着正确的 params 走到 `Init`
+- 攻击者如果绕过了 SessionStart，根本不需要 AppCache，直接能调任何后端操作
+
+**理由 3：如果要加检查，位置应该在 SessionStart，不应该分散在各后端插件**
+- 各后端插件的 `Init` 里读取 AppCache（SFTP 的 `SftpCache.Get`、Samba 的 `SambaCache.Get` 等）
+- 在每个插件里都加黑名单检查 = 重复代码 + 容易遗漏
+- 集中在 `SessionStart` 中 `_extractSession` 之后检查一次 = 所有后端自动受益
+- 性能影响可忽略：SQLite 主键查询 + 可加布隆过滤器缓存
+
+**唯一例外场景：长轮询 / SSE / 分块下载的超长时间请求**
+
+如果有一个请求持续运行 30 分钟（如下载超大文件），在这 30 分钟内会话被撤销，这个请求不会被中断。这符合"请求级快照"语义。
+
+如果业务需要"撤销后立即中断正在进行的长请求"，需要额外做：
+1. 给 `App` 的 `ctx.Context` 加定时查询黑名单的包装（如 `context.WithCancel` + ticker）
+2. 或者在 AppCache 命中时给后端连接注入"撤销检查钩子"
+3. 超出最小改动范围
+
+---
+
+### 10.5 完整改动清单（最小方案）
+
+| 序号 | 文件 | 改动内容 | 影响范围 |
+|---|---|---|---|
+| 1 | `server/model/index.go` | 新增 `RevokedSession` 表 DDL + 索引；`autovacuum` 加过期清理 | 数据初始化 |
+| 2 | `server/model/session.go`（新建） | 实现 `IsSessionRevoked` / `RevokeSession` / `UnrevokeSession` / `RevokedSessionList` | 数据层 |
+| 3 | `server/common/error.go` | 新增 `ErrSessionRevoked = NewError("...", 401)` | 错误定义 |
+| 4 | `server/middleware/session.go` | `SessionStart` 中在 `_extractSession` 之后、`_extractBackend` 之前调用 `model.IsSessionRevoked`，返回时调 `RecoverFromBadCookie` + `SendErrorResult(res, ErrSessionRevoked)` | 核心拦截点 |
+| 5 | `server/ctrl/admin.go` | 新增 `AdminSessionRevoke` / `AdminSessionUnrevoke` / `AdminSessionRevokedList` handler | 管理功能 |
+| 6 | `server/routes.go` | 注册 3 条 `/admin/api/session/revoke*` 路由，加 `AdminOnly` 中间件 | 路由注册 |
+| 7 | 前端 admin 页面（可选） | 新增会话管理 UI：展示审计日志中的 gen_id、提供撤销/恢复按钮 | 管理界面 |
+
+**不改的文件**：
+- `server/common/crypto.go`：`GenerateID` 直接复用
+- `server/ctrl/session.go`：`SessionAuthenticate` / `SessionLogout` / `SessionGet` 均不改
+- 各后端插件（sftp/s3/webdav/...）：无需修改
+- `server/common/cache.go` / AppCache：无需修改
+- `server/middleware/session.go` 中 `SessionTry` / `CanManageShare`：不改
+- Share 相关代码：不改（超出最小范围）
+
+---
+
+### 10.6 安全语义保证
+
+| 安全属性 | 是否满足 | 说明 |
+|---|---|---|
+| 撤销后新请求立即被拒 | ✅ | 下一次请求的 SessionStart → 黑名单检查 → 401 + 清 Cookie |
+| 撤销后 AppCache 旧连接可被旧 Cookie 复用 | ❌（不允许） | 旧 Cookie 已无法通过 SessionStart，拿不到走到 AppCache 所需的明文 params |
+| 撤销后进行中的长请求立即中断 | ⚠️（可选） | 最小方案按请求级快照，不中断；如需要可加 Context 包装 |
+| 撤销同一用户不同密码的所有会话 | ✅ | GenerateID 排除 password，同 username 不管密码都命中同一黑名单 |
+| 撤销后用户重新登录（改了密码） | ⚠️（需注意） | GenerateID 仍相同 → 新登录同样被踢。解决：Unrevoke，或限定 until 时长，或改用 session_id 方案 |
+| 共享链接创建者被撤销后链接失效 | ❌（最小方案） | 共享链接走独立路径；如需要需改 Share 表加 owner_gen_id |
+| 并发撤销/登录的一致性 | ✅ | SQLite 主键冲突保证同一 gen_id 不重复写入 |
