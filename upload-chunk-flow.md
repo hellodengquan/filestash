@@ -581,7 +581,339 @@ workers$.subscribe(async({ tasks: newTasks, loading = false }) => {
 
 ---
 
-## 六、关键文件索引
+## 七、多 Backend 分片合并的差异化路径
+
+所有 backend 都通过统一的 `IBackend.Save(path string, file io.Reader) error` 接口接入，但内部实现差异巨大，导致分片合并（即流式消费 io.Reader）的行为完全不同。
+
+### 7.1 IBackend 接口与 Backend 注册机制
+
+**统一接口定义** (`server/common/types.go:13-24**:
+```go
+type IBackend interface {
+    ...
+    Save(path string, file io.Reader) error  // 所有 backend 必须实现
+    ...
+}
+```
+
+**注册机制** (`server/common/backend.go:21-26`:
+```go
+func (d *Driver) Register(name string, driver IBackend) {
+    d.ds[name] = driver
+}
+// 各 backend 在各自 `init()` 中调用，例如：
+// plg_backend_s3: Backend.Register("s3", S3Backend{})
+// plg_backend_ftp: Backend.Register("ftp", Ftp{})
+// plg_backend_local: Backend.Register("local", &Local{...})
+```
+
+**TUS 创建时绑定 backend 来源** (`server/ctrl/files.go:578-585`
+```go
+ctx.Context = context.Background()
+b, err := ctx.Backend.Init(ctx.Session, ctx)  // 用当前会话重建 backend 实例
+if err != nil { ... }
+uploader := createChunkedUploader(b.Save, path, size)  // ← 绑定具体 backend 的 Save 方法
+```
+
+### 7.2 Local Backend：直接文件写入磁盘
+
+**代码位置**: `server/plugin/plg_backend_local/index.go:124-134
+```go
+func (this Local) Save(path string, content io.Reader) error {
+    f, err := SafeOsOpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0664)
+    if err != nil {
+        return err
+    }
+    if _, err = io.Copy(f, content); err != nil {  // ← 直接从 io.PipeReader → 本地文件
+        f.Close()
+        return err
+    }
+    return f.Close()
+}
+```
+
+| 特性 | 说明 |
+|--------|------|
+| **流式特性 | 纯流式 `io.Copy`，零额外缓冲 |
+| **内存占用 | 仅内核 pipe buffer（默认 64KB） |
+| **断点影响 | pipe 自带背压：写端写入快于磁盘消费时，PATCH 阻塞 |
+| **失败行为 | io.Copy 出错立即返回，文件已写部分落盘但不清理（需手动删除） |
+
+### 7.3 S3 Backend：SDK 内置再分片（Multipart Upload）
+
+**代码位置**: `server/plugin/plg_backend_s3/index.go:569-587`
+```go
+func (this S3Backend) Save(path string, file io.Reader) error {
+    p := this.path(path)
+    if p.bucket == "" { return ErrNotValid }
+    uploader := s3manager.NewUploader(this.createSession(p.bucket))
+    input := s3manager.UploadInput{
+        Body:        file,   // ← io.PipeReader
+        Bucket:      aws.String(p.bucket),
+        Key:         aws.String(p.path),
+        ContentType: aws.String(GetMimeType(path)),
+        ...
+    }
+    _, err := uploader.UploadWithContext(this.app.Context, &input)
+    return err
+}
+```
+
+**关键差异**：AWS SDK 的 `s3manager.Uploader` 内部使用 **Multipart Upload** 机制：
+
+| 特性 | 说明 |
+|--------|------|
+| **SDK 分片策略** | Uploader 内部默认 5MB 分块（`DefaultUploadConcurrency=5）并发上传 |
+| **内存占用** | 需要至少缓冲多个分片缓冲） 至少缓冲 5×5MB=25MB） |
+| **两级分片 | 前端分片 → Pipe → S3 SDK 再 前端 chunk 再分片） → S3 Multipart |
+| **断点粒度 |
+| **失败行为 | 任一分片失败触发 abort multipart upload，不完整文件不会可见） |
+| **完成时机 | SDK 内部调用 CompleteMultipartUpload 才真正存在 |
+
+> **⚠️ 注意两层分片**：前端 chunk_size=20MB，SDK 内部再拆成 4 个 5MB 的 multipart part 上传到 S3。
+
+### 7.4 FTP Backend：FTP 协议流模式）
+
+**代码位置**: `server/plugin/plg_backend_ftp/index.go:363-367
+```go
+func (f Ftp) Save(path string, file io.Reader) (err error) {
+    return f.Execute(func(client *goftp.Client) error {
+        return client.Store(path, file)  // goftp 的 Store 方法
+    })
+}
+```
+
+**Execute 包装器** (`plg_backend_ftp/index.go:373-399
+```go
+func (f Ftp) Execute(fn func(*goftp.Client) error) error {
+    err := fn(f.client)
+    ftpErr, ok := err.(goftp.Error)
+    if !ok { return err }
+    code := ftpErr.Code()
+    if code == 421 || (code == 0 && err.Error() == "EOF reading response: EOF" {
+        // 连接断开 → 自动重连重试
+        f.Close()
+        b, initErr := f.Init(f.p, &App{Context: f.ctx})
+        return b.(*Ftp).Execute(fn)
+    }
+    ...
+}
+```
+
+| 特性 | 说明 |
+|--------|------|
+| **传输模式 | FTP `STOR` 命令，数据流 |
+| **连接池 | `ConnectionsPerHost` 可配置（默认 5） |
+| **失败重试 | 421/EOF 自动重连后重新执行 Execute(fn) **但会丢失已读流数据 |
+| **致命问题 | ⚠️ FTP 的 `client.Store` 从 `io.Reader` 消费后，连接断开 → 重连后再次消费同一个 Reader，此时 pipe 已读位置已前进，重传的数据永久丢失 |
+
+### 7.5 三种 Backend 对比表
+
+| 维度 | Local | S3 | FTP |
+|------|-------|-----|-----|
+| **Save 调用方 | 内核 write() → 内核 pipe buffer 64KB) | AWS SDK Uploader (5MB 缓冲池 | goftp STOR 数据流 |
+| **内存占用 | 低（≤ 高（多分片并发） | 中（流 |
+| **再分片** | 无 | 有（SDK 内部再拆成 5MB） | 无 |
+| **失败原子性** | 写入一半可见） | 原子（Complete 前不可见） | 部分写入（服务端临时文件） |
+| **断点续传 | 依赖服务端 offset） | 依赖 TUS cache | 依赖 TUS cache |
+| **断连重传 | pipe 阻塞 | 连接断开由 SDK 管 | 自动重连但有丢数据风险 |
+
+---
+
+## 八、断点续传状态的存储位置与权限校验挂载点
+
+### 8.1 断点状态存储：纯内存，不落盘
+
+**结论：断点续传状态 100% 存储在 Go 进程内存中，不写入磁盘。
+
+#### 存储结构**：`server/ctrl/files.go:477
+
+```go
+var chunkedUploadCache AppCache  // 包级全局变量
+```
+
+**初始化** `server/ctrl/files.go:687-700
+```go
+func initChunkedUploader() {
+    chunkedUploadCache = NewAppCache(60*24, 1)  // retention=24h, cleanup=1min
+    chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+        c := value.(*chunkedUpload)
+        c.Close()  // 被驱逐时关闭 pipe
+    })
+}
+```
+
+**存储介质**：`server/common/cache.go:51-63
+```go
+func NewAppCache(arg ...time.Duration) AppCache {
+    c := AppCache{}
+    c.Cache = cache.New(retention*time.Minute, cleanup*time.Minute)
+    // ← 基于 "github.com/patrickmn/go-cache" → 纯内存 KV，纯内存
+    return c
+}
+```
+
+#### chunkedUpload 结构体**：`server/ctrl/files.go:702-710
+```go
+type chunkedUpload struct {
+    fn     func(path string, file io.Reader) error  // backend.Save
+    stream *io.PipeWriter      // ← 写端
+    offset uint64              // ← 已写字节数（断点位置）
+    size   uint64              // ← 文件总大小
+    done   chan error         // ← Backend.Save 返回值信号
+    once   sync.Once
+    mu     sync.Mutex        // ← offset 读写锁
+}
+```
+
+#### 与磁盘的关系：
+```
+                   进程内存中
+┌─────────────────────────────────────┐
+│  chunkedUploadCache            │
+│  ┌────────────────────────┐  │
+│  │ map[hash(key)]          │  │
+│  │   - offset =1234567     │  │
+│  │   - *io.PipeWriter    │  │
+│  │   - done channel       │  │
+│  │   - size        │  │
+│  └────────────────────────┘  │
+└──────────────┬──────────────────────┘
+           │ io.Pipe()
+           │
+           ▼
+    ┌────────────────┐
+    │ io.PipeReader │────► Backend.Save(Reader
+    └────────────────┘
+           │
+           ▼
+  各 Backend 各自写入各自的目标存储
+  (Local 磁盘 / S3 / FTP 服务器)
+```
+
+**关键注意事项**：
+1. **进程重启 = 所有断点状态全部丢失**。进程重启后 cache 清空，用户必须重新上传
+2. **`TMP_PATH`（`data/cache/`）用于 range request 缓存下载分片上传
+3. **多实例部署**：用户请求哈希到同一台实例，断点续传只能在同一实例恢复
+
+### 8.2 权限校验：三层校验挂载点
+
+上传请求经过三层权限拦截，全部 **跨所有 backend 生效：
+
+#### Layer 1: Controller 层硬编码权限（基础能力级权限
+
+**代码位置**：`server/ctrl/files.go:492-522
+
+```go
+func FileSave(ctx *App, res http.ResponseWriter, req *http.Request) {
+    // ① 权限层1：编辑权限
+    if model.CanEdit(ctx) == false {
+        if model.CanUpload(ctx) == false {
+            SendErrorResult(res, ErrPermissionDenied)
+            return
+        }
+        // 无编辑权限但有上传权限 → 禁止覆盖
+        root, filename := SplitPath(path)
+        entries, err := ctx.Backend.Ls(root)
+        for _, e := range entries {
+            if e.Name() == filename {
+                SendErrorResult(res, ErrConflict)  // 文件已存在 → 409
+                return
+            }
+        }
+    }
+    ...
+}
+```
+
+#### Layer 2: Authorisation Middleware（插件可插拔）
+
+**挂载接口**：`server/common/types.go:32-41`
+```go
+type IAuthorisation interface {
+    ...
+    Save(ctx *App, path string) error
+    ...
+}
+```
+
+**调用点**：`server/ctrl/files.go:516-522
+```go
+// 所有已注册的 Auth 插件
+for _, auth := range Hooks.Get.AuthorisationMiddleware() {
+    if err = auth.Save(ctx, path); err != nil {
+        SendErrorResult(res, ErrNotAuthorized)
+        return
+    }
+}
+```
+
+**注册机制**：`server/common/plugin.go:141-149
+```go
+var authorisation_middleware []IAuthorisation
+
+func (this Register) AuthorisationMiddleware(a IAuthorisation) {
+    authorisation_middleware = append(authorisation_middleware, a)
+}
+```
+
+**已注册的插件示例**（grep）：
+- `plg_authorisation_example
+- `plg_search_sqlitefts` - 搜索爬虫文件
+- ...
+
+#### Layer 3: Backend 自声明 Meta（能力级 ACL）
+
+**接口**：`server/common/types.go` - 各 backend 可选实现
+```go
+// 非 IBackend 接口本身不是强制
+// 但 backend 可以声明
+```
+
+**示例**：
+- **S3**：`plg_backend_s3/index.go:182-192`
+  - 根路径 `/` → `CanUpload: false`
+- **FTP**：`plg_backend_ftp/index.go:239-251
+  - 匿名用户 `acl == "r"` → `CanUpload: false`
+
+**调用链**：`server/ctrl/files.go:492`
+`
+通过 `model.CanUpload(ctx)` 在 FileLs 中调用，FileSave 中直接调用）
+
+#### 权限校验完整调用链路图
+```
+前端发起请求
+    │
+    ▼
+FileSave() handler
+    │
+    ├──► Layer 1: model.CanEdit()/CanUpload()
+    │         └─ ctx.Share.CanUpload (分享链接场景)
+    │
+    ├──► Layer 2: for _, auth := range Hooks.Get.AuthorisationMiddleware()
+    │         auth.Save(ctx, path)
+    │         └─► plg_authorisation_*
+    │
+    ├──► TUS HEAD/POST/PATCH
+    │
+    └──► Backend.Save() 的 Save() 的 Meta 本身
+              └─► backend 具体 backend 的 FTP 后端本身的 ACL/S3 bucket policy...
+```
+
+#### TUS 各 HTTP Method 的权限覆盖情况
+
+| TUS Method | Layer 1 CanEdit/Upload) | Layer 2 AuthMiddleware.Save) | Backend 实际执行 |
+|-------------|-----------------------|------------------------|-----------------|
+| **OPTIONS** | ❌ 不校验 | ❌ 不校验 | - |
+| **HEAD** (断点查询) | ❌ 不校验 | ❌ 不校验 | 读 cache |
+| **POST** (创建会话) | ✅ 校验 | ✅ 校验 | - |
+| **PATCH** (传分片) | ❌ 不校验 | ❌ 不校验 | 写 pipe 写入 |
+
+> **⚠️ 安全隐患**：HEAD 和 PATCH 不经过 Layer 1/Layer 2 权限校验。攻击者只要拿到有效的 session 就可以 PATCH 继续写入（cacheKey 包含 path + session，攻击者可写。
+
+---
+
+## 九、关键文件索引
 
 | 文件 | 作用 | 核心行号 |
 |------|------|----------|
@@ -597,5 +929,13 @@ workers$.subscribe(async({ tasks: newTasks, loading = false }) => {
 | ↳ `initChunkedUploader()` | 缓存初始化（24h） | 687-700 |
 | `server/common/cache.go` | AppCache 实现（基于 go-cache） | 11-77 |
 | `server/common/config.go` | 上传配置项定义 | 79-80, 299, 324 |
+| `server/common/types.go` | IBackend/IAuthorisation 接口定义 | 13-41 |
+| `server/common/backend.go` | Backend Driver 注册与获取 | 11-38 |
+| `server/common/plugin.go` | Hooks 注册机制（AuthMiddleware 等） | 138-149 |
+| `server/common/constants.go` | TMP_PATH 等常量定义 | 20-56 |
+| `server/model/permissions.go` | CanEdit/CanUpload 权限判定 | 7-33 |
+| `server/plugin/plg_backend_local/index.go` | Local Backend Save 实现 | 124-134 |
+| `server/plugin/plg_backend_s3/index.go` | S3 Backend Save 实现（s3manager） | 569-587 |
+| `server/plugin/plg_backend_ftp/index.go` | FTP Backend Save + Execute 重连 | 363-399 |
 | `public/assets/pages/filespage/model_virtual_layer.js` | UI 虚拟文件层（loading 状态管理） | 全程 |
 | ↳ `save()` | 文件保存前后的 UI 状态切换 | 136-179 |
