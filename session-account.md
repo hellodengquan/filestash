@@ -1330,3 +1330,460 @@ AppCache 读取发生在 `_extractBackend`（第 4 步），**在黑名单检查
 | 撤销后用户重新登录（改了密码） | ⚠️（需注意） | GenerateID 仍相同 → 新登录同样被踢。解决：Unrevoke，或限定 until 时长，或改用 session_id 方案 |
 | 共享链接创建者被撤销后链接失效 | ❌（最小方案） | 共享链接走独立路径；如需要需改 Share 表加 owner_gen_id |
 | 并发撤销/登录的一致性 | ✅ | SQLite 主键冲突保证同一 gen_id 不重复写入 |
+
+---
+
+## 十一、session_id + Revoked 方案上线协同分析
+
+### 11.1 session_id 的写入位置与格式
+
+#### 11.1.1 写入点 1：`SessionAuthenticate`（直接登录）
+
+`server/ctrl/session.go:52-135`，在 `ctx.Body["timestamp"] = time.Now().Format(time.RFC3339)` 之后追加：
+
+```go
+ctx.Body["session_id"] = RandomString(20)  // 使用 crypto/rand 的 RandomString
+```
+
+写入后 session map 结构变为：
+```
+{
+  "type":      "sftp",
+  "hostname":  "sftp.example.com",
+  "username":  "alice",
+  "password":  "secret",
+  "path":      "/",
+  "timestamp": "2026-06-18T10:30:00Z",
+  "session_id":"aB3kX9mP2nQ8vR5wL7y",   ← 新增 20 字符随机串
+  "session":   "{...}",                    ← SSO 扩展会话（仅 IdP 登录时）
+}
+```
+
+#### 11.1.2 写入点 2：`SessionAuthMiddleware`（SSO/OAuth 登录）
+
+`server/ctrl/session.go:427`，在 `mappingToUse["timestamp"] = time.Now().Format(time.RFC3339)` 之后追加：
+
+```go
+mappingToUse["session_id"] = RandomString(20)
+```
+
+两处写入确保所有登录路径（直接表单 + SSO 回调）都生成 session_id。
+
+#### 11.1.3 对 Cookie 分片的影响
+
+session_id 增加 33 字节（key "session_id" = 10 + value 20 + JSON 分隔符 ~3 = ~33）。当前加密后 Cookie 通常 < 1KB，距离 3800 字节分片阈值很远。**不增加分片数。**
+
+#### 11.1.4 对 GenerateID 的影响
+
+`GenerateID` `server/common/crypto.go:193-218` 排除 `"session"` 和 `"timestamp"`，但**不排除** `"session_id"`。需要补加：
+
+```go
+switch key {
+case "password":
+case "path":
+case "session":
+case "timestamp":
+case "session_id":   // ← 新增，确保 GenerateID 不受随机 session_id 影响
+```
+
+如果不排除，同一用户每次登录 GenerateID 不同 → 无法按 GenerateID 聚合同一用户的所有会话。但在 session_id 方案下，我们用 session_id 作为黑名单主键，GenerateID 仍用于关联共享链接等场景，**必须保持稳定**。
+
+---
+
+### 11.2 旧设备何时被踢出
+
+#### 11.2.1 踢出触发路径
+
+管理员调用 `POST /admin/api/session/revoke`，body 为 `{ "session_id": "aB3kX9mP2nQ8vR5wL7y" }`。
+
+执行时序：
+
+```
+管理员 → POST /admin/api/session/revoke → AdminOnly 中间件验证 → AdminSessionRevoke handler
+  → model.RevokeSession(session_id, durationHours)
+    → INSERT INTO RevokedSession(gen_id, revoked_at, until) VALUES(?, datetime('now'), ...)
+```
+
+#### 11.2.2 旧设备的下一次请求
+
+```
+旧设备 → GET /api/files/ls → SessionStart
+  → _extractAuthorization → 从 Cookie 拼接加密 token
+  → _extractSession → 解密 → json.Unmarshal → session["session_id"] = "aB3kX9mP2nQ8vR5wL7y"
+  → 黑名单检查: model.IsSessionRevoked("aB3kX9mP2nQ8vR5wL7y")
+    → SELECT COUNT(*) FROM RevokedSession WHERE gen_id = ? AND until > datetime('now')
+    → 返回 true
+  → RecoverFromBadCookie(res)  → Set-Cookie: auth=; MaxAge=-1
+                                 → Set-Cookie: auth1=; MaxAge=-1
+                                 → ...（逐片清除）
+  → SendErrorResult(res, ErrSessionRevoked)  → HTTP 401
+```
+
+**旧设备在下次请求时被踢出，不是立即踢出。** 具体时间取决于旧设备的活跃度：
+- 旧设备正在浏览文件 → 下次点击/刷新即被踢出（通常几秒内）
+- 旧设备闲置 → 直到用户再次操作才被踢出
+- 旧设备下载大文件中 → 当前请求不受影响，下次请求被踢出（请求级快照语义）
+
+#### 11.2.3 与 GenerateID 方案的对比
+
+| 维度 | GenerateID 方案 | session_id 方案 |
+|---|---|---|
+| 踢出粒度 | 同一用户同一后端所有设备 | 单设备单浏览器 |
+| 旧设备踢出时机 | 同上 | 同上 |
+| 新设备受影响？ | 是（同用户新登录也被踢） | **否**（新设备有新 session_id） |
+| 管理员需知道什么 | username + hostname + type | session_id（从审计日志获取） |
+
+---
+
+### 11.3 单设备多 Cookie（分片）的清理顺序
+
+#### 11.3.1 Cookie 分片写入顺序
+
+`SessionAuthenticate` `server/ctrl/session.go:102-124` 写 Cookie：
+
+```
+循环 index=0, 1, 2, ...
+  Set-Cookie: auth=前3800字节;   MaxAge=604800; Path=/api/
+  Set-Cookie: auth1=后3800字节;  MaxAge=604800; Path=/api/
+  Set-Cookie: auth2=剩余字节;    MaxAge=604800; Path=/api/
+```
+
+每个分片包含同一加密串的不同片段，**每个分片独立包含 session_id 的加密信息**（因为 session_id 在加密前的完整 JSON 中，不是分散在分片里）。
+
+#### 11.3.2 Cookie 分片读取顺序
+
+`_extractAuthorization` `server/middleware/session.go:160-173` 读 Cookie：
+
+```go
+index := 0
+for {
+    cookie, err := req.Cookie(CookieName(index))
+    if err != nil { break }
+    index++
+    token += cookie.Value   // 按序拼接
+}
+```
+
+**关键点**：如果只有 `auth1`（缺少 `auth`），`req.Cookie("auth")` 返回 err → 循环直接 break → token 为空 → 后续解密失败。分片是严格顺序的，缺首片则全废。
+
+#### 11.3.3 黑名单踢出时的 Cookie 清理
+
+`RecoverFromBadCookie` `server/common/recovery.go:10-21`：
+
+```go
+func RecoverFromBadCookie(res http.ResponseWriter) {
+    index := 0
+    for {
+        _, err := req.Cookie(CookieName(index))  // ← 问题：此函数不接收 req
+        ...
+    }
+}
+```
+
+实际上 `RecoverFromBadCookie` 的签名是 `func RecoverFromBadCookie(res http.ResponseWriter)`，它不读 req。让我确认其实际实现。
+
+实际实现是逐序号删除固定名称的 Cookie，不依赖 req。这意味着**如果旧 Cookie 有 3 片（auth/auth1/auth2），而新 Cookie 只有 1 片（auth），清 Cookie 时可能只清了 auth，auth1/auth2 残留**。
+
+#### 11.3.4 分片清理的完整方案
+
+**改动点**：黑名单拦截时，需要清除所有可能的分片。由于不知道旧 Cookie 到底有几片，需要设置一个足够大的上限，或与 `SessionLogout` 保持一致（逐片尝试清除直到 req.Cookie 返回 err）。
+
+在 `SessionStart` 的黑名单拦截点，我们持有 `req`，所以可以复用 `SessionLogout` 的逻辑：
+
+```go
+// 在黑名单拦截后
+if revoked {
+    // 清除所有分片 Cookie
+    index := 0
+    for {
+        _, err := req.Cookie(CookieName(index))
+        if err != nil { break }
+        http.SetCookie(res, applyCookieRules(&http.Cookie{
+            Name:   CookieName(index),
+            Value:  "",
+            MaxAge: -1,
+            Path:   COOKIE_PATH,
+        }, req))
+        index++
+    }
+    SendErrorResult(res, ErrSessionRevoked)
+    return
+}
+```
+
+**清理顺序**：auth(0) → auth1 → auth2 → ... → 直到 req.Cookie 找不到下一个。这确保同一设备的所有分片被清除。
+
+**残留风险**：如果在踢出请求之前，浏览器因为其他操作已经覆盖了部分分片（如新登录只写了 auth 而旧 Cookie 有 auth1），则 auth1 可能残留。但残留的 auth1 不完整，`_extractAuthorization` 读到它时因为缺首片，token 为空 → 不构成安全风险。
+
+---
+
+### 11.4 重新登录与强制登出时黑名单条目的生命周期
+
+#### 11.4.1 场景矩阵
+
+| 场景 | session_id 生成 | 黑名单影响 | 需要的处理 |
+|---|---|---|---|
+| 用户主动注销 | 不涉及（旧 session_id 仍在 Cookie 里直到浏览器删除） | 无 | 注销只清 Cookie，不涉及黑名单 |
+| 用户主动注销后重新登录 | 生成新 session_id | 旧 session_id 不在黑名单 → 不影响 | 无需额外处理 |
+| 管理员强制踢出某设备 | 不涉及 | 旧 session_id 被加入黑名单 | 已实现 |
+| 管理员踢出后用户重新登录 | 生成新 session_id | 新 session_id 不在黑名单 → 正常登录 | 无需额外处理 ✅ |
+| 用户改密码后重新登录 | 生成新 session_id | 旧 session_id 在黑名单（如果被踢）→ 旧设备被拒 | 无需额外处理 ✅ |
+| 同一用户多设备 | 每设备独立 session_id | 只踢指定 session_id 的设备 | 精确控制 ✅ |
+
+#### 11.4.2 关键优势：session_id 方案下重新登录不会被误杀
+
+这是选择 session_id 而非 GenerateID 的核心理由。对比：
+
+```
+GenerateID 方案:
+  管理员踢出 gen_id="abc123"（基于 username+hostname）
+  用户改密码后重新登录 → GenerateID 仍为 "abc123" → 新会话也被拒绝 ❌
+  必须先 Unrevoke → 用户才能登录 → 管理体验差
+
+session_id 方案:
+  管理员踢出 session_id="aB3kX9..."（旧设备的具体会话）
+  用户重新登录 → 新 session_id="dF7mN2..." → 不在黑名单 → 正常登录 ✅
+  无需 Unrevoke
+```
+
+#### 11.4.3 黑名单条目的过期机制
+
+`RevokedSession` 表设计：
+
+```sql
+CREATE TABLE RevokedSession(
+    session_id VARCHAR(40) PRIMARY KEY,
+    gen_id     VARCHAR(40),          -- 保留 GenerateID 用于"按用户批量查看"
+    revoked_at DATETIME DEFAULT (datetime('now')),
+    until      DATETIME DEFAULT (datetime('now', '+365 days'))  -- 默认 1 年后自动过期
+)
+```
+
+**过期语义**：
+- `until` 不是"会话恢复时间"，而是"黑名单条目清理时间"
+- 过期后条目被 `autovacuum` 删除，该 session_id 从黑名单消失
+- 但此时旧 Cookie 早已过期（MaxAge = cookie_timeout，默认 1 周），不可能再用
+- 所以过期清理是**安全的**：被踢的会话在 Cookie 过期后，黑名单条目已无存在必要
+
+**`until` 应该设多长？**
+
+| 策略 | until 值 | 理由 |
+|---|---|---|
+| 等于 cookie_timeout | `now + cookie_timeout` | 被踢的 Cookie 过期后黑名单条目即无意义，最省空间 |
+| 固定 7 天 | `now + 7 days` | 兼顾安全与存储，覆盖绝大多数 cookie_timeout 配置 |
+| 固定 1 年 | `now + 365 days` | 保守，审计追踪期长，但占用更多存储 |
+
+**推荐**：`until = now + max(cookie_timeout, 7天)`。代码实现：
+
+```go
+func RevokeSession(sessionID, genID string) error {
+    timeout := Config.Get("general.cookie_timeout").Int()  // 分钟
+    untilHours := timeout / 60
+    if untilHours < 168 { untilHours = 168 }  // 至少 7 天
+    _, err := DB.Exec(
+        "INSERT INTO RevokedSession(session_id, gen_id, until) VALUES(?, ?, datetime('now', '+' || ? || ' hours'))",
+        sessionID, genID, untilHours,
+    )
+    return err
+}
+```
+
+#### 11.4.4 用户主动注销时是否写入黑名单？
+
+**不需要。** 理由：
+- 主动注销 = 用户在浏览器中点"退出" → `SessionLogout` 清除所有分片 Cookie
+- Cookie 被清除后，即使 session_id 不在黑名单，旧 Cookie 也无法再使用
+- 写入黑名单是多余的，且会与"被强制踢出"混淆
+
+**例外**：如果担心 Cookie 在网络层被抓包（如中间人），注销后应考虑将 session_id 写入黑名单，使被窃取的 Cookie 立即失效。但这属于安全加固，不是基本功能。
+
+#### 11.4.5 审计日志中的 session_id 追溯
+
+`SessionAuthenticate` `server/ctrl/session.go:128` 的审计日志：
+
+```go
+Log.Stdout("AUDIT action[login] backend[%s] user[%s] target[%s]", session["type"], username(session), ip(req))
+```
+
+需要扩展为：
+
+```go
+Log.Stdout("AUDIT action[login] backend[%s] user[%s] sid[%s] target[%s]", session["type"], username(session), session["session_id"], ip(req))
+```
+
+同样，`SessionLogout` `server/ctrl/session.go:179` 和管理员踢出操作也需要记录 session_id。
+
+管理员从审计日志中提取 session_id，构造踢出请求。管理员 UI 可以提供"查看活跃会话 → 点击踢出"的操作。
+
+---
+
+### 11.5 黑名单查询与 AppCache TTL 的互动窗口
+
+#### 11.5.1 完整时序图
+
+```
+             时间 →
+             
+设备 A (session_id=SID_A)           服务端                       AppCache
+    │                                │                            │
+    ├─ GET /api/files/ls ───────────►│                            │
+    │                                ├─ SessionStart:             │
+    │                                │  1. _extractAuthorization  │
+    │                                │  2. _extractSession        │
+    │                                │     → session_id = SID_A   │
+    │                                │  3. IsSessionRevoked(SID_A)│
+    │                                │     → false ✅             │
+    │                                │  4. _extractBackend        │
+    │                                │     → AppCache.Get(params) │
+    │                                │     → 命中！取出旧 *Sftp   │
+    │  ◄── 200 OK ──────────────────┤                            │
+    │                                │                            │
+    │         管理员踢出 SID_A        │                            │
+    │                                │                            │
+    │                                ├─ RevokeSession("SID_A")   │
+    │                                │  → INSERT INTO RevokedSes  │
+    │                                │                            │
+    ├─ GET /api/files/cat ─────────►│                            │
+    │                                ├─ SessionStart:             │
+    │                                │  3. IsSessionRevoked(SID_A)│
+    │                                │     → true ❌              │
+    │                                │  → RecoverFromBadCookie    │
+    │  ◄── 401 ErrSessionRevoked ───┤  → SendErrorResult        │
+    │                                │                            │
+    │                                │     AppCache 中旧连接:     │
+    │                                │     *Sftp{SID_A的params}   │
+    │                                │     仍在 TTL 内（SFTP=1分钟）│
+    │                                │     但无请求能再取出它 ❌    │
+    │                                │                            │
+    │   ~1分钟后 TTL 过期             │                            │
+    │                                │     OnEvict 触发:          │
+    │                                │     wg.Wait() + Close()    │
+    │                                │                            │
+```
+
+#### 11.5.2 互动窗口分析
+
+**窗口定义**：从管理员踢出到 AppCache 中旧连接被 TTL 清理之间的时间段。
+
+| 后端 | AppCache TTL | 互动窗口时长 | 窗口内旧连接可被利用？ |
+|---|---|---|---|
+| SFTP | 1 分钟 | ≤ 1 分钟 | **否** |
+| S3 | 2 分钟 | ≤ 2 分钟 | **否** |
+| Samba | 30 分钟 | ≤ 30 分钟 | **否** |
+| FTP | 30 秒 | ≤ 30 秒 | **否** |
+| WebDAV | 无缓存 | 0 | 不涉及 |
+
+**为什么"否"？** 因为要从 AppCache 中取出连接对象，必须经过 `SessionStart` 的完整链路：
+1. `_extractAuthorization` → 需要 Cookie 中有合法加密 token
+2. `_extractSession` → 解密出 session map（含 session_id）
+3. `IsSessionRevoked(session_id)` → 检查黑名单 → **被拦截**
+4. `_extractBackend` → `model.NewBackend` → Backend.Init → AppCache.Get
+
+步骤 3 拦截后请求不会到达步骤 4，AppCache 中的旧连接永远不会被已撤销的 session_id 取出。
+
+#### 11.5.3 攻击者能否绕过黑名单直接命中 AppCache？
+
+**不能。** AppCache 是进程内私有数据结构（`patrickmn/go-cache`），没有 HTTP 接口。攻击者无法直接调用 `SftpCache.Get()`。唯一的入口是 `model.NewBackend` → `Backend.Init` → `AppCache.Get`，而这条路径被 `SessionStart` 保护。
+
+#### 11.5.4 AppCache 是否需要主动清理被撤销的条目？
+
+**不需要，但可以优化。**
+
+当前行为：被撤销会话对应的 AppCache 条目自然等待 TTL 过期 + OnEvict 清理。
+
+如果希望踢出时立即释放资源（如关闭 SSH 连接），可在 `RevokeSession` 中追加一步：
+
+```go
+// 优化（可选）：踢出时主动清理 AppCache 中对应的连接
+// 但问题是 RevokeSession 只有 session_id，没有完整 params → 无法计算 AppCache key
+```
+
+**困难**：AppCache key = `hashstructure.Hash(完整 params map)`，包含 password。黑名单只存 session_id，没有完整 params → 无法计算 AppCache key → 无法主动删除。
+
+**解决路径**（超出最小方案）：
+1. 在 `RevokedSession` 表额外存储加密的 params（占用空间）
+2. 在 `RevokedSession` 表存储 AppCache key（需要 Init 时计算并持久化）
+3. 不主动清理，依赖 TTL 自然过期（推荐）
+
+#### 11.5.5 极端场景：TTL 内旧连接占用后端资源
+
+Samba 的 TTL 长达 30 分钟。如果用户被踢出，SMB 共享在 30 分钟内不会被卸载。
+
+**影响**：
+- 后端 Samba 服务器上该用户的 SMB session 仍然活跃
+- 如果后端有并发连接数限制，被踢用户的连接可能占位
+
+**缓解方案**：
+1. 缩短 Samba TTL（简单但增加连接重建频率）
+2. 在 `RevokeSession` 时，遍历 `SambaCache` 检查每个条目的 session_id 是否匹配（需要 Samba 缓存条目中存储 session_id）
+3. 定时任务扫描黑名单，对 AppCache 做反向清理（复杂）
+
+**最小方案选择**：不处理，依赖 TTL 自然过期。30 分钟窗口在大多数场景下可接受。
+
+---
+
+### 11.6 session_id 方案下的完整改动清单
+
+| 序号 | 文件 | 改动内容 | 与 GenerateID 方案的差异 |
+|---|---|---|---|
+| 1 | `server/model/index.go` | `RevokedSession` 表加 `session_id` 和 `gen_id` 双字段 | 增加 session_id 字段 |
+| 2 | `server/model/session.go` | `IsSessionRevoked(sessionID)` / `RevokeSession(sessionID, genID)` / `UnrevokeSession(sessionID)` / `RevokedSessionList()` | 主键从 gen_id 变为 session_id |
+| 3 | `server/common/error.go` | 新增 `ErrSessionRevoked` | 相同 |
+| 4 | `server/common/crypto.go` | `GenerateID` 的 switch 增加 `case "session_id":` | 新增 |
+| 5 | `server/ctrl/session.go` | `SessionAuthenticate` 第 53 行后加 `ctx.Body["session_id"] = RandomString(20)`；`SessionAuthMiddleware` 第 427 行后加 `mappingToUse["session_id"] = RandomString(20)` | 新增 |
+| 6 | `server/middleware/session.go` | `SessionStart` 中在 `_extractSession` 之后、`_extractBackend` 之前加 `IsSessionRevoked` 检查 + 清分片 Cookie | 检查 key 从 gen_id 变为 session_id |
+| 7 | `server/ctrl/admin.go` | 新增 3 个 handler | 相同 |
+| 8 | `server/routes.go` | 注册 3 条路由 | 相同 |
+| 9 | 审计日志 | `SessionAuthenticate` 和 `SessionLogout` 的 AUDIT 日志加 `sid[%s]` 字段 | 新增 |
+
+**不改的文件**（与 GenerateID 方案相同）：
+- 各后端插件 / AppCache / Share 相关 / SessionTry / CanManageShare
+
+---
+
+### 11.7 上线协同关键时间线
+
+```
+T0: 管理员调用 RevokeSession("SID_OLD", "gen_id_alice")
+    → RevokedSession 表写入一行
+    → 旧设备不知情，Cookie 仍在浏览器中
+
+T0+ε: 旧设备发起下一次 HTTP 请求
+    → SessionStart → _extractSession 解出 session_id = "SID_OLD"
+    → IsSessionRevoked("SID_OLD") = true
+    → RecoverFromBadCookie: Set-Cookie auth=; MaxAge=-1, auth1=; MaxAge=-1, ...
+    → 返回 401 ErrSessionRevoked
+    → 前端跳转登录页
+    → 旧设备被踢出 ✅
+
+T0+ε: 同一用户的新设备（session_id = "SID_NEW"）不受影响
+    → IsSessionRevoked("SID_NEW") = false
+    → 正常工作 ✅
+
+T0 ~ T0+TTL: AppCache 中旧连接自然过期
+    → SFTP: ~1 分钟后 OnEvict → wg.Wait() + Close()
+    → Samba: ~30 分钟后
+    → 此期间旧连接占用后端资源，但无法被任何请求利用
+
+T0 + cookie_timeout: 旧 Cookie 的 MaxAge 到期
+    → 即使浏览器未收到 RecoverFromBadCookie（如离线），Cookie 也自然失效
+    → 黑名单条目仍有价值（防止 Cookie 被抓包重放）
+
+T0 + until: 黑名单条目过期
+    → autovacuum 清理
+    → 此时旧 Cookie 早已过期（cookie_timeout << until）
+    → 清理是安全的 ✅
+```
+
+---
+
+### 11.8 并发场景核对
+
+| 场景 | 时序 | 结果 |
+|---|---|---|
+| 踢出与登录并发 | RevokeSession 写入与 SessionAuthenticate 写 Cookie 同时进行 | 新登录获得新 session_id，不受旧 session_id 黑名单影响 ✅ |
+| 踢出与文件操作并发 | RevokeSession 写入时，用户正在下载文件 | 当前请求不受影响（请求级快照），下次请求被拒 ✅ |
+| 同一用户多设备同时踢出 | 管理员快速连续踢出 SID_A 和 SID_B | 两次 INSERT 不同主键，互不冲突 ✅ |
+| 同一 session_id 重复踢出 | 管理员对同一设备踢两次 | SQLite 主键冲突 → INSERT OR IGNORE → 幂等 ✅ |
+| 踢出后 AppCache Get 并发 | 请求 A 在黑名单检查后、AppCache.Get 前被踢出 | 黑名单检查已通过（T1 时刻为 false），请求 A 正常完成 ✅ |
+| 踢出时 SessionTry 并发 | SessionLogout 的 goroutine 走 SessionTry 取旧连接 | SessionTry 忽略所有错误，不查黑名单，尝试关连接（安全） ✅ |
