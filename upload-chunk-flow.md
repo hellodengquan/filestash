@@ -1756,7 +1756,503 @@ if proto == "tus" && req.Method == http.MethodPost {
 
 ---
 
-## 十三、关键文件索引
+## 十三、多用户并发上传同一文件的去重策略代码挂载点
+
+Filestash 的去重策略是 **分层防御 + 各管一段** 的组合，没有统一的全局去重调度器。每个层级（前端单实例、后端单用户、后端多用户）分别负责一部分范围。
+
+### 13.1 去重层次全景图
+
+```
+ 用户拖拽 N 个文件
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 1: 前端 DOM 检查去重（per-browser）              │
+│ ctrl_upload.js:272-278                                │
+│ querySelectorAll([data-path=xxx][data-status=running])│
+│ → 存在 → 等待 1s 放回队列头部                           │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 2: 前端目录依赖树去重（BFS ready()）             │
+│ ctrl_upload.js:694-710                                │
+│ 父目录任务 done === false → ready() return false       │
+│ → 保证 /a/b/c.txt 不在 /a/b/ 创建完成前上传              │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 3: 后端权限层存在性检查（CanUpload 场景）         │
+│ files.go:492-513                                      │
+│ CanEdit=false && CanUpload=true →                     │
+│   Ls(root) + 遍历 entries 检查同名                     │
+│   存在 → ErrConflict(409)                              │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 4: 后端 cacheKey 天然用户隔离（TUS POST）         │
+│ files.go:543-546, 568-571                             │
+│ cacheKey = { path, GenerateID(session) }              │
+│ → 不同用户 session hash 不同                          │
+│ → 同一用户二次 POST：先 Del 旧缓存再新建               │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 5: 后端 offset 并发安全（单 TUS 实例内）          │
+│ files.go:709, 715-717, 731-733                       │
+│ chunkedUpload.mu sync.Mutex                           │
+│ → 保护 offset 读写一致性                              │
+│ → 不阻止并发 PATCH（需要客户端配合去重）               │
+└─────────────────────────────────────────────────────┘
+```
+
+### 13.2 Layer 1：前端 DOM 检查去重
+
+**代码位置**：`public/assets/pages/filespage/ctrl_upload.js:272-278`
+
+```javascript
+// processWorkerQueue 的 step2
+const $tasks = qsa($page, `[data-path="${task.path}"][data-status="running"]`);
+if ($tasks.length > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));  // 等待 1s
+    tasks.unshift(task);  // 放回队列头部（先进先出，下次继续尝试）
+    continue;
+}
+```
+
+**覆盖范围**：
+- ✅ 同一浏览器同一标签页
+- ✅ 防止 user 快速双击「上传」按钮导致重复任务
+- ❌ 多标签页之间不共享 DOM（各自独立的 workers$ 队列）
+- ❌ 多浏览器 / 多用户无效
+
+**data-status 状态设置时机**（`ctrl_upload.js:207, 235`）：
+```javascript
+// 开始执行时
+$task.setAttribute("data-status", "running");
+
+// 成功/失败时清除
+$task.removeAttribute("data-status");  // done/error 时
+```
+
+### 13.3 Layer 2：前端目录依赖树去重
+
+**代码位置**：`public/assets/pages/filespage/ctrl_upload.js:694-710`
+
+```javascript
+ready = () => {
+    for (let i=0; i<tasks.length; i++) {
+        // 只检查当前任务之前的目录任务（BFS 顺序保证）
+        if (tasks[i].path === task.path) break;
+        else if (tasks[i].type === "file") continue;
+        else if (isInDirectory(tasks[i].path, task.path) === false) continue;
+
+        // 父目录的创建任务未完成 → 阻塞
+        if (tasks[i].done === false) return false;
+    }
+    return true;
+};
+```
+
+**覆盖范围**：
+- ✅ 同一拖拽批次内的目录/文件依赖
+- ✅ 防止「目录 /a/b/ 还没创建，文件 /a/b/c.txt 已经开始上传 → 404」
+- ❌ 跨批次上传（先拖一批目录，再拖一批文件）
+
+### 13.4 Layer 3：后端权限层存在性检查（409 Conflict）
+
+**代码位置**：`server/ctrl/files.go:492-513`
+
+```go
+if model.CanEdit(ctx) == false {
+    if model.CanUpload(ctx) == false {
+        SendErrorResult(res, ErrPermissionDenied)
+        return
+    }
+    // CanUpload 用户：禁止覆盖已有文件
+    root, filename := SplitPath(path)
+    entries, err := ctx.Backend.Ls(root)
+    if err != nil {
+        SendErrorResult(res, ErrPermissionDenied)
+        return
+    }
+    for i := 0; i < len(entries); i++ {
+        if entries[i].Name() == filename {
+            Log.Debug("files::save action=permission_ls err=already_exist")
+            SendErrorResult(res, ErrConflict)  // ← HTTP 409
+            return
+        }
+    }
+}
+```
+
+**⚠️ 关键限制**：
+- 只对 **CanEdit=false, CanUpload=true** 的用户生效（典型场景：只允许上传、不允许修改的分享链接用户）
+- 对管理员 / 所有者（CanEdit=true）**不做去重**，直接覆盖
+- 存在 TOCTOU（Time-of-check to time-of-use）竞态：两个请求同时通过 Ls 检查 → 都进入 Save → 后者覆盖前者
+
+### 13.5 Layer 4：后端 cacheKey 天然用户隔离 + POST 清理
+
+**cacheKey 设计**（`files.go:543-546`）：
+```go
+cacheKey := map[string]string{
+    "path":    path,
+    "session": GenerateID(ctx.Session),  // ← 不同用户必然不同
+}
+```
+
+**并发 POST 竞态**（`files.go:568-571`）：
+```go
+if proto == "tus" && req.Method == http.MethodPost {
+    // ★ 关键：新建前先删旧缓存
+    if c := chunkedUploadCache.Get(cacheKey); c != nil {
+        chunkedUploadCache.Del(cacheKey)
+        // ↑ 同一用户第二次 POST → 第一次的缓存/offset/pipe 全丢
+    }
+    ...
+}
+```
+
+**并发场景分析**：
+
+| 场景 | cacheKey 相同？ | 去重效果 |
+|------|---------------|---------|
+| **用户A + 用户B 传同一路径** | ❌ session 不同 | ❌ 两个独立 TUS 实例 → 最终 Save 谁后完成谁覆盖 |
+| **同用户多标签页传同一路径** | ✅ session 相同 | ⚠️ 第二次 POST Del 第一次的缓存 → 第一次的 PATCH 收到 409 |
+| **同用户同标签页双击上传** | ✅ session 相同 | ✅ Layer 1 DOM 检查先拦截 |
+
+**PATCH 命中失败（缓存被第二次 POST 删了）**（`files.go:623-628`）：
+```go
+c := chunkedUploadCache.Get(cacheKey)
+if c == nil {
+    Log.Debug("files::save::tus action=backend_save step=cache_fetch_patch")
+    SendErrorResult(res, NewError("Conflict", 409))  // ← 返回给前端
+    return
+}
+```
+前端收到 409 → `executeHttp` 的 `onload` 中 `xhr.status=409` 不在 [200,201,204] → reject Error → UI 进入 error 状态 → 显示 retry 按钮。
+
+### 13.6 Layer 5：offset 的 Mutex 并发安全
+
+**代码位置**：`server/ctrl/files.go:709, 712-733`
+
+```go
+type chunkedUpload struct {
+    ...
+    mu sync.Mutex     // ← 只保护 offset，不做全链路去重
+}
+
+func (this *chunkedUpload) Next(body io.ReadCloser) error {
+    n, err := io.Copy(this.stream, body)
+    body.Close()
+    this.mu.Lock()
+    this.offset += uint64(n)     // ← 并发写入时互斥
+    this.mu.Unlock()
+    return err
+}
+
+func (this *chunkedUpload) Meta() (uint64, uint64) {
+    this.mu.Lock()
+    defer this.mu.Unlock()
+    return this.offset, this.size   // ← 读取时互斥
+}
+```
+
+**能保护的范围**：
+- ✅ 同一条 TUS 上传链路中，多个 goroutine 并发读写 offset 的数据一致性
+- ❌ 不阻止同用户多标签页同时对同一路径进行 PATCH（需要 Layer 1 + Layer 4 配合）
+- ❌ `io.Copy` 写入 pipe 的过程不受 mu 保护（同一时刻多 PATCH 并发写 stream 会导致数据交织）
+
+> **实际上不会发生多 PATCH 并发写 stream**：因为前端分片是顺序 for 循环执行（`ctrl_upload.js:434`：`for (...; i<numberOfChunks; i++) { await executeHttp(...) }`），同一文件的 PATCH 天然串行。
+
+### 13.7 多用户并发覆盖的竞态漏洞
+
+**最终竞态窗口**：CanEdit=true 用户（管理员/所有者）的上传完全没有去重：
+
+```
+  时间轴 ─────────────────────────────────────────────►
+  Admin A:  CanEdit=true → Layer3 跳过 → POST → PATCH...(offset 50%)
+  Admin B:  CanEdit=true → Layer3 跳过 → POST → PATCH...(offset 50%)
+                                    │
+                                    ▼
+                    最后一个 PATCH 完成的 Close()
+                    → Backend.Save 的结果生效
+                    → 另一个人的数据永久丢失
+```
+
+**代码证明**（`files.go:492-514` 之间的注释位置）：
+- CanEdit=true → 直接跳过 500-513 行的存在性检查
+- CanEdit=true 直接进入 516 行 AuthorisationMiddleware → 继续 TUS 流程
+
+---
+
+## 十四、上传超时的客户端断连处理路径
+
+Filestash 的超时处理是 **「无主动超时 + 多层被动超时」** 的组合。整个上传链路 **没有任何地方设置主动的超时阈值**（没有 XHR timeout、没有 HTTP Server WriteTimeout、没有 per-request context deadline），完全依赖底层系统被动超时 + 24h 缓存驱逐兜底。
+
+### 14.1 超时层级全景图
+
+```
+ 用户发起分片上传 (PATCH /api/files/save)
+        │
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 1: 前端 XHR (无主动超时)                       │
+│ ctrl_upload.js:527-585                                │
+│ ✗ 未设置 xhr.timeout                                 │
+│ ✗ onprogress 只算速度，无超时检测                     │
+│ 处理: onerror / onabort → reject Promise             │
+└──────────────────────┬──────────────────────────────┘
+                       │ TCP 断连 / 浏览器内置超时 / 手动 abort
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 2: Go HTTP Server (无 Read/Write 超时)          │
+│ plg_starter_http/index.go:21-24                      │
+│ plg_starter_https/index.go:23-29                     │
+│ srv := &http.Server{                                 │
+│     Addr:    fmt.Sprintf(":%d", port)                │
+│     Handler: r                                       │
+│     // ✗ ReadTimeout: 未设置                         │
+│     // ✗ WriteTimeout: 未设置                        │
+│     // ✗ IdleTimeout: 未设置                         │
+│ }                                                    │
+│ 处理: TCP keepalive 超时（内核默认 ~2h）              │
+└──────────────────────┬──────────────────────────────┘
+                       │ req.Body.Read() 返回 err
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 3: FileSave PATCH handler                      │
+│ files.go:636-644                                      │
+│ io.Copy(this.stream, req.Body)                        │
+│ → req.Body 读到 EOF/错误时自然返回                    │
+│ → body.Close() 执行                                  │
+│ → this.offset += n (只加成功字节)                    │
+│ 处理: err 非 nil → HTTP 403 给前端                   │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 4: io.Pipe 背压断连处理                        │
+│ files.go:672-685 (createChunkedUploader)              │
+│ Backend.Save goroutine 读得慢 → PATCH 写阻塞           │
+│ 处理: 无超时，一直阻塞（依赖客户端 ABORT/浏览器超时）   │
+└──────────────────────┬──────────────────────────────┘
+                       │ 用户/浏览器主动断开 → stream.Close 触发
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│ Layer 5: TUS 缓存 24h 驱逐兜底                       │
+│ files.go:687-699                                      │
+│ chunkedUploadCache (retention=1440min, cleanup=1min) │
+│ OnEvict 回调 → c.Close() → stream.Close() →          │
+│   → Backend.Save 读 pipe 收到 ErrClosedPipe          │
+│   → done channel 返回错误                            │
+│ 处理: 泄漏的半完成上传最终被清理                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 14.2 Layer 1：前端 XHR（无主动超时）
+
+**代码位置**：`public/assets/pages/filespage/ctrl_upload.js:527-585`
+
+```javascript
+function executeHttp(url, { method, headers, body, progress, speed }) {
+    const xhr = new XMLHttpRequest();
+    this.xhr = xhr;
+    return new Promise((resolve, reject) => {
+        xhr.open(method, ...);
+        // ★ 没有 xhr.timeout = XXX 这一行！
+        // ★ 没有 xhr.ontimeout = ... 这一行！
+        xhr.upload.onprogress = (e) => {
+            ... // 只算 percent + speed
+            // ★ 5 秒窗口只用于速度平均，不触发任何超时判定
+            if (e.timeStamp - prevProgress[0].timeStamp > 5000) {
+                prevProgress.shift();  // 仅窗口老化，不取消
+            }
+        };
+        xhr.upload.onabort = () => reject(ABORT_ERROR);
+        xhr.onerror = (e) => reject(new AjaxError("failed", e, "FAILED"));
+        xhr.onload = () => { ... };
+        xhr.send(body);
+    });
+}
+```
+
+**超时来源（全依赖外部）**：
+- 浏览器内置 TCP 超时（通常 5-10 分钟无活动）
+- 代理/负载均衡器的空闲超时（如 Nginx proxy_read_timeout 默认 60s）
+- 用户点击 $stop → `cancel()` → `xhr.abort()` → `onabort` → `ABORT_ERROR`
+
+**cancel 实现**（`ctrl_upload.js:345-348`）：
+```javascript
+cancel() {
+    if (this.xhr) assert.type(this.xhr, XMLHttpRequest).abort();
+    this.xhr = null;
+}
+```
+
+### 14.3 Layer 2：Go HTTP Server（无 Read/Write 超时）
+
+**代码位置**：`server/plugin/plg_starter_http/index.go:21-24`
+```go
+srv := &http.Server{
+    Addr:         fmt.Sprintf(":%d", port),
+    Handler:      r,
+    // 三大关键超时全部未设置：
+    // ReadTimeout:       未设置 → 无限
+    // ReadHeaderTimeout: 未设置 → 无限
+    // WriteTimeout:      未设置 → 无限
+    // IdleTimeout:       未设置 → 无限
+}
+```
+
+**HTTPS starter 同样未设置**（`plg_starter_https/index.go:23-29`）：
+```go
+srv := &http.Server{
+    Addr:         fmt.Sprintf(":%d", port),
+    Handler:      r,
+    TLSNextProto: ...,
+    TLSConfig:    ...,
+    ErrorLog:     NewNilLogger(),
+    // 同样无 Read/Write/Idle 超时
+}
+```
+
+**实际影响**：
+- PATCH 请求体慢速发送（1KB/s）→ 服务器一直等（不超时）
+- 网络半断开（丢包 90%）→ 服务器一直阻塞在 `req.Body.Read()`
+- 最终依赖：
+  - TCP KeepAlive（`net.ListenConfig` 默认启用，通常 2 小时）
+  - 操作系统 / 负载均衡器 / 浏览器的底层超时
+
+### 14.4 Layer 3：FileSave PATCH handler（自然结束）
+
+**代码位置**：`server/ctrl/files.go:636-644`
+
+```go
+reader := req.Body
+if hash != nil {
+    reader = io.NopCloser(io.TeeReader(req.Body, hash))
+}
+if err := uploader.Next(reader); err != nil {
+    // Next 返回 err（可能是 req.Body 读取错误）
+    Log.Debug("files::save::tus action=uploader.next path=%s err=%s", path, err.Error())
+    SendErrorResult(res, NewError(err.Error(), 403))
+    return
+}
+```
+
+**Next 内部**（`files.go:712-719`）：
+```go
+func (this *chunkedUpload) Next(body io.ReadCloser) error {
+    n, err := io.Copy(this.stream, body)
+    body.Close()
+    this.mu.Lock()
+    this.offset += uint64(n)    // ← 只累加成功写入的字节
+    this.mu.Unlock()
+    return err                 // ← 原封不动返回错误
+}
+```
+
+**断连时的字节一致性**：
+- `io.Copy` 内部是 32KB 循环 Read + Write
+- 当 `body.Read()` 返回错误（断连），`n` 只包含最后一次成功 copy 的字节数
+- `offset += n` → 恰好是数据正确写入 pipe 的字节数
+- **不会半字节计 offset**，断点续传时恰好从正确位置继续 ✓
+
+### 14.5 Layer 4：io.Pipe 背压 + 断连锁定
+
+**代码位置**：`server/ctrl/files.go:672-685`
+
+```go
+func createChunkedUploader(save func(path string, file io.Reader) error, path string, size uint64) *chunkedUpload {
+    r, w := io.Pipe()
+    done := make(chan error, 1)
+    go func() {
+        done <- save(path, r)  // ★ 独立 goroutine，无限阻塞也无人取消
+    }()
+    return &chunkedUpload{
+        fn:     save,
+        stream: w,
+        done:   done,
+        ...
+    }
+}
+```
+
+**背压场景**（慢速 Backend）：
+```
+客户端 100MB/s 写入 PATCH
+        │
+        ▼
+io.PipeWriter (内存缓冲区)
+        │ 64KB 满 → 阻塞 PATCH 的 io.Copy
+        ▼
+io.PipeReader
+        │
+        ▼
+Backend.Save (FTP 慢速 500KB/s)
+```
+- 效果：PATCH 响应被拉长，但 PATCH handler 不会超时
+- 客户端 `xhr.onprogress` 会看到 loaded/total 卡住（但不会触发超时）
+
+**断连场景**（客户端断网 20 分钟恢复）：
+1. 客户端断网 → `xhr.onerror` 或 TCP RST → Go 侧 `req.Body.Read()` 返回错误
+2. `io.Copy` 返回错误 → `Next` 返回错误 → HTTP 403 响应（如果 socket 还能写）
+3. 但 `save()` goroutine 继续等待 pipe 的更多数据
+4. **没有人通知 goroutine 客户端已经断连** → pipe 保持打开
+5. 最终依赖 Layer 5：24h 后 chunkedUploadCache.OnEvict → `stream.Close()` → goroutine 退出
+
+### 14.6 Layer 5：TUS 缓存 24h 驱逐兜底
+
+**代码位置**：`server/ctrl/files.go:687-699`
+
+```go
+func initChunkedUploader() {
+    chunkedUploadCache = NewAppCache(60*24, 1)  // retention 24h, cleanup 1min
+    chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+        c := value.(*chunkedUpload)
+        if c == nil { return }
+        if err := c.Close(); err != nil {       // ★ 强制关闭 pipe
+            Log.Warning("ctrl::files::chunked::cleanup action=close err=%s", err.Error())
+            return
+        }
+    })
+}
+```
+
+**Close 的连锁反应**（`files.go:721-728`）：
+```go
+func (this *chunkedUpload) Close() error {
+    this.stream.Close()       // ① 写端关闭 → PipeReader 收到 ErrClosedPipe
+    err := <-this.done        // ② 等待 save() goroutine 退出
+    this.once.Do(func() { close(this.done) })
+    return err
+}
+```
+
+**效果**：任何泄漏的上传会话（用户关浏览器、断网、TAB 崩溃）最多 24h 后：
+- pipe 被关闭
+- save() goroutine 退出（可能返回错误给 done channel）
+- cache 条目删除
+- 内存回收
+
+### 14.7 各 Backend 的内部超时补充
+
+| Backend | 内部超时配置 | 说明 |
+|---------|------------|------|
+| **FTP** | `plg_backend_ftp/index.go:92` `goftp.Config{Timeout: timeout}` | 控制 FTP 数据连接超时，默认值从 session params 中取 |
+| **S3** | AWS SDK 默认 HTTP 客户端 | Go http.Client 默认无超时，SDK 内部有 per-request 重试（最多 3 次指数退避） |
+| **Local** | 无 | 直接系统调用 `write()`，无应用层超时 |
+| **Backblaze** | `HTTPClient()` 中的 Transport（`common/http.go`） | `DialContext` 30s，TLSHandshake 10s，但 ResponseHeaderTimeout 未设置 |
+| **Azure** | SDK 内部策略 | Azure SDK 默认管道包含重试策略（4 次 800ms-60s 指数退避） |
+
+---
+
+## 十五、关键文件索引
 
 | 文件 | 作用 | 核心行号 |
 |------|------|----------|
@@ -1783,6 +2279,8 @@ if proto == "tus" && req.Method == http.MethodPost {
 | `server/common/crypto.go` | GenerateID hash 算法（归属判定核心） | 193-218 |
 | `server/middleware/session.go` | SessionStart 中间件、_extractSession/_extractBackend | 57-82, 262-319 |
 | `server/model/files.go` | NewBackend 构造器（白名单校验+backend.Init） | 9-51 |
+| `server/plugin/plg_starter_http/index.go` | HTTP Server 启动（无 Read/Write 超时设置） | 18-36 |
+| `server/plugin/plg_starter_https/index.go` | HTTPS Server 启动（无 Read/Write 超时设置） | 18-55 |
 | `server/plugin/plg_backend_local/index.go` | Local Backend Save 实现（O_TRUNC 风险） | 124-134 |
 | `server/plugin/plg_backend_s3/index.go` | S3 Backend Save（s3manager）+ threadSize 控制 | 87-97, 569-587 |
 | `server/plugin/plg_backend_ftp/index.go` | FTP Backend Save + Execute 自动重连（丢数据风险） | 80-103, 363-399 |
