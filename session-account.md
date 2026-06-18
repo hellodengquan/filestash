@@ -726,3 +726,335 @@ if c != nil {
    - SFTP 有 wg 但 Close() 不等待 wg
    - 如果并发情况下一个请求在关连接，另一个还在用，可能导致后者出错
    - 实际中因为同一用户的并发请求会复用同一缓存连接，注销时 Close() 会影响正在进行的请求
+
+---
+
+## 九、三条潜在风险的代码级触发路径核对
+
+### 9.1 风险 1：handler 返回后后台 goroutine 仍持有 req 引用
+
+#### 9.1.1 完整调用链路
+
+```
+DELETE /api/session
+  → NewMiddlewareChain(SessionLogout, [ApiHeaders, SecureHeaders, SecureOrigin, PluginInjector])
+    → f(&app, &resw, req)                    // 执行 SessionLogout
+    → req.Body.Close()                         // ← 主 goroutine 关闭 Body
+    → go logger(&app, &resw, req)              // ← 主 goroutine 再次用 req
+
+SessionLogout 内部:
+  → go func() {                                // ← 后台 goroutine 启动
+      middleware.SessionTry(func(c, _res, _req) {
+        c.Backend.Close()
+      })(ctx, res, req)                        // ← 后台 goroutine 持有 req
+    }()
+  → ... Set-Cookie 循环 (也读 req.Cookie) ...
+  → SendSuccessResult(res, nil)                // ← 主 goroutine 返回
+```
+
+#### 9.1.2 后台 goroutine 对 req 的具体操作
+
+`SessionTry` 内部 `server/middleware/session.go:85-94` 按序执行：
+
+| 步骤 | 代码位置 | 操作 | 是否安全 |
+|---|---|---|---|
+| `_extractShare(req)` | `session.go:87` | 读 `req.URL.Query().Get("share")` + `mux.Vars(req)["share"]` | **安全**：URL 和 Vars 在 req 生命周期内不会变 |
+| `_extractAuthorization(req)` | `session.go:88` | 循环调用 `req.Cookie(CookieName(i))` | **有风险**：见下 |
+| `_extractSession(req, ctx)` | `session.go:89` | 不直接读 req（读 ctx.Authorization） | **安全** |
+| `_extractBackend(req, ctx)` | `session.go:90` | 不直接读 req（读 ctx.Session） | **安全** |
+
+#### 9.1.3 `req.Cookie()` 的实际安全性
+
+Go 标准库 `net/http` 中 `req.Cookie(name)` 的实现：
+- 遍历 `req.Header["Cookie"]` 解析出目标 cookie
+- 纯只读操作，不修改 req 的任何字段
+- `req.Header` 在请求创建时设置，之后不会被 Go 运行时修改
+
+**主 goroutine 对 req 的修改**：
+- `NewMiddlewareChain` 在 handler 返回后执行 `req.Body.Close()`（`middleware/index.go:32-34`）
+- 这只影响 `req.Body`，不影响 `req.Header` 或 `req.Cookie()`
+
+**结论**：后台 goroutine 读 `req.Cookie()` 时主 goroutine 可能已经 Close 了 Body，但 `Cookie()` 不依赖 Body，只依赖 Header。Header 在整个请求生命周期内不变。
+
+#### 9.1.4 真正的危险点：`res` 和 `ctx` 的并发写
+
+| 对象 | 主 goroutine | 后台 goroutine | 冲突？ |
+|---|---|---|---|
+| `res` (ResponseWriter) | `SendSuccessResult` → WriteHeader + Write | `SessionTry` 内部不写 res（fn 只调 Close） | **无冲突** |
+| `ctx` | 不修改（注销不走 SessionStart，ctx.Session 为空） | SessionTry 写 `ctx.Share`/`ctx.Authorization`/`ctx.Session`/`ctx.Backend` | **无冲突**（主不读这些字段） |
+| `req` | `req.Body.Close()` + `req.Cookie()` | `req.Cookie()` | **理论竞态**但实际无影响（见上） |
+
+#### 9.1.5 终态判定
+
+**不会 panic，不会返回异常状态码。**
+
+- 后台 goroutine 的 `SessionTry` 是容错版（所有 err 被 `_` 忽略）
+- 即使 `_extractAuthorization` 解析失败，返回空字符串
+- 即使 `_extractSession` 解密失败，返回空 map
+- 即使 `_extractBackend` 失败，返回 nil Backend → `c.Backend != nil` 检查跳过 Close
+- 唯一可能的外在表现：**Close() 没被调用**（如果 Cookie 在主 goroutine 中已被清除导致后台读不到），旧连接留在 AppCache 等 TTL 过期
+
+#### 9.1.6 另一个真实问题
+
+`NewMiddlewareChain` 在 handler 返回后执行 `req.Body.Close()` `middleware/index.go:32-34`。
+但 `SessionLogout` 走的中间件链包含 `BodyParser` 吗？不包含 `server/routes.go:28-29`。
+所以 Body 在 `SessionLogout` 中没被读，Close 一个未读的 Body 是安全的。
+
+---
+
+### 9.2 风险 2：Close() 不查引用计数时并发请求的错误传播
+
+#### 9.2.1 触发场景
+
+同一用户浏览器打开标签页 A（正在下载大文件）和标签页 B（点击注销），两者使用同一个 SFTP 连接（因为 params 哈希相同，命中同一个 AppCache 条目）。
+
+```
+时间轴 →
+  │
+  ├─ 请求 A (GET /api/files/cat?path=/bigfile)
+  │    └─ SessionStart → SftpCache.Get(params) 命中缓存 → 取出 *Sftp{SSHClient, SFTPClient}
+  │    └─ SFTPClient.OpenFile("/bigfile", O_RDONLY) → 开始读取
+  │    └─ b.SFTPClient.ReadDir / OpenFile / ... 操作进行中
+  │
+  ├─ 请求 B (DELETE /api/session)
+  │    └─ go func() {
+  │           SessionTry → SftpCache.Get(params) 命中同一缓存
+  │           → 取出同一个 *Sftp{SSHClient, SFTPClient}
+  │           → SFTPClient.Close()    // 关闭 sftp.Client
+  │           → SSHClient.Close()     // 关闭底层 ssh.Client
+  │         }()
+  │
+  └─ 请求 A 的下一次 sftp read 调用...
+       → 底层 SSH 连接已关闭
+       → ??? 什么错误
+```
+
+#### 9.2.2 SFTP 后端：错误传播链路
+
+**第一步**：`ssh.Client.Close()` 被调用（`server/plugin/plg_backend_sftp/index.go:349`）
+
+这会关闭底层 TCP 连接，并设置 `ssh.Client` 内部状态为 closed。
+
+**第二步**：请求 A 的下一次 SFTP 操作（如 `ReadDir`/`OpenFile`/`Read`）通过 `tracedClient` 调用 `sftp.Client` 方法
+
+`tracedClient`（`server/plugin/plg_backend_sftp/tracing.go:20-110`）只是包装了 span，最终调用 `t.Client.XXX()`
+
+**第三步**：`sftp.Client` 发送请求时发现底层连接已关闭
+
+`pkg/sftp` 库中，当底层连接关闭后：
+- 发送操作返回 `io.EOF`（如果 SSH channel 已关闭）
+- 或 `*sftp.StatusError{Code: 4, msg: "Failure"}`（如果 SFTP 服务器返回错误）
+- 或 `net: use of closed network connection`（如果 TCP socket 被关）
+
+**第四步**：错误经过 `b.err(e)` 映射 `server/plugin/plg_backend_sftp/index.go:357-376`
+
+```go
+func (b Sftp) err(e error) error {
+    f, ok := e.(*sftp.StatusError)
+    if ok == false {
+        if e == os.ErrNotExist {
+            return ErrNotFound           // → 404
+        }
+        return e                         // ← 未经映射的原生错误
+    }
+    switch f.Code {
+    case 0:  return nil
+    case 1:  return NewError("There's nothing more to see", 404)
+    case 2:  return NewError("Does not exist", 404)
+    case 3:  return NewError("Permission denied", 403)
+    case 4:  return NewError("Failure", 409)
+    ...
+    }
+}
+```
+
+SSH 连接关闭产生的错误（`io.EOF` / `net: use of closed network connection`）**不是** `*sftp.StatusError`，也不等于 `os.ErrNotExist`，所以 `b.err()` 返回**未经映射的原生 error**。
+
+**第五步**：ctrl 层调用 `SendErrorResult(res, err)` `server/common/response.go:85-102`
+
+```go
+obj, ok := err.(interface{ Status() int })
+if ok == true {
+    res.WriteHeader(obj.Status())   // 有 Status() 方法 → 用它的状态码
+} else {
+    res.WriteHeader(500)            // 没有 Status() 方法 → 500
+}
+```
+
+`io.EOF` 和 `net.OpError` 都**没有** `Status() int` 方法 → **HTTP 500**。
+
+对于 `*sftp.StatusError{Code: 4}` 的情况：`b.err()` 将其映射为 `NewError("Failure", 409)` → `AppError` 有 `Status()` 返回 409 → **HTTP 409**。
+
+#### 9.2.3 各操作的具体错误表现
+
+| 操作 | 被关连接后触发的 Go 错误 | 经过 b.err() 后 | 最终 HTTP 状态码 | 用户感知 |
+|---|---|---|---|---|
+| `Ls` (ReadDir) | `io.EOF` 或 `net.OpError` | 原样透传 | **500** | 列表加载失败 |
+| `Cat` (OpenFile) | `io.EOF` 或 `ssh.ChannelClosed` | 原样透传 | **500** | 文件打开失败 |
+| `Cat` 读取中 (Read) | `io.EOF` (来自 io.Copy) | **不经过 b.err()** | **连接直接断开** | 下载中断，响应截断 |
+| `Save` (OpenFile+Write) | `io.EOF` 或 `net.OpError` | 原样透传 | **500** | 保存失败 |
+| `Mv` (Rename) | `*sftp.StatusError{Code:4}` | `NewError("Failure", 409)` | **409** | 重命名冲突 |
+| `Rm` (Remove) | `*sftp.StatusError{Code:4}` | `NewError("Failure", 409)` | **409** | 删除冲突 |
+| `Stat` | `io.EOF` | 原样透传 | **500** | 文件信息获取失败 |
+
+**特别注意 Cat 读取中的情况**：
+
+`FileCat` handler（`server/ctrl/files.go`）中文件下载使用 `io.Copy(res, remoteFile)`，如果 Read 中途连接断开：
+- `io.Copy` 返回 `io.EOF` 或 `io.ErrUnexpectedEOF`
+- 但此时 HTTP 响应头已经写出去（200 OK + Content-Length），数据已经部分传输
+- handler 无法再改状态码
+- 客户端（浏览器）看到的是一个**不完整的下载**（Content-Length 不匹配）
+- 浏览器通常会报"网络错误"或"下载中断"
+
+#### 9.2.4 其他后端的表现
+
+| 后端 | Close() 语义 | 被关闭后的并发请求表现 |
+|---|---|---|
+| **S3** | 无状态连接（每次 newSession），Close 未实现 | **不受影响**（S3 不缓存连接对象，只缓存 Region） |
+| **WebDAV** | 无缓存，每次新建 HTTP 连接 | **不受影响**（无共享连接） |
+| **Samba** | 关闭 SMB session | 后续操作返回 SMB 错误 → 映射为 500 |
+| **FTP** | `f.client.Close()` 关闭控制连接 | 数据传输中断 → `goftp` 返回 `net.OpError` → 500 |
+| **Git** | 清理临时 clone 目录 | 后续操作报 "repository not found" → 500 |
+
+#### 9.2.5 与 OnEvict 的对比
+
+注意 SFTP 的 `OnEvict` 回调 `server/plugin/plg_backend_sftp/index.go:28-41`：
+
+```go
+SftpCache.OnEvict(func(key string, value interface{}) {
+    c := value.(*Sftp)
+    c.wg.Wait()       // ← 等待所有引用释放
+    c.Close()          // ← 然后才关闭
+})
+```
+
+缓存 TTL 过期时的清理是**安全的**（等待 wg → 等所有请求完成再关）。问题只出现在 `SessionLogout` 主动调用 `Close()` 时，因为**不走 OnEvict**，不等待 wg。
+
+#### 9.2.6 结论
+
+**并发请求不会拿到 "closed" 或特定业务错误码。** 最常见的表现是：
+
+- 元数据操作（Ls/Stat/Mkdir/Mv/Rm）→ **HTTP 500**（原生 Go error 未经映射）
+- 下载操作（Cat）→ **响应截断**（已写 200 头，数据中途断开）
+- 上传操作（Save）→ **HTTP 500**
+
+前端无法区分"连接被注销关闭"和"网络故障/后端异常"，统一表现为操作失败。
+
+---
+
+### 9.3 风险 3：缺管理员粒度强制下线在多租户场景的数据穿透
+
+#### 9.3.1 Filestash 的多租户模型
+
+Filestash 的"租户"概念不是内置的，而是通过以下组合实现的：
+
+1. **后端白名单** `Config.Conn`：限定可连接的存储后端（type/hostname/path/url）
+2. **认证中间件插件** `AuthenticationMiddleware`：限制谁能登录（如 WordPress SSO、LDAP、passthrough）
+3. **授权中间件插件** `AuthorisationMiddleware`：限制登录后能访问哪些路径
+4. **共享链接** `Share`：带密码/过期时间的受限访问
+
+**关键缺失**：没有"用户会话注册表"——服务端不知道当前有哪些活跃用户。
+
+#### 9.3.2 管理员现有的踢人手段
+
+| 手段 | 代码路径 | 影响范围 | 粒度 |
+|---|---|---|---|
+| 改 `general.secret_key` | `config.go:71` | 全体用户全部失效 | **全量** |
+| 删 `Config.Conn` 条目 | `model/files.go:9-51` | 该后端所有用户无法**新建**连接 | **后端级** |
+| 改认证中间件配置 | `ctrl/session.go:220-236` | 新用户无法通过该中间件登录 | **认证方式级** |
+| 删共享链接 | `model/share.go` | 使用该链接的**新**访问被拒 | **链接级** |
+
+**以上均无法踢掉已持有有效 Cookie 的特定用户。**
+
+#### 9.3.3 数据穿透路径分析
+
+**场景**：多租户 SFTP 后端，不同用户分配不同 chroot path
+
+```
+用户 A: {type:sftp, hostname:sftp.example.com, username:tenant_a, path:/data/tenant_a/}
+用户 B: {type:sftp, hostname:sftp.example.com, username:tenant_b, path:/data/tenant_b/}
+```
+
+**穿透路径 1：共享链接跨租户泄露**
+
+`ShareUpsert` `server/ctrl/share.go:44-58` 创建共享链接时：
+```go
+s := Share{
+    Auth: func() string {
+        if ctx.Share.Id == "" {
+            str := ""
+            index := 0
+            for {
+                cookie, err := req.Cookie(CookieName(index))
+                // ...拼接完整的加密会话 token...
+                str += cookie.Value
+            }
+            return str  // ← 完整的用户 A 加密会话存入 Share.Auth
+        }
+        return ctx.Share.Auth
+    }(),
+}
+```
+
+这意味着共享链接的 `Auth` 字段存储的是**创建者完整的加密会话**，包含密码。如果用户 A 创建了指向 `/data/tenant_a/` 的共享链接并分享给用户 B，用户 B 通过该链接访问时：
+
+- `_extractShare` 解密 `Share.Auth` → 得到用户 A 的完整 session params
+- `_extractSession` 用这个 session 创建后端连接 → **以用户 A 的身份操作**
+- `_extractBackend` 初始化 Backend 时 path 被 Share 的 path 覆盖 → 限制在用户 A 的 chroot 内
+
+**跨租户穿透可能性**：如果 `Share.Path` 配置为 `/`（而非 `/data/tenant_a/`），或者 chroot 在 SFTP 服务器端未严格限制，用户 B 可以通过用户 A 的凭据访问用户 A 的数据。
+
+但这是**设计如此**（共享=授权），不是漏洞。问题是管理员无法撤回已发出的共享链接所包含的凭据——只能删共享链接阻止新访问，已通过共享链接建立自己 Cookie 的人不受影响。
+
+**穿透路径 2：Cookie 盗用无法单点清除**
+
+假设用户 A 的 Cookie 被盗（XSS、中间人等），攻击者获得加密 token。管理员发现后：
+- 无法只使用户 A 的 Cookie 失效
+- 改 SECRET_KEY → 所有用户全部下线
+- 删 SFTP 后端配置 → 阻止**新**连接，但 AppCache 中的旧连接仍在 TTL 内有效
+
+**穿透路径 3：AppCache 跨请求复用**
+
+同一 Filestash 实例上，如果用户 A 和用户 B 连接同一个 SFTP 服务器但用不同账号：
+- 他们的连接在 AppCache 中是不同 key → 不互相影响
+- 但如果**同一账号**被多人共享使用（如共享服务账号），AppCache 只建一个连接 → 所有人复用
+
+```
+用户 A 登录: {type:sftp, hostname:srv, username:shared, password:xxx}
+用户 B 登录: {type:sftp, hostname:srv, username:shared, password:xxx}
+→ params 哈希相同 → 命中同一 SftpCache 条目 → 共享同一个 SSH 连接
+```
+
+这不是漏洞，但在多租户场景下意味着：
+- 用户 A 的文件操作和用户 B 的文件操作在同一个 SSH session 上交错
+- SFTP 服务器端看到的都是同一个用户
+- 审计日志无法区分是 A 还是 B
+
+#### 9.3.4 管理员粒度强制下线的缺失带来的具体影响
+
+| 场景 | 缺失能力 | 后果 |
+|---|---|---|
+| 用户密码泄露 | 无法使该用户现有 Cookie 失效 | 攻击者在 cookie_timeout 内（默认 1 周）持续访问 |
+| 员工离职 | 无法远程清除其浏览器中的 Cookie | 前员工在 cookie_timeout 内可继续访问公司存储 |
+| 共享链接滥用 | 无法使已通过链接创建 Cookie 的用户失效 | 只能删链接阻止新访问，已登录用户不受影响 |
+| 合规审计 | 无法展示"已终止某用户所有会话" | 不满足某些合规要求（如 SOC2、GDPR 数据访问撤回） |
+| APT 防御 | 无法快速隔离被入侵的会话 | 必须改 SECRET_KEY 影响全体用户，造成大面积服务中断 |
+
+#### 9.3.5 根本原因
+
+`_extractSession` `server/middleware/session.go:262-315` 的认证逻辑**完全自包含**：
+
+```go
+str, err = DecryptString(SECRET_KEY_DERIVATE_FOR_USER, ctx.Authorization)
+// 只检查：1) 能否解密  2) timestamp 是否超过 1 年
+// 不检查：1) 会话是否被管理员撤销  2) 用户是否仍被授权
+```
+
+没有"会话黑名单"或"令牌撤销列表"的概念。每个请求独立验证，不查询任何服务端状态。
+
+#### 9.3.6 可行的缓解方案方向（代码层面）
+
+1. **增加会话撤销表**：在 SQLite 中添加 `revoked_sessions` 表，`_extractSession` 解密后检查 `GenerateID(session)` 是否在撤销列表中
+2. **利用 AuthorisationMiddleware 插件**：在每次请求时向外部认证服务（如 LDAP/IdP）验证用户是否仍有效，但当前插件只在 `Ls`/`Cat` 等操作上检查，不在 SessionStart 上检查
+3. **缩短 cookie_timeout**：将默认 1 周缩短到数小时，缩小攻击窗口
+4. **增加 session_id 概念**：在 session map 中嵌入随机 ID，管理员可按 ID 撤销
