@@ -913,7 +913,441 @@ FileSave() handler
 
 ---
 
-## 九、关键文件索引
+## 九、合并失败时残留分片的 GC 路径
+
+Filestash 的「残留分片」分两个层面：**进程内部的 TUS 缓存清理**和**后端存储介质的残留数据清理**。两者的 GC 路径完全不同，前者完善，后者因 backend 而异。
+
+### 9.1 GC 触发点全景图
+
+```
+                  合并失败触发源
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+   用户主动取消    进程异常崩溃      24h 超时驱逐
+          │              │              │
+          ▼              ▼              ▼
+   xhr.abort()       进程内存清零    chunkedUploadCache
+   → XHR abort                         .OnEvict 回调
+          │                              │
+          ▼                              ▼
+  PATCH io.Copy 返回 err           c.Close() → stream.Close()
+          │                              │
+          └──────┬───────────────────────┘
+                 ▼
+         TUS 内存状态清理（AppCache 删除）
+                 │
+                 ▼
+         Backend.Save 的 Reader 收到 EOF/ErrPipe
+                 │
+       ┌─────────┴──────────┬────────────┬───────────────┐
+       ▼                    ▼            ▼               ▼
+     Local                S3         FTP/SFTP      Backblaze/Azure
+  (文件残留磁盘)     (Multipart残留)  (部分STORE)    (Block残留)
+       │                    │            │               │
+       ▼                    ▼            ▼               ▼
+   无自动清理        SDK内失败自动Abort  服务端策略      SDK 清理
+   需用户手动        但进程崩溃残留      依赖服务端      依赖策略
+```
+
+### 9.2 层 1：TUS 缓存的 GC（进程内）
+
+**触发点 1：正常 Close 流程（成功/显式失败）** - `server/ctrl/files.go:656-663`
+```go
+} else if newOffset == totalSize {
+    if err := uploader.Close(); err != nil {
+        SendErrorResult(res, ErrNotValid)
+        return
+    }
+    chunkedUploadCache.Del(cacheKey)  // ← 成功：主动从缓存删除
+}
+```
+
+**触发点 2：Offset 越界（安全保护）** - `server/ctrl/files.go:650-655`
+```go
+if newOffset > totalSize {
+    uploader.Close()                       // ← 关闭管道
+    chunkedUploadCache.Del(cacheKey)       // ← 立即从缓存删除
+    SendErrorResult(res, NewError("aborted - offset larger than total size", 403))
+    return
+}
+```
+
+**触发点 3：OnEvict 驱逐回调（24h 超时/程序清理）** - `server/ctrl/files.go:689-699`
+```go
+chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+    c := value.(*chunkedUpload)
+    if c == nil { return }
+    if err := c.Close(); err != nil {        // ← 被驱逐时强制 Close
+        Log.Warning("ctrl::files::chunked::cleanup action=close err=%s", err.Error())
+        return
+    }
+})
+```
+
+**触发点 4：服务启动时清理 TMP_PATH** - `server/common/constants.go:54-55`
+```go
+os.RemoveAll(GetAbsolutePath(TMP_PATH))    // ← 清理下载缓存
+os.MkdirAll(GetAbsolutePath(TMP_PATH), os.ModePerm)
+```
+> 注意：`TMP_PATH` 只存 **下载 range** 缓存（`file_cache`），**不存上传分片**。上传分片 100% 在内存 pipe 中。
+
+### 9.3 层 2：各 Backend 存储残留的 GC 路径
+
+#### 9.3.1 Local Backend：半写入文件永久残留
+
+**残留场景**：
+1. 上传 1GB 文件，传到 600MB 时用户取消 / 进程崩溃 / 网络中断
+2. `SafeOsOpenFile` 已经创建了目标文件（`O_CREATE|O_TRUNC`）
+3. `io.Copy(f, content)` 写了 600MB，返回错误，`f.Close()` 执行
+
+**代码路径** (`server/plugin/plg_backend_local/index.go:124-134`)：
+```go
+func (this Local) Save(path string, content io.Reader) error {
+    f, err := SafeOsOpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0664)
+    // ↑ 注意：O_TRUNC 会先截断已有同名文件！
+    if err != nil { return err }
+    if _, err = io.Copy(f, content); err != nil {
+        f.Close()           // ← 关闭已写 600MB 的文件
+        return err
+    }
+    return f.Close()
+}
+```
+
+**GC 状态**：
+- ❌ **无自动清理**，600MB 截断文件永久停留在目标路径
+- ⚠️ 更糟：`O_TRUNC` 在 Save 入口就清空了原文件，失败后原文件已丢失
+- 用户视角：目标目录出现一个「大小不符」的同名文件，下次重试上传会再次 `O_TRUNC` 覆盖它
+
+#### 9.3.2 S3 Backend：SDK 内部两级保护 + 进程崩溃的盲区
+
+**第一级：s3manager.Uploader 的正常失败路径**
+
+AWS SDK 的 `Uploader` 内部使用 Multipart Upload，失败时会自动 Abort：
+
+```
+Uploader.UploadWithContext(ctx, &input)
+    │
+    ├──► CreateMultipartUpload  ← 创建 UploadId
+    │
+    ├──► 并发 UploadPart (默认 5×5MB 缓冲)
+    │       ├── Part #1 OK
+    │       ├── Part #2 OK
+    │       └── Part #3 失败
+    │            │
+    │            └──► AbortMultipartUpload  ← SDK 内部自动调用
+    │                 （清理 S3 端已上传的 Part）
+    │
+    └──► 错误返回给调用方
+```
+
+**第二级：进程崩溃 / SIGKILL 的盲区**
+
+如果在 `CreateMultipartUpload` 成功、`CompleteMultipartUpload` 成功之前进程崩溃：
+- SDK 内部的 `defer` 来不及执行
+- **S3 端残留 Incomplete Multipart Upload**（所有已上传 Part 永久存在）
+- ❌ **Filestash 无任何清理逻辑**
+
+**运维侧补救方案**：需要在 S3 Bucket 上配置 Lifecycle Rule：
+```json
+{
+  "Rule": {
+    "Filter": { "Prefix": "" },
+    "Status": "Enabled",
+    "AbortIncompleteMultipartUpload": {
+      "DaysAfterInitiation": 7
+    }
+  }
+}
+```
+
+#### 9.3.3 FTP Backend：部分 STOR 文件 + 重连丢数据风险
+
+**残留场景 1：STOR 中途断开**
+```
+client.Store(path, reader)
+    ├──► USER/PASS → PASV → STOR path
+    ├──► Data Socket Open
+    ├──► 写入 600MB 数据
+    └──► 连接断开（421 / 网络中断）
+         │
+         └──► FTP 服务端行为：
+              • 大多数服务器（vsftpd/proftpd）：保留已写 600MB 的临时文件
+              • 下次同路径 STOR 重新开始（覆盖）
+```
+
+**残留场景 2：Execute 自动重连的副作用** - `plg_backend_ftp/index.go:373-390`
+```go
+code := ftpErr.Code()
+if code == 421 || (code == 0 && err.Error() == "error reading response: EOF") {
+    f.Close()
+    FtpCache.Set(f.p, nil)
+    b, initErr := f.Init(f.p, &App{Context: f.ctx})
+    return b.(*Ftp).Execute(fn)   // ← 重新执行同一个 Store 函数
+}
+```
+
+**⚠️ 致命问题**：
+- 第一次 `client.Store(path, reader)` 已经消费了 reader 的前 600MB
+- 重连后再次调用 `client.Store(path, reader)`，reader 的 Read 位置无法回退
+- 结果：只上传了剩余 400MB → **文件缺失开头 600MB，永久损坏**
+- GC：损坏文件残留，无自动清理
+
+#### 9.3.4 Backblaze B2：整体上传模式，无中间残留
+
+**代码位置**：`server/plugin/plg_backend_backblaze/index.go:401-459`
+```go
+func (this Backblaze) Save(path string, file io.Reader) error {
+    // Step 1: b2_get_upload_url 获取上传 URL
+    // Step 2: 从 io.Reader 读 → HTTP POST 到 uploadUrl
+    res, err := this.requestWithSHA1(
+        "POST", resBody.UploadUrl, file,
+        map[string]string{
+            "Authorization":       resBody.Token,
+            "X-Bz-File-Name":      url.PathEscape(p.B2Path),
+            "Content-Type":        GetMimeType(p.B2Path),
+            "X-Bz-Content-Sha1":   sha,  // ← 整体 SHA1
+        }, totalSize,
+    )
+}
+```
+
+**残留特性**：
+- 一次性流式 POST，后端在 SHA1 校验通过前 **不暴露文件**
+- 中途断开：B2 服务端丢弃已接收数据，**无残留**
+- 进程崩溃：同上，无任何残留
+- ✅ GC 最干净
+
+#### 9.3.5 Azure Blob：UploadStream 的 Block Blob 自动管理
+
+**代码位置**：`server/plugin/plg_backend_azure/index.go:331-338`
+```go
+func (this *AzureBlob) Save(path string, file io.Reader) error {
+    _, err := this.client.UploadStream(
+        this.ctx, ap.containerName, ap.blobName, file, nil,
+    )
+    return err
+}
+```
+
+**残留特性**：
+- Azure SDK `UploadStream` 内部使用 Block Blob 分块（StageBlock + CommitBlockList）
+- 失败时 SDK 自动清理未提交的 Block
+- 进程崩溃：未提交 Block 在 7 天后被 Azure 自动 GC（服务端策略）
+- ✅ 后端自带 GC 兜底
+
+### 9.4 各 Backend 残留 GC 对比表
+
+| Backend | 残留类型 | 正常失败清理 | 进程崩溃残留 | GC 兜底机制 |
+|---------|---------|-------------|-------------|------------|
+| **Local** | 目标文件磁盘残留 | ❌ 保留已写部分 | ❌ 永久保留 | ❌ 无，需用户手动 |
+| **S3** | Incomplete Multipart | ✅ SDK 自动 Abort | ⚠️ 永久保留 Part | ⚠️ 需配置 Bucket Lifecycle |
+| **FTP** | 目标文件残留 / 损坏 | ⚠️ 保留部分内容 | ❌ 永久保留 | ❌ 依赖 FTP 服务端策略 |
+| **Backblaze** | 无残留 | ✅ 整体校验 | ✅ 无残留 | ✅ 服务端丢弃不完整数据 |
+| **Azure** | 未提交 Block | ✅ SDK 清理 | ✅ 7 天后 Azure 清 | ✅ Azure 服务端策略 |
+
+---
+
+## 十、多 Backend 并发上传的限流策略挂载点
+
+Filestash 的并发限流是 **多层分散式** 的，没有统一中央调度器，而是前端、HTTP 层、各 backend SDK 各自为政。
+
+### 10.1 限流层次全景图
+
+```
+           用户上传 N 个文件
+                  │
+       ┌──────────┴──────────┐
+       ▼                     ▼
+【前端限流】MAX_WORKERS=4   多标签页/多用户并发
+  (per-browser 槽位)           │
+       │                    │
+       └──────┬─────────────┘
+              ▼
+       【HTTP层限流】RateLimiter (全局令牌桶: 10/s, 突发1000)
+              │
+              ▼
+       FileSave 路由 (无并发上限)
+              │
+    ┌─────────┼──────────┬───────────────┐
+    ▼         ▼          ▼               ▼
+【S3并发】  【FTP并发】 【Local并发】   【其他 Backend】
+ threadSize  ConnectionsPerHost   无限制      各自 SDK 限制
+ (50 默认)    (默认5)
+    │           │              │
+    ▼           ▼              ▼
+ S3 SDK      FTP 连接池      OS write()
+ Uploader    (goftp)        (系统限制)
+ PartSize=5MB
+ Concurrency=5
+```
+
+### 10.2 Layer 1：前端上传池（per-browser）
+
+**代码位置**：`public/assets/pages/filespage/ctrl_upload.js:99-100,259-325`
+```javascript
+const MAX_WORKERS = 4;  // ← 硬编码，不读取后端 upload_pool_size 配置
+const reservations = new Array(MAX_WORKERS).fill(false);
+
+// 调度循环
+while (tasks.length > 0) {
+    const nworker = reservations.indexOf(false);
+    if (nworker === -1) break;     // 4 个槽位全满 → 等待
+    reservations[nworker] = true;
+    processWorkerQueue(nworker);   // 启动 worker
+}
+```
+
+**特性**：
+- 单浏览器实例最多 **4 个文件同时上传**（不分大小）
+- `MAX_WORKERS` 是硬编码，**不读取** 后端的 `upload_pool_size=15` 配置
+- 多标签页之间 **不共享** 槽位（每个标签页独立 4 个）
+
+### 10.3 Layer 2：HTTP API RateLimiter（全局）
+
+**代码位置**：`server/middleware/http.go:107-121`
+```go
+var limiter = rate.NewLimiter(10, 1000)  // ← 令牌桶：10/s 速率, 1000 突发容量
+
+func RateLimiter(fn HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        if limiter.Allow() == false {
+            Log.Warning("middleware::http::ratelimit too many requests")
+            SendErrorResult(res, NewError(..., http.StatusTooManyRequests))
+            return
+        }
+        fn(ctx, res, req)
+    })
+}
+```
+
+**挂载位置（routes.go）**：
+| 路由 | 是否挂载 RateLimiter |
+|------|---------------------|
+| `/api/session` (POST 登录) | ✅ |
+| `/admin/api/session` (POST) | ✅ |
+| **`/api/files/save`** (上传) | ❌ **未挂载** |
+| `/api/files/cat` (下载) | ❌ |
+| `/api/files/*` (其他) | ❌ |
+
+> **关键发现**：上传 API `/api/files/save` 和 `/api/files/cat` **没有** 挂 RateLimiter！令牌桶只保护登录接口。上传路径无全局 QPS 限制。
+
+### 10.4 Layer 3：S3 Backend 内部并发控制
+
+**两个维度的并发控制**：
+
+#### 维度 A：`threadSize` 参数（Rm/Mv 批量操作）
+
+**代码位置**：`server/plugin/plg_backend_s3/index.go:87-97,379-399`
+```go
+threadSize, err := strconv.Atoi(params["number_thread"])
+if err != nil {
+    threadSize = 50                    // ← 默认 50 个 goroutine
+} else if threadSize > 5000 || threadSize < 1 {
+    threadSize = 2
+}
+
+// 删除操作中的应用
+jobChan := make(chan S3Path, this.threadSize)
+errChan := make(chan error, this.threadSize)
+for i := 1; i <= this.threadSize; i++ {   // ← 启动 threadSize 个 worker
+    wg.Add(1)
+    go func() {
+        for spath := range jobChan {
+            client.DeleteObjectWithContext(ctx, ...)
+        }
+    }()
+}
+```
+
+- 只作用于 `Rm()`（递归删除）和 `Mv()`（目录移动）
+- **不影响 Save()**
+
+#### 维度 B：AWS SDK Uploader 的分片并发
+
+**代码位置**：S3 SDK `s3manager.Uploader` 默认参数
+```go
+uploader := s3manager.NewUploader(session)
+// Uploader 内部默认值：
+//   PartSize:       5 * 1024 * 1024    // 5MB 每片
+//   Concurrency:    5                   // 5 个 goroutine 并发传 part
+```
+
+**整体并发模型**：
+```
+1 个用户文件上传（S3 + 分片）
+    │
+    ├──► 前端 MAX_WORKERS 允许（4 个槽位之一）
+    │
+    ├──► HTTP 层：无 RateLimiter 限制
+    │
+    └──► s3manager.Uploader
+         ├── 从 io.PipeReader 读取
+         ├── 缓冲 5 × 5MB = 25MB 内存
+         └── 5 个并发 S3 PutPart 请求
+```
+
+**4 文件并行的总并发**：4 × 5 = 20 个并发 S3 PutPart 请求，内存占用至少 4 × 25MB = 100MB
+
+### 10.5 Layer 4：FTP Backend 连接池
+
+**代码位置**：`server/plugin/plg_backend_ftp/index.go:80-85,98-103`
+```go
+conn := 5   // 默认 5 个连接
+if params["conn"] != "" {
+    if i, err := strconv.Atoi(params["conn"]); err == nil && i > 0 {
+        conn = i
+    }
+}
+
+cfg := goftp.Config{
+    ConnectionsPerHost: conn,    // ← goftp SDK 连接池大小
+    Timeout:            timeout,
+    ...
+}
+client, err := goftp.DialConfig(cfg, hostname)
+```
+
+**特性**：
+- 同一 FTP backend（同用户+同主机）共享 `FtpCache`，所有 Save/Ls 操作竞争 `conn` 个连接
+- 示例：4 个文件同时上传 + 2 个 Ls 查询 → 竞争 5 个连接，形成自然限流
+
+### 10.6 Layer 5：`upload_pool_size` 配置（名存实亡）
+
+**配置定义**：`server/common/config.go:79,298,323`
+```go
+// 管理后台可配置
+FormElement{Name: "upload_pool_size", Type: "number", Default: 15, ...}
+
+// 反序列化
+UploadPoolSize int `json:"upload_pool_size"`
+
+// 读取
+UploadPoolSize: this.Get("general.upload_pool_size").Int(),
+```
+
+**实际使用**：全局 grep `UploadPoolSize` / `upload_pool_size`
+- 配置项被完整保存到 JSON、导出到前端 `/api/config`
+- ❌ **后端代码中没有任何地方实际使用 `Config.UploadPoolSize` 做并发控制**
+- ❌ **前端 `MAX_WORKERS` 也不读取此配置（硬编码 4）**
+- 结论：这是一个 **预留但未实现** 的配置项
+
+### 10.7 各 Backend 并发限流挂载点总结表
+
+| 限流层级 | 挂载点代码位置 | 控制对象 | 默认值 | 是否实际生效 |
+|---------|--------------|---------|--------|------------|
+| 前端上传池 | `ctrl_upload.js:99` | per-browser 文件数 | 4 | ✅ 生效 |
+| HTTP 令牌桶 | `middleware/http.go:107` | 全局 API QPS | 10/s | ⚠️ 只保护登录，不保护上传 |
+| S3 threadSize | `plg_backend_s3/index.go:89` | Rm/Mv 操作并发 | 50 | ✅ 仅删除/移动 |
+| S3 Uploader Concurrency | SDK 默认 | Save 的 Part 并发 | 5 | ✅ 内置生效 |
+| FTP ConnectionsPerHost | `plg_backend_ftp/index.go:81` | FTP 连接池 | 5 | ✅ 生效 |
+| Local I/O | 无代码 | 系统 write() | 无限制 | ❌ 直接穿透 |
+| upload_pool_size | `config.go:79` | 配置项 | 15 | ❌ 未接入实际代码 |
+
+---
+
+## 十一、关键文件索引
 
 | 文件 | 作用 | 核心行号 |
 |------|------|----------|
@@ -934,8 +1368,13 @@ FileSave() handler
 | `server/common/plugin.go` | Hooks 注册机制（AuthMiddleware 等） | 138-149 |
 | `server/common/constants.go` | TMP_PATH 等常量定义 | 20-56 |
 | `server/model/permissions.go` | CanEdit/CanUpload 权限判定 | 7-33 |
-| `server/plugin/plg_backend_local/index.go` | Local Backend Save 实现 | 124-134 |
-| `server/plugin/plg_backend_s3/index.go` | S3 Backend Save 实现（s3manager） | 569-587 |
-| `server/plugin/plg_backend_ftp/index.go` | FTP Backend Save + Execute 重连 | 363-399 |
+| `server/routes.go` | API 路由注册（RateLimiter 挂载点） | 53-68 |
+| `server/middleware/http.go` | RateLimiter 令牌桶实现 | 107-121 |
+| `server/common/constants.go` | 启动时 TMP_PATH 清理逻辑 | 54-55 |
+| `server/plugin/plg_backend_local/index.go` | Local Backend Save 实现（O_TRUNC 风险） | 124-134 |
+| `server/plugin/plg_backend_s3/index.go` | S3 Backend Save（s3manager）+ threadSize 控制 | 87-97, 569-587 |
+| `server/plugin/plg_backend_ftp/index.go` | FTP Backend Save + Execute 自动重连（丢数据风险） | 80-103, 363-399 |
+| `server/plugin/plg_backend_backblaze/index.go` | Backblaze Save（整体 SHA1 上传） | 401-459 |
+| `server/plugin/plg_backend_azure/index.go` | Azure Save（UploadStream Block Blob） | 331-338 |
 | `public/assets/pages/filespage/model_virtual_layer.js` | UI 虚拟文件层（loading 状态管理） | 全程 |
 | ↳ `save()` | 文件保存前后的 UI 状态切换 | 136-179 |
