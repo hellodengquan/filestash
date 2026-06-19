@@ -22,8 +22,11 @@ HTTP 请求 → 中间件链 → Controller (ctrl/)
 ## 目录
 
 - [2. 审计日志（操作记录）完整流程](#2-审计日志操作记录完整流程)
+  - [2.4.1 衔接点 7：审计 log 记录持久化与查询索引路径](#241-衔接点-7审计-log-记录持久化与查询索引路径)
   - [2.5 衔接点 1：Save 失败时审计日志如何落地、操作记录与失败结果对齐](#25-衔接点-1save-失败时审计日志如何落地操作记录与失败结果对齐)
+  - [2.6.1 衔接点 8：审计检索 API 支持的过滤条件、按时间分页实现](#261-衔接点-8审计检索-api-支持的过滤条件按时间分页实现)
 - [3. 配额 / 容量限制 完整流程](#3-配额--容量限制-完整流程)
+  - [3.2.1 衔接点 9：配额超限通知如何对接邮件 / Webhook / 消息总线](#321-衔接点-9配额超限通知如何对接邮件--webhook--消息总线)
   - [3.3.1 衔接点 3：大文件分块上传 mid-stream 配额检查与最终入库前二次校验](#331-衔接点-3大文件分块上传-mid-stream-配额检查与最终入库前二次校验)
   - [3.5 衔接点 2：同一用户多后端连接时容量限制的跨后端聚合路径](#35-衔接点-2同一用户多后端连接时容量限制的跨后端聚合路径)
   - [3.6 衔接点 4：TUS 断点续传已上传字节与配额对账、续传中途配额变化响应](#36-衔接点-4tus-断点续传已上传字节与配额对账续传中途配额变化响应)
@@ -158,6 +161,176 @@ for _, auth := range Hooks.Get.AuthorisationMiddleware() {
 - 启动 goroutine 监听 trigger channel
 - 创建 Job 并放入工作队列
 - worker 池异步执行关联的 Action（如发邮件、调用 API 等）
+
+### 2.4.1 衔接点 7：审计 log 记录持久化与查询索引路径
+
+#### 2.4.1.1 默认实现：无持久化
+
+核心框架**不提供审计日志的默认持久化存储**。`SimpleAudit`（`server/model/audit.go:58-75`）只是一个**占位符**：
+
+```go
+type SimpleAudit struct{}
+
+func (this SimpleAudit) Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error) {
+    return AuditQueryResult{
+        Form: &AuditForm,
+        RenderHTML: `<div id="alert-audit-missing">
+            You need to install an audit plugin to use this
+        </div>`,
+    }, nil
+}
+```
+
+打开管理后台的 Activity / Audit 页面，会看到红色提示框："You need to install an audit plugin to use this"。
+
+#### 2.4.1.2 已有的持久化存储体系（可复用但默认不用于审计）
+
+Filestash 核心自带一个 **SQLite 数据库**，在 `Onload` 中初始化（`server/model/index.go:12-38`）：
+
+```go
+var DB *sql.DB
+
+func init() {
+    Hooks.Register.Onload(func() {
+        if DB, err = sql.Open("sqlite3", GetAbsolutePath(DB_PATH)+"/share.sql?_fk=true"); err != nil { ... }
+    })
+}
+```
+
+但 `share.sql` 中**只有 3 张表**，都不用于审计：
+
+| 表名 | 用途 | 索引 |
+|------|------|------|
+| `Location(backend, path)` | 已共享的路径 | PRIMARY KEY(backend, path) |
+| `Share(id, related_backend, related_path, params, auth)` | 共享链接 | FOREIGN KEY → Location |
+| `Verification(key, code, expire)` | 邮箱验证码 | `idx_verification(code, expire)` |
+
+还有 Workflow 体系的表（在 `server/pkg/workflow/model/db.go` 中初始化）：
+
+| 表名 | 用途 | 索引 |
+|------|------|------|
+| `workflows(id, name, published, trigger, actions, created_at, updated_at)` | 工作流配置 | 无（按 name 匹配） |
+| `jobs(id, related_workflow, status, input, steps, retries, created_at, started_at, finished_at)` | 工作流执行记录 | 无 |
+
+**jobs 表是唯一接近"审计"的持久化记录**，但它：
+- 只记录 workflow job 的执行（不是所有文件操作）
+- input/steps 存 JSON，**没有结构化索引**
+- 没有按时间、用户、路径的专门索引
+
+#### 2.4.1.3 HTTP 访问日志的独立路径（Telemetry）
+
+与审计日志平行的是 HTTP 访问日志链（`server/middleware/telemetry.go`）：
+
+```go
+var telemetry = Telemetry{Data: make([]LogEntry, 0)}  // 内存 buffer
+
+type LogEntry struct {
+    Host       string  `json:"host"`
+    Method     string  `json:"method"`
+    RequestURI string  `json:"pathname"`
+    Status     int     `json:"status"`
+    Duration   float64 `json:"responseTime"`
+    Version    string  `json:"version"`
+    Backend    string  `json:"backend"`    // session["type"]
+    Share      string  `json:"share"`      // share.Id
+    Session    string  `json:"session"`    // GenerateID(ctx.Session)
+    RequestID  string  `json:"requestID"`  // X-Request-ID
+}
+```
+
+**Telemetry 的去向**（两个独立分支）：
+
+1. **内存 → 远端上报**：如果 `Config.Get("log.telemetry").Bool() == true`
+   - `telemetry.Record(point)` 追加到 `[]LogEntry` slice（有 `sync.Mutex` 保护）
+   - `telemetry.Flush()` 定时（或触发时）通过 HTTP POST 到 `https://downloads.filestash.app/event`
+   - 发送后清空 slice
+   - **这是遥测数据，不是审计日志，且上报到 Filestash 官方服务器**
+
+2. **本地日志文件**：如果 `Config.Get("log.enable").Bool() == true`
+   - 直接 `Log.Stdout("HTTP %3d %3s ...")` → 由 logger 写入 `LOG_PATH` 指定的文件
+   - 格式是纯文本行，无结构化，无索引
+
+**`/admin/api/logs` 接口**（`server/ctrl/admin.go:106-136`）读取的是这个本地日志文件：
+
+```go
+func FetchLogHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
+    file, _ := os.OpenFile(logpath, os.O_RDONLY, os.ModePerm)
+    maxSize := req.URL.Query().Get("maxSize")
+    if maxSize != "" {
+        // 从文件尾部向前读 maxSize 字节，遇到换行符停止
+    }
+    // 返回纯文本，不是 JSON
+}
+```
+
+这个接口**只支持 `maxSize`（倒序读取尾部 N 字节）**，**不支持按时间、用户、路径过滤**，也没有分页。
+
+#### 2.4.1.4 自定义审计插件需要自建存储
+
+一个完整的审计插件需要：
+
+```go
+type DBAuditPlugin struct{}
+
+func init() {
+    // 在 Onload 中初始化审计表
+    Hooks.Register.Onload(func() {
+        DB.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event       VARCHAR(32)     NOT NULL,
+            path        VARCHAR(2048)   NOT NULL,
+            target      VARCHAR(2048),
+            backend     VARCHAR(16)     NOT NULL,
+            session_id  VARCHAR(40)     NOT NULL,
+            user_id     VARCHAR(128),
+            share_id    VARCHAR(64),
+            request_id  VARCHAR(32)     NOT NULL,
+            status      VARCHAR(16)     DEFAULT 'PENDING',
+            error_msg   VARCHAR(1024),
+            created_at  DATETIME        DEFAULT CURRENT_TIMESTAMP,
+            finished_at DATETIME
+        )`)
+        // 建索引
+        DB.Exec(`CREATE INDEX idx_audit_event       ON audit_log(event)`)
+        DB.Exec(`CREATE INDEX idx_audit_created_at  ON audit_log(created_at)`)
+        DB.Exec(`CREATE INDEX idx_audit_user        ON audit_log(user_id, created_at)`)
+        DB.Exec(`CREATE INDEX idx_audit_session     ON audit_log(session_id, created_at)`)
+        DB.Exec(`CREATE INDEX idx_audit_path        ON audit_log(path)`)
+    })
+
+    // 注册为 AuthorisationMiddleware 来写入日志
+    Hooks.Register.AuthorisationMiddleware(DBAuditPlugin{})
+    // 注册为 AuditEngine 来提供查询
+    Hooks.Register.AuditEngine(DBAuditPlugin{})
+}
+
+// 写入（操作前 PENDING）
+func (this DBAuditPlugin) Save(ctx *App, path string) error {
+    DB.Exec(`INSERT INTO audit_log
+        (event, path, backend, session_id, user_id, share_id, request_id, status)
+        VALUES ('save', ?, ?, ?, ?, ?, ?, 'PENDING')`,
+        path, ctx.Session["type"], GenerateID(ctx.Session),
+        getUser(ctx.Session), ctx.Share.Id, ctx.Context.Value("X-Request-ID"))
+    return nil
+}
+
+// 查询（支持过滤与分页）
+func (this DBAuditPlugin) Query(ctx *App, p map[string]string) (AuditQueryResult, error) {
+    // 根据 p["date from"], p["date to"], p["action"], p["path"], ... 构造 WHERE 子句
+    // 用 LIMIT / OFFSET 分页
+    // 返回自定义的 RenderHTML 表格
+}
+```
+
+#### 2.4.1.5 无现成索引路径总结
+
+| 能力 | 核心框架默认 | 可复用体系 | 需自建 |
+|------|-------------|-----------|--------|
+| 审计日志持久化 | ❌ 无 | `share.sql` SQLite、Workflow `jobs` 表 | ✅ |
+| 查询索引 | ❌ 无 | `jobs` 表无专门索引、telemetry 无索引 | ✅ |
+| 按时间过滤 | ❌ 无 | 无（`/admin/api/logs` 只支持倒序 maxSize） | ✅ |
+| 分页 | ❌ 无 | 无 | ✅ |
+| 按用户/路径/后端/操作类型过滤 | ❌ 无 | Workflow `FindWorkflows` 有 trigger 过滤但不是审计表 | ✅ |
 
 ### 2.5 衔接点 1：Save 失败时审计日志如何落地、操作记录与失败结果对齐
 
@@ -294,7 +467,159 @@ func FetchAuditHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
 - 查询 `GET /admin/api/audit?action=xxx&path=xxx&...`
 - 渲染插件返回的 Form 和 HTML
 
-### 2.6 审计 Form 支持的查询字段
+### 2.6.1 衔接点 8：审计检索 API 支持的过滤条件、按时间分页实现
+
+#### 2.6.1.1 框架层：纯透传，无过滤逻辑
+
+框架层的 `FetchAuditHandler`（`server/ctrl/admin.go:138-158`）**完全透明地把 URL query 参数透传给插件**：
+
+```go
+searchParams := map[string]string{}
+for key, element := range _get {
+    if len(element) == 0 { continue }
+    searchParams[key] = element[0]
+}
+result, err := plg.Query(ctx, searchParams)
+```
+
+**框架本身不做任何参数验证、SQL 构造、分页、索引选择**——所有逻辑完全由 `IAuditPlugin.Query()` 实现决定。
+
+#### 2.6.1.2 前端表单参数 → URL query 的映射
+
+前端 `ctrl_activity_audit.js:48-65` 中的逻辑：
+
+```javascript
+// 每次表单字段变化（防抖 1s 后）
+const formData = new FormData($form);
+const p = new URLSearchParams();
+for (const [key, value] of formData.entries()) {
+    if (!value) continue;
+    // 表单字段名格式是 "search.date from" / "search.action" 等
+    // 去掉 "search." 前缀后作为 query key
+    p.set(key.replace(new RegExp("^search\."), ""), `${value}`);
+}
+// GET /admin/api/audit?date+from=xxx&action=save&path=%2Fdata...
+```
+
+**框架定义的表单字段**（`server/model/audit.go:11-56`）对应以下过滤条件：
+
+| 表单字段 (FormElement.Name) | URL Query Key | 前端类型 | 说明 |
+|----------------------------|---------------|----------|------|
+| `search.date from` | `date from` | `datetime` | 起始时间 |
+| `search.date to` | `date to` | `datetime` | 结束时间 |
+| `search.action` | `action` | `select` | 操作类型：`rename`/`list`/`download`/`create_folder`/`remove`/`move`/`save_file`/`create_file` |
+| `search.path` | `path` | `text` | 源路径（模糊匹配） |
+| `search.backend` | `backend` | `text` | 后端类型（如 sftp/s3/local） |
+| `search.session` | `session` | `text` | 会话 ID（= GenerateID(ctx.Session)） |
+| `search.share` | `share` | `text` | 共享链接 ID（= Share.Id） |
+| `search.user` | `user` | `text` | 用户标识 |
+| `search.target` | `target` | `text` | 目标路径（rename/move 时的目标） |
+
+**注意**：框架不校验这些值的格式，比如 `date from` 传非法字符串也会原样透传给插件。
+
+#### 2.6.1.3 分页实现：完全缺失
+
+核心框架**不提供任何分页支持**：
+
+- URL 参数中**没有定义 `page`、`pageSize`、`limit`、`offset`、`cursor` 等字段**
+- 前端 `AuditForm` 中没有分页控件字段
+- 后端 `FetchAuditHandler` 不处理分页参数
+- `AuditQueryResult` struct（`server/common/types.go:68-71`）只有 `Form *Form` 和 `RenderHTML string`，**没有 `total`、`pages`、`hasNext` 等元数据**
+
+前端唯一的分页行为是：**表单变化时重新拉取全量数据**（通过 `rxjs.debounceTime(1000)` 防抖），完全靠插件渲染的 HTML 自己实现滚动/分页 UI。
+
+#### 2.6.1.4 时间范围过滤：也完全缺失
+
+虽然表单提供了 `date from` / `date to` 两个 `datetime` 字段，但：
+
+- 框架不校验时间格式
+- 框架不保证这两个值一定会被 `SimpleAudit` 使用（`SimpleAudit` 忽略所有参数，直接返回提示 HTML）
+- 时间参数传值格式由浏览器 `datetime` input 决定（ISO 8601 字符串如 `2026-06-20T15:30`），但**后端没有解析逻辑**，完全依赖自定义插件解析
+
+#### 2.6.1.5 完整的自定义分页 + 时间过滤实现示例
+
+```go
+// DBAuditPlugin.Query 的完整实现
+func (this DBAuditPlugin) Query(ctx *App, p map[string]string) (AuditQueryResult, error) {
+    // 1. 解析过滤条件
+    where := []string{}
+    args := []interface{}{}
+
+    if v, ok := p["date from"]; ok && v != "" {
+        where = append(where, "created_at >= ?")
+        t, _ := time.Parse(time.RFC3339, v)
+        args = append(args, t.UTC().Format("2006-01-02 15:04:05"))
+    }
+    if v, ok := p["date to"]; ok && v != "" {
+        where = append(where, "created_at <= ?")
+        t, _ := time.Parse(time.RFC3339, v)
+        args = append(args, t.UTC().Format("2006-01-02 15:04:05"))
+    }
+    if v, ok := p["action"]; ok && v != "" {
+        where = append(where, "event = ?")
+        args = append(args, v)
+    }
+    if v, ok := p["path"]; ok && v != "" {
+        where = append(where, "path LIKE ?")
+        args = append(args, "%"+v+"%")
+    }
+    if v, ok := p["user"]; ok && v != "" {
+        where = append(where, "user_id = ?")
+        args = append(args, v)
+    }
+    // ... action, backend, session, share, target 同理
+
+    // 2. 解析分页参数（插件自定义，不在 Form 定义中）
+    page := 1
+    pageSize := 50
+    if v, ok := p["page"]; ok { page, _ = strconv.Atoi(v) }
+    if v, ok := p["pageSize"]; ok { pageSize, _ = strconv.Atoi(v) }
+    if page < 1 { page = 1 }
+    if pageSize > 500 { pageSize = 500 }
+    offset := (page - 1) * pageSize
+
+    // 3. 查总数（用于分页控件显示）
+    var total int
+    countSQL := `SELECT COUNT(*) FROM audit_log`
+    if len(where) > 0 {
+        countSQL += " WHERE " + strings.Join(where, " AND ")
+    }
+    DB.QueryRow(countSQL, args...).Scan(&total)
+
+    // 4. 查数据（用 created_at DESC 倒序，借助 idx_audit_created_at 索引）
+    querySQL := `SELECT id, event, path, target, backend, user_id, status, created_at
+        FROM audit_log`
+    if len(where) > 0 {
+        querySQL += " WHERE " + strings.Join(where, " AND ")
+    }
+    querySQL += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    args = append(args, pageSize, offset)
+
+    rows, err := DB.Query(querySQL, args...)
+    // ... 渲染成 RenderHTML 表格
+}
+```
+
+#### 2.6.1.6 两种返回结果的路径对照
+
+| 数据接口 | 路径 | 过滤能力 | 分页 | 结构化 |
+|----------|------|---------|------|--------|
+| `GET /admin/api/audit` | `FetchAuditHandler` → `IAuditPlugin.Query()` | 9 个字段（插件实现） | ❌ 无（需自建） | ❌ 返回 HTML，不是 JSON |
+| `GET /admin/api/logs` | `FetchLogHandler` → 读本地日志文件 | 仅 `maxSize`（倒序尾部 N 字节） | ❌ 无 | ❌ 返回纯文本 |
+| Workflow `GET /admin/api/workflow/{id}` | 管理后台看 Job History | 仅按 `related_workflow` 过滤 | ❌ 取最近 3000 条 | ✅ JSON |
+
+**Workflow Job History**（`server/pkg/workflow/model/workflow.go:103-136`）是唯一有分页雏形的持久化查询：
+
+```sql
+SELECT COALESCE(JSON_GROUP_ARRAY(JSON_OBJECT(...)), JSON_ARRAY()) FROM (
+    SELECT * FROM jobs j
+    WHERE j.related_workflow = w.id
+    ORDER BY j.created_at DESC
+    LIMIT 3000    -- 硬编码 LIMIT，没有 OFFSET / page 控制
+) j
+```
+
+### 2.7 审计 Form 支持的查询字段
 
 `server/model/audit.go:11-56` 定义了默认的搜索表单字段：
 
@@ -350,6 +675,265 @@ NFS4 错误码：`NFS4ERR_DQUOT = 69` 表示硬配额达到。
 #### Local 后端
 
 `plg_backend_local/index.go` 直接调用系统 API，配额由操作系统文件系统强制执行，错误会透传给上层。
+
+### 3.2.1 衔接点 9：配额超限通知如何对接邮件 / Webhook / 消息总线
+
+#### 3.2.1.1 核心设计：配额超限本身不触发通知
+
+**默认逻辑中，配额超限错误不会触发任何通知回调链**。
+
+`Backend.Save()` 返回 `ErrQuotaExceeded` → `FileSave` 调用 `SendErrorResult(res, err)` → 返回 HTTP 4xx → 请求结束。
+
+整个流程中：
+- ❌ **没有专门的"配额超限事件"**（不同于文件操作事件）
+- ❌ 没有 Hook 点允许插件注册 `OnQuotaExceeded` 回调
+- ❌ 没有从错误响应中自动捕获配额错误并触发 workflow 的逻辑
+
+**要让配额超限产生通知，只能通过现有的 Workflow 体系间接实现**，有两条路径：
+
+#### 3.2.1.2 路径 A：通过 Workflow 自定义 Trigger + Condition
+
+用户在管理后台创建一个新的 Workflow：
+
+```
+Trigger: event (文件事件)
+Condition: event = "stat"  (对应 Save 操作)
+            AND path LIKE "/quota-sensitive/*"
+Action 1: run/api → 调用用户自建的配额检查服务（查询已用空间 + 预估本次大小）
+            如果配额够 → 无操作
+            如果配额不够 → 触发 Action 2
+Action 2: notify/email → 发通知给管理员
+```
+
+**这不是真正的"配额超限触发"**，因为 Workflow 的 event trigger 是在 `auth.Save()` 时（操作前）触发的，此时 Backend.Save 还没执行，根本不知道会不会超限。
+
+所以这种方式只能做**预检查通知**（"你要传的文件太大了"），做不到**真实超限通知**（"后端说配额不够了"）。
+
+#### 3.2.1.3 路径 B：自定义 Middleware 捕获响应状态（真正的超限通知）
+
+通过自定义 Middleware 包裹所有上传请求，在响应已经写入后检查是否有配额错误：
+
+```go
+type QuotaNotifier struct{}
+
+func (this QuotaNotifier) Middleware(next HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        // 只处理上传路径
+        if req.URL.Path != "/api/files/save" {
+            next(ctx, res, req)
+            return
+        }
+
+        next(ctx, res, req)
+
+        // 检查响应状态码
+        rw, ok := res.(*middleware.ResponseWriter)
+        if !ok || rw.Status() < 400 {
+            return
+        }
+
+        // 检查响应体中是否包含配额错误消息
+        // 注意：需要缓存响应体才能读取，这里省略缓存逻辑
+        body := getResponseBody(rw)
+        if !strings.Contains(body, "Quota exceeded") &&
+           !strings.Contains(body, "No space left") &&
+           !strings.Contains(body, "NFS4ERR_DQUOT") {
+            return
+        }
+
+        // 触发通知
+        user := getUser(ctx.Session)
+        backend := ctx.Session["type"]
+        path := req.URL.Query().Get("path")
+
+        // 方式 1：直接发邮件
+        go this.sendEmail(user, backend, path, body)
+
+        // 方式 2：调 Webhook
+        go this.callWebhook(map[string]string{
+            "type":      "quota_exceeded",
+            "user":      user,
+            "backend":   backend,
+            "path":      path,
+            "timestamp": time.Now().UTC().Format(time.RFC3339),
+        })
+
+        // 方式 3：写入消息总线（通过事件总线）
+        go workflow.TriggerEvents(quotaEventChannel, "quota_event",
+            workflow.TriggerCallback(func(p map[string]string) bool {
+                return true
+            }))
+    })
+}
+
+func init() {
+    Hooks.Register.Middleware(QuotaNotifier{}.Middleware)
+}
+```
+
+#### 3.2.1.4 现成的通知机制：Workflow Action
+
+Filestash 内置了 3 种 Workflow Action（`server/pkg/workflow/actions/`），可以通过 Trigger 调用：
+
+##### Action 1：`notify/email`（`actions/notify_email.go`）
+
+```go
+type ActionNotifyEmail struct{}
+
+func (this *ActionNotifyEmail) Manifest() WorkflowSpecs {
+    return WorkflowSpecs{
+        Name:  "notify/email",
+        Specs: Form{Elmnts: []FormElement{
+            {Name: "email",   Type: "text"},
+            {Name: "subject", Type: "text"},
+            {Name: "message", Type: "long_text"},
+        }},
+    }
+}
+
+func (this *ActionNotifyEmail) Execute(params, input map[string]string) (map[string]string, error) {
+    // 从全局配置读 SMTP 参数
+    email := struct {
+        Hostname: Config.Get("email.server").String()
+        Port:     Config.Get("email.port").Int()
+        Username: Config.Get("email.username").String()
+        Password: Config.Get("email.password").String()
+        From:     Config.Get("email.from").String()
+        // 以下支持从 input 变量模板渲染
+        To:      Render(params["email"], input)
+        Subject: Render(params["subject"], input)
+        Message: Render(params["message"], input)
+    }{}
+    m := gomail.NewMessage()
+    m.SetHeader("From", email.From)
+    m.SetHeader("To", email.To)
+    m.SetBody("text/html", strings.ReplaceAll(email.Message, "\n", "<br>"))
+    mail := gomail.NewDialer(email.Hostname, email.Port, email.Username, email.Password)
+    return input, mail.DialAndSend(m)
+}
+```
+
+**SMTP 配置来源**：`server/common/config.go` 中预定义了 `email.server` / `email.port` / `email.username` / `email.password` / `email.from` 配置项，管理员在后台配置。
+
+##### Action 2：`run/api`（`actions/run_api.go`）
+
+```go
+type RunApi struct{}
+
+func (this *RunApi) Execute(params, input map[string]string) (map[string]string, error) {
+    // params.url / params.method / params.headers / params.body
+    // 都支持用 {{变量名}} 模板从 input 渲染
+    req, _ := http.NewRequest(
+        params["method"],
+        Render(params["url"], input),
+        bytes.NewBufferString(Render(params["body"], input)))
+
+    // headers 按行解析，每行 "Key: Value"
+    for _, header := range strings.Split(Render(params["headers"], input), "\n") {
+        if parts := strings.SplitN(strings.TrimSpace(header), ":", 2); len(parts) == 2 {
+            req.Header.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+        }
+    }
+    if strings.Contains("POST/PUT/PATCH", params["method"]) {
+        req.Header.Set("Content-Type", "application/json")
+    }
+    resp, err := HTTP.Do(req)
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        return input, NewError(fmt.Sprintf("received status code is %d", resp.StatusCode), resp.StatusCode)
+    }
+    // 把响应体放到 output["http::response"] 供后续步骤使用
+    output["http::status"] = string(resp.StatusCode)
+    output["http::response"] = string(responseBody)
+    return output, nil
+}
+```
+
+这就是**Webhook** 能力。任何 URL 都可以调。
+
+##### Action 3：`tools/debug`（`actions/tools_debug.go`）
+
+```go
+func (this *ToolsDebug) Execute(params, input map[string]string) (map[string]string, error) {
+    Log.Info("[workflow] action=tools/debug input=%v", input)
+    return input, nil
+}
+```
+
+只是把 input 打到日志，用来调试 workflow 触发时的变量。
+
+#### 3.2.1.5 变量模板渲染机制
+
+`notify/email` 和 `run/api` 中的 `To/Subject/Message/URL/Body/Headers` 都通过 `Render(template, variables)` 处理（`actions/utils.go:7-13`）：
+
+```go
+func Render(templateText string, variables map[string]string) string {
+    rendered, err := TmplExec(templateText, TmplParams(variables))
+    if err != nil {
+        return templateText
+    }
+    return rendered
+}
+```
+
+`TmplExec` 支持 `{{event}}`、`{{path}}`、`{{user}}` 等变量替换，变量来源于 **workflow job input**（即 `fileactionCallback(params)` 返回的 map）。
+
+#### 3.2.1.6 文件事件回调的 input 内容
+
+`fileactionCallback`（`pkg/workflow/trigger/fileaction.go`）返回的 input 变量包含：
+
+```go
+fileactionCallback(params map[string]string) TriggerCallback {
+    return func(p map[string]interface{}) bool {
+        // 匹配：p["event"] == params["event"] && p["path"] ~= params["path"]
+        // 然后发布时，p 就是 job 的 input，包含：
+        //   event  = "ls" / "cat" / "mkdir" / "rm" / "mv" / "stat" / "touch" / "save"
+        //   path   = 操作路径
+        //   target = 目标路径（仅 mv 事件有）
+        //   以及 ctx.Session 中的 user/username 等（取决于自定义 AuthorisationMiddleware）
+    }
+}
+```
+
+在 workflow 的 Action 中可以用 `{{event}}`、`{{path}}`、`{{target}}` 引用这些变量。
+
+#### 3.2.1.7 完整配额超限通知回调链（自定义方案）
+
+```
+用户上传 POST /api/files/save
+    │
+    ▼
+QuotaNotifier Middleware
+    │
+    ▼
+auth.Save(ctx, path)
+    ├─ processFileAction() → TriggerEvents(event trigger)
+    │   └─ 如果配置了 event workflow → 创建 job → worker 池异步执行
+    │       ├─ Action 1: run/api → POST 到自建配额检查服务
+    │       │   Body: {"path": "{{path}}", "user": "{{user}}"}
+    │       │   Response: {"quota": {"used": 98GB, "limit": 100GB}}
+    │       ├─ Action 2: notify/email → Subject: "即将达到配额"
+    │       └─ Action 3: run/api → POST 到 Slack/钉钉/消息总线
+    │
+    ▼
+ctx.Backend.Save(path, reader) → 返回 ErrQuotaExceeded
+    │
+    ▼
+SendErrorResult(res, 403, "Quota exceeded")
+    │
+    ▼
+QuotaNotifier Middleware (after next())
+    ├─ 检查 status=403 且 body 含 "Quota exceeded"
+    └─ 异步通知：
+        ├─ notify/email → admin@example.com
+        ├─ run/api → POST 到 Slack Incoming Webhook
+        │   {
+        │     "text": "用户 alice 在 SFTP backend 上传 /data/report.csv
+        │             时配额超限，已用 98GB/100GB"
+        │   }
+        └─ run/api → POST 到内部消息总线 /kafka/quota-topic
+```
+
+**总结：配额超限通知没有专门的 Hook，需要靠自定义 Middleware 拦截响应状态，或者靠 Workflow 做预检查通知。邮件和 Webhook 功能已经由 `notify/email` 和 `run/api` 两个内置 Workflow Action 提供。**
 
 ### 3.3 应用层：上传相关限制
 
@@ -1311,37 +1895,43 @@ func (b *QuotaBackend) Save(path string, r io.Reader) error {
 
 | 文件路径 | 作用 |
 |----------|------|
-| `server/common/types.go` | `IAuditPlugin`、`IAuthorisation`、`IBackend` 接口定义 |
-| `server/common/plugin.go` | Hook 注册/获取机制（`Onload`/`OnQuit`/`OnConfig`/`Middleware`） |
+| `server/common/types.go` | `IAuditPlugin`、`IAuthorisation`、`IBackend`、`IAction`、`ITrigger` 接口定义 |
+| `server/common/plugin.go` | Hook 注册/获取机制（`Onload`/`OnQuit`/`OnConfig`/`Middleware`/`WorkflowAction`） |
 | `server/common/backend.go` | Backend Driver 注册与获取 |
-| `server/common/config.go` | 配置定义（上传并发、分块等） |
+| `server/common/config.go` | 配置定义（上传并发、分块、SMTP 参数等） |
 | `server/common/config_state.go` | 配置文件加载/保存，`Onload` 中设置文件权限 |
 | `server/common/crypto.go` | `GenerateID()` 实现，按后端连接生成唯一标识 |
 | `server/common/cache.go` | `AppCache` 实现（底层 `go-cache`），`NewAppCache`/`OnEvict` |
 | `server/common/utils.go` | 通用工具函数 |
-| `server/model/audit.go` | 默认 `SimpleAudit` 实现、AuditForm 定义 |
+| `server/model/audit.go` | 默认 `SimpleAudit` 实现、`AuditForm` 搜索表单定义 |
 | `server/model/files.go` | `NewBackend` 连接白名单检查 |
 | `server/model/index.go` | `Onload` 初始化 SQLite DB（Share/Location/Verification 表） |
 | `server/model/permissions.go` | `CanRead/CanEdit/CanUpload/CanShare` 权限函数 |
 | `server/ctrl/files.go` | 文件操作 Controller，TUS 分块上传实现，`chunkedUploadCache` |
-| `server/ctrl/admin.go` | `FetchAuditHandler` 审计查询 Handler |
-| `server/routes.go` | 路由注册，`/admin/api/audit` 端点 |
+| `server/ctrl/admin.go` | `FetchAuditHandler` 审计查询、`FetchLogHandler` 本地日志读取 |
+| `server/routes.go` | 路由注册，`/admin/api/audit`、`/admin/api/logs` 端点 |
 | `server/middleware/index.go` | `NewMiddlewareChain` 中间件组装，`logger()` 调用点 |
 | `server/middleware/session.go` | `SessionStart`，`_extractBackend` 初始化，多 cookie 管理 |
-| `server/middleware/telemetry.go` | HTTP 访问日志记录（LogEntry、RequestID 生成） |
+| `server/middleware/telemetry.go` | HTTP 访问日志记录（LogEntry、Telemetry、RequestID 生成、Flush 上报） |
 | `server/pkg/workflow/index.go` | Workflow 初始化、worker 池、Job 执行 |
 | `server/pkg/workflow/job.go` | `ExecuteJob`，Job 状态流转 |
+| `server/pkg/workflow/action.go` | `ExecuteAction` 分发、`findAction` 查找注册的 IAction |
+| `server/pkg/workflow/actions/notify_email.go` | `notify/email` Action，SMTP 邮件发送（gomail） |
+| `server/pkg/workflow/actions/run_api.go` | `run/api` Action，Webhook/API 调用 |
+| `server/pkg/workflow/actions/tools_debug.go` | `tools/debug` Action，日志输出 |
+| `server/pkg/workflow/actions/utils.go` | `Render()` 模板变量渲染 |
+| `server/pkg/workflow/model/workflow.go` | `FindWorkflows`、`AllWorkflows`、`GetWorkflow`（含 3000 条 Job History） |
 | `server/pkg/workflow/model/job.go` | `CreateJob`、`NextJob`、`UpdateJob`，Job 持久化 |
-| `server/pkg/workflow/trigger/fileaction.go` | ★ `hookAuthorisation` 审计触发核心 |
+| `server/pkg/workflow/trigger/fileaction.go` | ★ `hookAuthorisation` 审计触发核心，`fileactionCallback` 变量匹配 |
 | `server/pkg/workflow/trigger/index.go` | `TriggerEvents` 事件分发 |
 | `server/plugin/index.go` | 所有后端/认证插件的导入入口（编译时确定） |
 | `server/plugin/plg_starter_http/index.go` | HTTP Server 启动，`Shutdown()` 优雅关闭 |
 | `server/plugin/plg_authorisation_example/index.go` | 授权中间件示例 |
 | `server/plugin/plg_backend_local/index.go` | Local 后端实现（配额靠 OS） |
-| `server/plugin/plg_backend_sftp/index.go` | SFTP 后端（配额错误码映射） |
+| `server/plugin/plg_backend_sftp/index.go` | SFTP 后端（配额错误码映射 14→No space / 15→Quota exceeded） |
 | `server/plugin/plg_widget_recent/index.go` | `getUser()` 实现示例，`GenerateID` 使用示例 |
 | `server/plugin/plg_widget_favourite/index.go` | `OnConfig` 钩子使用示例（UI 补丁切换） |
 | `server/plugin/plg_widget_description/utils.go` | 另一个 `getUser()` 实现示例 |
 | `server/plugin/plg_metadata_sqlite/index.go` | `tenantID` 使用示例，按后端连接隔离 |
-| `public/assets/pages/adminpage/model_audit.js` | 前端审计查询模型 |
-| `public/assets/pages/adminpage/ctrl_activity_audit.js` | 前端审计页面控制器 |
+| `public/assets/pages/adminpage/model_audit.js` | 前端审计查询模型（`ajax GET admin/api/audit`） |
+| `public/assets/pages/adminpage/ctrl_activity_audit.js` | 前端审计页面控制器（表单防抖、URL query 组装、HTML 渲染） |
