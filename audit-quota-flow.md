@@ -26,6 +26,9 @@ HTTP 请求 → 中间件链 → Controller (ctrl/)
 - [3. 配额 / 容量限制 完整流程](#3-配额--容量限制-完整流程)
   - [3.3.1 衔接点 3：大文件分块上传 mid-stream 配额检查与最终入库前二次校验](#331-衔接点-3大文件分块上传-mid-stream-配额检查与最终入库前二次校验)
   - [3.5 衔接点 2：同一用户多后端连接时容量限制的跨后端聚合路径](#35-衔接点-2同一用户多后端连接时容量限制的跨后端聚合路径)
+  - [3.6 衔接点 4：TUS 断点续传已上传字节与配额对账、续传中途配额变化响应](#36-衔接点-4tus-断点续传已上传字节与配额对账续传中途配额变化响应)
+  - [3.7 衔接点 5：插件热替换/reload 时正在进行的上传处理与资源回收](#37-衔接点-5插件热替换reload-时正在进行的上传处理与资源回收)
+  - [3.8 衔接点 6：同一用户同时对多个后端写入的资源与计数协调](#38-衔接点-6同一用户同时对多个后端写入的资源与计数协调)
 - [4. 后端插件与审计/配额的衔接机制](#4-后端插件与审计配额的衔接机制)
 - [5. 关键文件索引](#5-关键文件索引)
 
@@ -719,6 +722,420 @@ func CookieName(idx int) string {
 
 当用户切换后端时，`SessionStart` 中间件会从对应 cookie 中解密出 session map，`GenerateID(ctx.Session)` 就会生成对应后端连接的 ID。
 
+### 3.6 衔接点 4：TUS 断点续传已上传字节与配额对账、续传中途配额变化响应
+
+#### 3.6.1 已上传字节的状态存储
+
+TUS 断点续传的中间状态**完全在内存中**，没有持久化。上传进度存储在 `chunkedUploadCache`（`server/ctrl/files.go:477`）：
+
+```go
+var chunkedUploadCache AppCache
+```
+
+`AppCache`（`server/common/cache.go:51-63`）底层使用 `patrickmn/go-cache`：
+
+```go
+func NewAppCache(arg ...time.Duration) AppCache {
+    var retention time.Duration = 5
+    var cleanup time.Duration = 10
+    if len(arg) > 0 {
+        retention = arg[0]
+        if len(arg) > 1 {
+            cleanup = arg[1]
+        }
+    }
+    c := AppCache{}
+    c.Cache = cache.New(retention*time.Minute, cleanup*time.Minute)
+    return c
+}
+```
+
+初始化时传入 `60*24, 1`（`files.go:688`），即 **retention = 1440 分钟 = 24 小时**，cleanup 间隔 = 1 分钟。
+
+这意味着：
+- **已上传字节偏移量只在内存中**，通过 `chunkedUpload.Meta()` 返回 `(offset, size)`
+- 如果进程重启，所有进行中的上传状态丢失
+- 客户端必须重新 `POST` 创建新的上传会话
+
+#### 3.6.2 续传时的对账机制
+
+客户端续传通过 `HEAD` 请求查询当前 offset（`files.go:554-567`）：
+
+```go
+if proto == "tus" && req.Method == http.MethodHead {
+    c := chunkedUploadCache.Get(cacheKey)
+    if c == nil {
+        SendErrorResult(res, ErrNotFound)  // 会话已过期/丢失
+        return
+    }
+    offset, length := c.(*chunkedUpload).Meta()
+    h.Set("Upload-Offset", fmt.Sprintf("%d", offset))
+    h.Set("Upload-Length", fmt.Sprintf("%d", length))
+    res.WriteHeader(http.StatusNoContent)
+}
+```
+
+**核心问题：offset 来自内存，不是来自后端存储**
+
+```
+客户端 HEAD /api/files/save?path=xxx
+    → Upload-Offset: 5242880  (来自 chunkedUpload.offset)
+    → Upload-Length: 10485760
+
+但后端存储上该文件可能已经有 5242880 字节（正常）、
+也可能只有 2097152 字节（中途 pipe 断开但部分数据已 flush）
+→ 内存 offset 与后端实际写入量不对账
+```
+
+**代码中没有**：
+- 向后端 `Stat()` 查询文件实际大小来校验 offset
+- 比对 `Upload-Offset` 与后端实际文件大小
+- offset 漂移的自动修正
+
+#### 3.6.3 续传中途配额变化的响应
+
+当配额在续传期间发生变化（如管理员调整了 SFTP 配额、其他用户占满了共享空间），Filestash 的响应完全依赖后端的即时行为：
+
+**场景 1：PATCH 过程中后端返回配额错误**
+
+`uploader.Next(reader)` → `io.Copy(this.stream, body)` → 数据通过 pipe 流入后台 `save()` goroutine → 后端写入时返回 quota exceeded → pipe 读端关闭 → `io.Copy` 收到 `io.ErrClosedPipe` → 返回 403。
+
+这是**即时响应**，不需要额外代码。
+
+**场景 2：两次 PATCH 之间配额变化**
+
+两次 PATCH 之间，没有配额预检查。下一个 PATCH 的数据会直接流入 pipe，后端在写入时才会发现配额不足。
+
+```
+PATCH #3 完成 → offset=6MB → 客户端暂停
+                    ↓
+    此时管理员将配额从 10MB 降到 5MB
+                    ↓
+PATCH #4 开始 → io.Copy → save() 写入 → 后端返回 quota exceeded → 403
+```
+
+**代码中没有**：
+- PATCH 请求开始时的配额预检查
+- 两次 PATCH 之间的心跳/配额探测
+- 配额变化的通知机制
+
+#### 3.6.4 重复 POST 的处理
+
+如果客户端在已有进行中上传时再次发 `POST`，旧的上传会被强制终止（`files.go:569-571`）：
+
+```go
+if proto == "tus" && req.Method == http.MethodPost {
+    if c := chunkedUploadCache.Get(cacheKey); c != nil {
+        chunkedUploadCache.Del(cacheKey)  // 触发 OnEvict → Close() → 等待 save() 返回
+    }
+    // 创建新的上传会话
+}
+```
+
+但这里有一个**对账缺口**：`Del` 触发 `OnEvict`，`OnEvict` 会调用 `Close()`，`Close()` 会关闭 pipe 写端并等待 `save()` 返回。如果 `save()` 此时正在写入大量数据，`Close()` 会**阻塞等待**直到写入完成或出错。这段时间内新的 `createChunkedUploader` 中的 `b.Save(path, r)` 可能会与旧的 `save()` 产生**对同一文件的并发写入**，而后端的行为取决于具体实现（SFTP 会覆盖、S3 用 multipart 可能追加或冲突）。
+
+#### 3.6.5 自定义配额对账方案
+
+```go
+type QuotaReconciler struct{}
+
+func (this QuotaReconciler) Middleware(next HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        // 仅在 TUS PATCH 之前做配额预检查
+        if _, ok := req.Header["Tus-Resumable"]; ok && req.Method == http.MethodPatch {
+            path := req.URL.Query().Get("path")
+            // 1. 查询后端实际文件大小
+            if info, err := ctx.Backend.Stat(path); err == nil {
+                actualSize := info.Size()
+                // 2. 查询当前配额
+                quota := GetCurrentQuota(GenerateID(ctx.Session))
+                // 3. 如果已经超限，直接拒绝
+                if actualSize >= quota {
+                    SendErrorResult(res, NewError("Quota already exceeded", 400))
+                    return
+                }
+            }
+        }
+        next(ctx, res, req)
+    })
+}
+```
+
+### 3.7 衔接点 5：插件热替换/reload 时正在进行的上传处理与资源回收
+
+#### 3.7.1 Filestash 没有运行时插件热替换
+
+**核心结论：Filestash 不支持运行时插件热替换。** 所有插件通过 `init()` 在进程启动时注册（Go 语言的空白导入机制），注册后不可撤销、不可替换。
+
+`server/plugin/index.go:48-50`：
+
+```go
+func init() {
+    Hooks.Register.Onload(func() { Log.Debug("plugins loaded") })
+}
+```
+
+所有 `plg_*` 包通过空白导入在编译时确定，运行时无法动态加载新插件。
+
+#### 3.7.2 生命周期钩子
+
+`server/common/plugin.go` 提供了四个生命周期钩子：
+
+| 钩子 | 注册方法 | 调用时机 | 用途 |
+|------|----------|----------|------|
+| `Onload` | `Hooks.Register.Onload(fn)` | 进程启动后 | 初始化 DB、读取配置 |
+| `OnQuit` | `Hooks.Register.OnQuit(fn)` | 进程退出前 | 清理资源 |
+| `OnConfig` | `Hooks.Register.OnConfig(fn)` | 配置变更时 | 响应配置热更新 |
+| `Middleware` | `Hooks.Register.Middleware(fn)` | 每次请求时 | 插入自定义中间件 |
+
+**配置热更新**是唯一的"类热替换"机制。`OnConfig` 钩子在管理员通过 `/admin/api/config` 修改配置时触发：
+
+```go
+// server/common/plugin.go:286-294
+var configChange []func()
+
+func (this Register) OnConfig(fn func()) {
+    configChange = append(configChange, fn)
+}
+func (this Get) OnConfig() []func() {
+    return configChange
+}
+```
+
+现有插件用 `OnConfig` 做的事情很有限——主要是切换 UI 补丁（`StaticPatch`）：
+
+```go
+// plg_widget_favourite/index.go:26-32
+Hooks.Register.OnConfig(func() {
+    if PluginEnable() {
+        Hooks.Register.StaticPatch(PATCH, WithID("plg_widget_favourite"))
+    } else {
+        Hooks.Register.StaticPatch([]byte(""), WithID("plg_widget_favourite"))
+    }
+})
+```
+
+#### 3.7.3 进程重启（唯一的"热替换"方式）
+
+当需要更换后端插件时，必须重启整个 Filestash 进程。重启流程：
+
+```
+1. SIGTERM / SIGINT 到达
+2. 所有 Starter 注册的 HTTP Server 执行 ctx.Done()
+   → srv.Shutdown(context.Background())  // 优雅关闭 HTTP 监听
+   → 停止接受新连接，等待已有请求完成
+3. Hooks.Get.OnQuit() 执行清理回调
+4. 进程退出
+5. 新进程启动 → init() 注册新插件 → Hooks.Get.Onload() 初始化
+```
+
+#### 3.7.4 进程重启对进行中上传的影响
+
+**HTTP Server 的优雅关闭**（`plg_starter_http/index.go:25-35`）：
+
+```go
+go func() {
+    ensureAppHasBooted(...)
+    <-ctx.Done()
+    srv.Shutdown(context.Background())  // 等待已有请求完成
+}()
+```
+
+`http.Server.Shutdown()` 的行为：
+- 停止接受新连接
+- 等待已有请求处理完毕
+- **没有超时限制**（`Shutdown(context.Background())` 传了 `Background` ctx）
+
+但这对 TUS 分块上传有特殊影响：
+
+| 上传类型 | 优雅关闭时的影响 |
+|----------|------------------|
+| 普通上传 `POST /api/files/save` | 正常完成，因为 `ctx.Backend.Save()` 是同步的 |
+| TUS 上传 `POST`（创建会话） | 正常完成，只是创建了 pipe |
+| TUS 上传 `PATCH`（传输数据） | 正常完成当前 chunk |
+| TUS 上传的 pipe 后台 goroutine | ⚠️ **没有等待机制** |
+
+**关键缺陷**：`chunkedUploadCache` 中的 pipe 后台 goroutine（`go func() { done <- save(path, r) }()`）不在 HTTP 请求的生命周期内。`Shutdown()` 等待的是 HTTP handler 返回，但 pipe 的 `save()` goroutine 可能还在运行。
+
+当进程退出时：
+1. HTTP handler 已经返回（`PATCH` 请求已经发了 204 No Content）
+2. pipe 后台 goroutine 还在 `save(path, r)`
+3. 进程退出 → goroutine 被强制杀死 → **数据可能只写了一半**
+
+#### 3.7.5 缓存过期时的资源回收
+
+`chunkedUploadCache` 的 `OnEvict` 回调（`files.go:687-700`）：
+
+```go
+chunkedUploadCache = NewAppCache(60*24, 1)
+chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+    c := value.(*chunkedUpload)
+    if c == nil {
+        Log.Warning("ctrl::files::chunked::cleanup nil on close")
+        return
+    }
+    if err := c.Close(); err != nil {
+        Log.Warning("ctrl::files::chunked::cleanup action=close err=%s", err.Error())
+        return
+    }
+})
+```
+
+`Close()` 的行为（`files.go:721-728`）：
+
+```go
+func (this *chunkedUpload) Close() error {
+    this.stream.Close()       // 关闭 pipe 写端 → save() 会收到 io.EOF
+    err := <-this.done        // 等待 save() 返回
+    this.once.Do(func() {
+        close(this.done)      // 关闭 channel
+    })
+    return err
+}
+```
+
+这个回收机制在**正常过期**（24 小时无操作）时是完整的，但在**进程异常退出**时不生效。
+
+#### 3.7.6 缺失的优雅关闭方案
+
+```go
+// 需要在 OnQuit 中主动关闭所有进行中的上传
+func init() {
+    Hooks.Register.OnQuit(func() {
+        // 遍历 chunkedUploadCache 中的所有上传
+        // 对每个执行 Close() 并等待完成
+        // 设置超时避免无限等待
+    })
+}
+```
+
+但当前代码中 **没有任何插件注册了 `OnQuit` 钩子来处理上传清理**。搜索全代码库，`Hooks.Register.OnQuit` 没有任何调用方。
+
+### 3.8 衔接点 6：同一用户同时对多个后端写入的资源与计数协调
+
+#### 3.8.1 并发写入的架构支持
+
+Filestash 的多后端连接架构天然支持并发写入——每个后端连接有独立的 `IBackend` 实例、独立的 session、独立的 `AuthorisationMiddleware` 链。
+
+用户通过浏览器 Tab 1 写入 SFTP、Tab 2 写入 S3 时：
+
+```
+Tab 1: Cookie: auth=<sftp_session>
+    → SessionStart 解密 → ctx.Session = {type: "sftp", hostname: "...", ...}
+    → ctx.Backend = SFTPBackend{}
+    → auth.Save(ctx, path) → processFileAction() → TriggerEvents()
+    → ctx.Backend.Save(path, reader)
+
+Tab 2: Cookie: auth1=<s3_session>
+    → SessionStart 解密 → ctx.Session = {type: "s3", bucket: "...", ...}
+    → ctx.Backend = S3Backend{}
+    → auth.Save(ctx, path) → processFileAction() → TriggerEvents()
+    → ctx.Backend.Save(path, reader)
+```
+
+两个请求完全独立，各自走自己的 Backend，没有共享状态。
+
+#### 3.8.2 上传并发控制
+
+**前端并发控制**：`upload_pool_size`（默认 15）在前端控制同时上传的文件数：
+
+```go
+// server/common/config.go:79
+FormElement{Name: "upload_pool_size", Type: "number", Default: 15,
+    Description: "Maximum number of files upload in parallel. Default: 15"},
+```
+
+但这是**全局限制**，不是按后端或按用户的限制。前端上传代码（`ctrl_upload.js`）维护一个本地的并发池，所有后端共享。
+
+**后端没有并发控制**：`ctx.Backend.Save()` 是同步阻塞的，后端插件本身不做并发限制。
+
+#### 3.8.3 chunkedUploadCache 的隔离性
+
+cache key 的构成（`files.go:543-546`）：
+
+```go
+cacheKey := map[string]string{
+    "path":    path,
+    "session": GenerateID(ctx.Session),
+}
+```
+
+`GenerateID(ctx.Session)` 包含后端类型、hostname 等参数（`crypto.go:193-218`），所以：
+- 用户 A 写 SFTP `/data/file.txt` → cacheKey = hash({path: "/data/file.txt", session: "sftp_hash_1"})
+- 用户 A 写 S3 `/data/file.txt` → cacheKey = hash({path: "/data/file.txt", session: "s3_hash_2"})
+
+**不同后端的 TUS 上传完全隔离**，不会互相干扰。
+
+#### 3.8.4 资源竞争的潜在问题
+
+| 场景 | 是否有问题 | 说明 |
+|------|-----------|------|
+| 不同用户写不同后端 | ✅ 无问题 | 完全独立 |
+| 同一用户写不同后端 | ✅ 无问题 | session 不同，cache key 不同 |
+| 同一用户同一后端写不同路径 | ✅ 无问题 | path 不同，cache key 不同 |
+| 同一用户同一后端写同一路径 | ⚠️ 有风险 | 后端并发写入同文件的语义不确定 |
+
+**同一后端同一路径的并发写入**：如果用户在两个 Tab 同时上传同名文件到同一个 SFTP 服务器：
+
+1. 两次 `POST` 会创建两个 `chunkedUpload`，但 **cache key 相同**
+2. 第二个 `POST` 会执行 `chunkedUploadCache.Del(cacheKey)`，终止第一个上传
+3. 第一个上传的 `OnEvict` → `Close()` → 等待 `save()` 返回
+4. 然后创建新的 `chunkedUpload`，但此时 `save()` 可能还在写入旧数据
+
+这就是 3.6.4 节提到的**并发写入**问题，后端行为取决于具体实现。
+
+#### 3.8.5 计数协调的缺失
+
+框架中**没有跨后端的写入计数协调**：
+
+1. **没有全局写入计数器** - 不知道一个用户当前有多少个进行中的上传
+2. **没有写入速率限制** - 不限制单位时间内的写入请求
+3. **没有跨后端的资源汇总** - 不知道用户在所有后端的总带宽/存储使用量
+
+如果需要实现"用户总并发上传数不超过 N"或"用户总写入带宽不超过 X MB/s"，需要自定义 `Middleware`：
+
+```go
+type ConcurrencyLimiter struct {
+    mu       sync.Mutex
+    counters map[string]int  // userID → 当前并发上传数
+}
+
+func (this *ConcurrencyLimiter) Middleware(next HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        if req.Method != http.MethodPost && req.Method != http.MethodPatch {
+            next(ctx, res, req)
+            return
+        }
+        if _, ok := req.Header["Tus-Resumable"]; !ok {
+            next(ctx, res, req)
+            return
+        }
+
+        userID := getUser(ctx.Session)
+        maxConcurrency := 5
+
+        this.mu.Lock()
+        if this.counters == nil {
+            this.counters = make(map[string]int)
+        }
+        current := this.counters[userID]
+        if current >= maxConcurrency {
+            this.mu.Unlock()
+            SendErrorResult(res, NewError("Too many concurrent uploads", 429))
+            return
+        }
+        this.counters[userID] = current + 1
+        this.mu.Unlock()
+
+        next(ctx, res, req)
+
+        this.mu.Lock()
+        this.counters[userID]--
+        this.mu.Unlock()
+    })
+}
+```
+
 ---
 
 ## 4. 后端插件与审计/配额的衔接机制
@@ -895,15 +1312,18 @@ func (b *QuotaBackend) Save(path string, r io.Reader) error {
 | 文件路径 | 作用 |
 |----------|------|
 | `server/common/types.go` | `IAuditPlugin`、`IAuthorisation`、`IBackend` 接口定义 |
-| `server/common/plugin.go` | Hook 注册/获取机制（`Hooks.Register.*` / `Hooks.Get.*`） |
+| `server/common/plugin.go` | Hook 注册/获取机制（`Onload`/`OnQuit`/`OnConfig`/`Middleware`） |
 | `server/common/backend.go` | Backend Driver 注册与获取 |
 | `server/common/config.go` | 配置定义（上传并发、分块等） |
+| `server/common/config_state.go` | 配置文件加载/保存，`Onload` 中设置文件权限 |
 | `server/common/crypto.go` | `GenerateID()` 实现，按后端连接生成唯一标识 |
+| `server/common/cache.go` | `AppCache` 实现（底层 `go-cache`），`NewAppCache`/`OnEvict` |
 | `server/common/utils.go` | 通用工具函数 |
 | `server/model/audit.go` | 默认 `SimpleAudit` 实现、AuditForm 定义 |
 | `server/model/files.go` | `NewBackend` 连接白名单检查 |
+| `server/model/index.go` | `Onload` 初始化 SQLite DB（Share/Location/Verification 表） |
 | `server/model/permissions.go` | `CanRead/CanEdit/CanUpload/CanShare` 权限函数 |
-| `server/ctrl/files.go` | 文件操作 Controller，TUS 分块上传实现 |
+| `server/ctrl/files.go` | 文件操作 Controller，TUS 分块上传实现，`chunkedUploadCache` |
 | `server/ctrl/admin.go` | `FetchAuditHandler` 审计查询 Handler |
 | `server/routes.go` | 路由注册，`/admin/api/audit` 端点 |
 | `server/middleware/index.go` | `NewMiddlewareChain` 中间件组装，`logger()` 调用点 |
@@ -914,11 +1334,13 @@ func (b *QuotaBackend) Save(path string, r io.Reader) error {
 | `server/pkg/workflow/model/job.go` | `CreateJob`、`NextJob`、`UpdateJob`，Job 持久化 |
 | `server/pkg/workflow/trigger/fileaction.go` | ★ `hookAuthorisation` 审计触发核心 |
 | `server/pkg/workflow/trigger/index.go` | `TriggerEvents` 事件分发 |
-| `server/plugin/index.go` | 所有后端/认证插件的导入入口 |
+| `server/plugin/index.go` | 所有后端/认证插件的导入入口（编译时确定） |
+| `server/plugin/plg_starter_http/index.go` | HTTP Server 启动，`Shutdown()` 优雅关闭 |
 | `server/plugin/plg_authorisation_example/index.go` | 授权中间件示例 |
 | `server/plugin/plg_backend_local/index.go` | Local 后端实现（配额靠 OS） |
 | `server/plugin/plg_backend_sftp/index.go` | SFTP 后端（配额错误码映射） |
 | `server/plugin/plg_widget_recent/index.go` | `getUser()` 实现示例，`GenerateID` 使用示例 |
+| `server/plugin/plg_widget_favourite/index.go` | `OnConfig` 钩子使用示例（UI 补丁切换） |
 | `server/plugin/plg_widget_description/utils.go` | 另一个 `getUser()` 实现示例 |
 | `server/plugin/plg_metadata_sqlite/index.go` | `tenantID` 使用示例，按后端连接隔离 |
 | `public/assets/pages/adminpage/model_audit.js` | 前端审计查询模型 |
