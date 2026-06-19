@@ -11,7 +11,9 @@
 - [5. 配置版本迁移与 Schema 演化兼容](#5-配置版本迁移与-schema-演化兼容)
 - [6. 热更新失败回滚机制](#6-热更新失败回滚机制)
 - [7. 多 Admin 并发冲突解决路径](#7-多-admin-并发冲突解决路径)
-- [8. 关键代码位置索引](#8-关键代码位置索引)
+- [8. 配置变更通知给在线 Admin 的机制](#8-配置变更通知给在线-admin-的机制)
+- [9. 敏感字段在审计场景下的明文恢复路径](#9-敏感字段在审计场景下的明文恢复路径)
+- [10. 关键代码位置索引](#10-关键代码位置索引)
 
 ---
 
@@ -1003,7 +1005,407 @@ Goroutine C: Config.Get("general.host").String() （可能读到旧值）
 
 ---
 
-## 8. 关键代码位置索引
+## 8. 配置变更通知给在线 Admin 的机制
+
+### 8.1 核心结论：无实时推送，依赖拉取模式
+
+Filestash **没有** WebSocket、SSE 或任何实时推送机制来通知在线 admin 配置变更。所有配置更新都采用**"拉取模式"**，即：
+- 保存者自己能看到更新（因为保存后重新拉取）
+- 其他在线 admin 只能在下次拉取时看到更新
+
+### 8.2 前端配置拉取机制
+
+#### 单例冷 Observable 设计
+
+```javascript
+// public/assets/pages/adminpage/model_config.js:6-15
+const config$ = isSaving$.pipe(
+    rxjs.filter((loading) => !loading),  // ← 保存中不获取
+    rxjs.switchMapTo(ajax({               // ← 每次订阅触发新请求
+        url: "admin/api/config",
+        method: "GET",
+        responseType: "json"
+    })),
+    rxjs.map((res) => res.responseJSON.result),
+    rxjs.shareReplay(1),                  // ← 缓存最近一次结果
+);
+```
+
+**关键特性**：
+1. **冷 Observable**：`ajax()` 是冷 Observable，**每次新订阅才会触发 HTTP 请求**
+2. **缓存复用**：`shareReplay(1)` 让多个订阅者共享同一份最近数据
+3. **保存互斥**：`isSaving$` 过滤确保保存期间不会发起新的获取请求
+
+**代码解读**：
+- `config$` 本身不会主动轮询，它是被动的
+- 只有当有新的订阅者（或保存结束后重新订阅）才会拉取新配置
+- `shareReplay(1)` 确保同一页面内多次订阅不会重复请求
+
+代码位置：`public/assets/pages/adminpage/model_config.js:6-15`
+
+#### 保存后自动刷新机制
+
+```javascript
+// public/assets/pages/adminpage/model_config.js:29-44
+export function save() {
+    return rxjs.pipe(
+        rxjs.tap(() => isSaving$.next(true)),
+        rxjs.debounceTime(800),
+        rxjs.mergeMap((formData) => ajax({
+            url: "admin/api/config",
+            method: "POST",
+            // ...
+        })),
+        rxjs.tap(() => isSaving$.next(false)),  // ← 保存完成，isSaving$ = false
+        // ...
+    );
+}
+```
+
+**刷新流程**：
+1. 保存开始 → `isSaving$.next(true)`
+2. 保存完成 → `isSaving$.next(false)`
+3. `config$` 管道中的 `filter((loading) => !loading)` 让值通过
+4. `switchMapTo(ajax(...))` 触发新的 GET 请求
+5. `shareReplay(1)` 将新配置推送给所有订阅者
+
+**效果**：保存者自己的页面会自动获取新配置并刷新。
+
+代码位置：`public/assets/pages/adminpage/model_config.js:29-44`
+
+### 8.3 页面首次加载拉取
+
+```javascript
+// public/assets/pages/adminpage/ctrl_settings.js:27-30
+const config$ = getAdminConfig().pipe(
+    rxjs.first(),  // ← 只取第一个值然后 complete
+    reshapeConfigBeforeDisplay,
+);
+```
+
+```javascript
+// public/assets/pages/adminpage/model_config.js:25-27
+export function get() {
+    return config$;  // ← 返回可观察对象，订阅触发拉取
+}
+```
+
+**关键点**：`rxjs.first()` 确保页面只在加载时拉取一次配置，之后不会自动刷新。
+
+### 8.4 其他在线 Admin 的通知盲区
+
+**场景**：Admin A 和 Admin B 同时打开设置页面
+
+```
+Admin A: 打开设置页面 → GET /admin/api/config → 配置 v1
+Admin B: 打开设置页面 → GET /admin/api/config → 配置 v1
+Admin A: 修改 log.level = DEBUG → POST → 配置变为 v2
+Admin A: isSaving$ 从 true→false → 触发 GET → 获取配置 v2 ✅
+Admin B: 页面继续显示配置 v1 ❌（无任何通知）
+```
+
+**Admin B 的刷新方式**：
+1. 手动刷新页面 F5
+2. 离开设置页面再进入
+3. 修改自己的配置（触发保存→拉取流程）
+4. 每 30 秒的 session 轮询 **不会** 触发配置刷新
+
+### 8.5 Session 轮询机制（不触发配置刷新）
+
+```javascript
+// public/assets/pages/adminpage/model_admin_session.js:6-19
+const adminSession$ = rxjs.merge(
+    sessionSubject$,
+    rxjs.merge(
+        rxjs.interval(30000),  // ← 每 30 秒轮询一次
+        rxjs.fromEvent(document, "visibilitychange").pipe(
+            rxjs.filter(() => !document.hidden)  // ← 页面可见时也轮询
+        ),
+    ).pipe(
+        rxjs.startWith(null),
+        rxjs.mergeMap(() => ajax({ url: "admin/api/session", ... })),
+        rxjs.map(({ responseJSON }) => responseJSON.result),
+    )
+).pipe(
+    rxjs.distinctUntilChanged(),  // ← session 不变时不触发
+    rxjs.shareReplay(1)
+);
+```
+
+**重要**：这个 30 秒轮询只检查 admin session 是否有效，**不会**拉取配置更新。配置变更不会触发任何通知。
+
+代码位置：`public/assets/pages/adminpage/model_admin_session.js:6-19`
+
+### 8.6 配置变更通知挂载点汇总
+
+| 挂载点 | 通知范围 | 机制 | 延迟 |
+|--------|----------|------|------|
+| 保存者页面自动刷新 | 仅保存者自己 | `isSaving$` true→false 触发 GET | 保存完成后立即 |
+| 页面加载拉取 | 所有进入页面的 admin | `rxjs.first()` 单次拉取 | 页面加载时 |
+| 重新进入设置页面 | 导航到该页面的 admin | 新订阅触发 GET | 页面切换时 |
+| Session 轮询 | ❌ 无配置通知 | 只检查 session 有效性 | N/A |
+| WebSocket/SSE | ❌ 不存在 | 无实时推送 | N/A |
+
+### 8.7 改进建议
+
+如果需要实时通知所有在线 admin，可以添加：
+
+1. **WebSocket 广播**：配置保存后通过 WebSocket 向所有在线 admin 推送变更事件
+2. **长轮询**：`/admin/api/config` 支持长轮询，配置变更时立即返回
+3. **版本号检测**：前端定时（如 10 秒）轮询配置版本号，发现变更后拉取完整配置
+4. **EventSource (SSE)**：服务端推送配置变更事件
+
+---
+
+## 9. 敏感字段在审计场景下的明文恢复路径
+
+### 9.1 敏感字段分类与存储方式
+
+Filestash 有三类敏感信息，存储方式不同，审计时的恢复能力也不同：
+
+| 敏感信息类型 | 存储方式 | 审计时能否恢复明文 |
+|-------------|----------|-------------------|
+| 中间件参数（identity_provider.params、attribute_mapping.params） | AES-GCM 加密 | ✅ 可以恢复 |
+| Admin 密码（auth.admin） | bcrypt 哈希 | ❌ 不可恢复 |
+| 分享链接密码（share.password） | bcrypt 哈希 | ❌ 不可恢复 |
+
+### 9.2 AES-GCM 加密字段的明文恢复路径
+
+#### 完整恢复链路
+
+```
+审计插件调用 Config.Get("middleware.identity_provider.params")
+    ↓
+Configuration.Get(path)  // server/common/config.go:364
+    ↓
+返回 FormElement（Value 是明文）
+    ↓
+审计插件读取 .String() 获取明文
+```
+
+**为什么可以直接获取明文？**
+
+因为配置在加载到内存时已经完成了解密：
+
+```go
+// server/common/config_state.go:40-65 (LoadConfig)
+func LoadConfig() ([]byte, error) {
+    // ...
+    // 1. 从磁盘读取加密的 JSON
+    configStr, err := os.ReadFile(...)
+    
+    // 2. 初始化解密密钥
+    var key string = CONFIG_SECRET
+    if key == "" {
+        key = Config.Get("general.secret_key").String()
+    }
+    
+    // 3. 解密所有敏感字段
+    for _, jsonPathWithEncryptedData := range configKeysToEncrypt {
+        p := gjson.Get(configStr, jsonPathWithEncryptedData).String()
+        // 🔑 解密！
+        t, err := DecryptString(Hash(key, 16), p)  // ← AES-GCM 解密
+        // ...
+        configStr, err = sjson.Set(configStr, jsonPathWithEncryptedData, t)
+    }
+    
+    return []byte(configStr), nil  // ← 返回解密后的 JSON
+}
+```
+
+代码位置：`server/common/config_state.go:48-65`
+
+#### 解密算法详解
+
+```go
+// server/common/crypto.go:27-53
+func EncryptString(secret string, data string) (string, error) {
+    d, _ := compress([]byte(data))               // ← zlib 压缩
+    d, _ = EncryptAESGCM([]byte(secret), d)      // ← AES-256-GCM 加密
+    return base64.URLEncoding.EncodeToString(d), nil
+}
+
+func DecryptString(secret string, data string) (string, error) {
+    d, _ := base64.URLEncoding.DecodeString(data)  // ← Base64 解码
+    d, _ = DecryptAESGCM([]byte(secret), d)        // ← AES-256-GCM 解密
+    d, _ = decompress(d)                           // ← zlib 解压
+    return string(d), nil
+}
+```
+
+**密钥派生**：
+- 主密钥：优先使用环境变量 `CONFIG_SECRET`，否则使用 `general.secret_key`
+- 加密密钥：`Hash(key, 16)` → SHA-256 哈希后取前 16 字节
+- 算法：AES-256-GCM（12 字节 nonce，16 字节认证标签）
+
+代码位置：`server/common/crypto.go:27-53,128-159`
+
+#### 内存中明文的生命周期
+
+```go
+// server/common/config.go:186-219 (Load)
+func (this *Configuration) Load() error {
+    // 1. 从文件读取（已解密）
+    cFile, err := LoadConfig()
+    
+    // 2. 扁平化 JSON
+    raw := map[string]any{}
+    json.Unmarshal(cFile, &raw)
+    
+    // 3. Hydration: 明文写入内存
+    for path, value := range flattenJSON("", raw) {
+        el := this.Get(path)
+        if el.currentElement != nil {
+            el.currentElement.Value = value  // ← 明文存入内存
+        }
+    }
+    
+    return nil
+}
+```
+
+**明文在内存中**：
+- `Configuration.Form[].Elmnts[].Value` 字段存储明文
+- 只要服务运行，敏感字段明文就存在于内存中
+- 通过 `Config.Get("path").String()` 可以随时读取明文
+
+#### 审计插件获取明文的完整路径
+
+```go
+// 审计插件实现 IAuditPlugin 接口
+type IAuditPlugin interface {
+    Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error)
+}
+
+// 在 Query 方法中可以直接访问明文
+func (myAudit MyAudit) Query(ctx *App, params map[string]string) (AuditQueryResult, error) {
+    // ✅ 直接获取中间件参数明文
+    idpParams := Config.Get("middleware.identity_provider.params").String()
+    attrParams := Config.Get("middleware.attribute_mapping.params").String()
+    
+    // 审计逻辑...
+    
+    return AuditQueryResult{...}, nil
+}
+```
+
+**注册审计插件**：
+```go
+// server/common/plugin.go:185-193
+var audit IAuditPlugin
+
+func (this Register) AuditEngine(a IAuditPlugin) {
+    audit = a
+}
+
+func (this Get) AuditEngine() IAuditPlugin {
+    return audit
+}
+```
+
+**默认实现**：`server/model/audit.go` 中的 `SimpleAudit` 只是占位符，提示需要安装审计插件。
+
+### 9.3 bcrypt 哈希字段的不可恢复性
+
+#### Admin 密码
+
+```go
+// server/ctrl/admin.go:57-62
+func AdminAuthenticationHandler(...) {
+    // 从配置中读取 bcrypt 哈希
+    adminPassword := Config.Get("auth.admin").String()  // ← 存储的是哈希，不是明文
+    
+    // 验证密码（只能比较，不能解密）
+    if err := bcrypt.CompareHashAndPassword(
+        []byte(adminPassword), 
+        []byte(password)
+    ); err != nil {
+        SendErrorResult(res, ErrAuthenticationFailed)
+        return
+    }
+}
+```
+
+**特点**：
+- 存储的是 60 字符的 bcrypt 哈希（`$2a$10$...`）
+- 前端在设置时就用 bcrypt.js 哈希（`ctrl_setup.js:91`）
+- 明文密码**从未**进入后端内存（除了验证时的短暂存在）
+- 审计时**无法**恢复 admin 密码明文
+
+代码位置：`server/ctrl/admin.go:57-62`
+
+#### 分享链接密码
+
+```go
+// server/common/types.go:178-228
+const PASSWORD_DUMMY = "{{PASSWORD}}"
+
+// 序列化时掩码
+func (s *Share) MarshalJSON() ([]byte, error) {
+    p := Share{
+        Password: func(pass *string) *string {
+            if pass != nil {
+                return NewString(PASSWORD_DUMMY)  // ← 替换为占位符
+            }
+            return nil
+        }(s.Password),
+        // ...
+    }
+    return json.Marshal(p)
+}
+```
+
+**特点**：
+- 分享密码存储在后端（可能是 bcrypt 或明文，取决于后端实现）
+- 序列化为 JSON 时被替换为 `{{PASSWORD}}` 掩码
+- 审计时如果直接访问数据库可能获得哈希值，但同样无法恢复明文
+
+### 9.4 明文恢复权限边界
+
+| 角色 | 能否获取敏感字段明文 | 途径 |
+|------|---------------------|------|
+| 前端 Admin UI | ❌ 不能 | 前端只获取配置 schema，敏感字段被加密/哈希 |
+| 后端插件 | ✅ 可以 | `Config.Get("path").String()` 直接读取内存明文 |
+| 审计插件 | ✅ 可以 | 作为后端插件，享有同等权限 |
+| 配置文件 | ❌ 不能 | 加密存储，需要密钥解密 |
+| 内存 dump | ✅ 可以 | 明文存在于 Go 堆内存中 |
+
+### 9.5 审计时的明文恢复代码核对表
+
+#### 核对路径 1：加密字段能正常解密
+
+**代码核对**：
+1. ✅ `LoadConfig()` 中调用 `DecryptString()` 解密所有 `configKeysToEncrypt` 路径
+2. ✅ 解密密钥正确派生：`Hash(CONFIG_SECRET || secret_key, 16)`
+3. ✅ 解密后的明文写入内存 `FormElement.Value`
+4. ✅ `Config.Get()` 能正确找到该路径并返回 `Value`
+
+**可能的失败点**：
+- `CONFIG_SECRET` 环境变量变更导致密钥不匹配
+- `general.secret_key` 被重置
+- 配置文件损坏
+
+#### 核对路径 2：审计插件有权限访问
+
+**代码核对**：
+1. ✅ `AuditEngine.Query()` 运行在服务端上下文
+2. ✅ 没有权限检查限制审计插件访问 `Config.Get()`
+3. ✅ `IAuditPlugin` 接口没有对敏感字段的访问限制
+4. ✅ 默认 `SimpleAudit` 不访问敏感字段，但自定义插件可以
+
+**风险点**：恶意审计插件可以窃取所有敏感字段明文
+
+#### 核对路径 3：bcrypt 字段不可恢复
+
+**代码核对**：
+1. ✅ `auth.admin` 存储的是 bcrypt 哈希，不是明文
+2. ✅ 前端设置密码时就已哈希（`ctrl_setup.js:91`）
+3. ✅ 后端只使用 `bcrypt.CompareHashAndPassword()` 验证
+4. ✅ 没有任何代码路径能从哈希恢复明文
+
+---
+
+## 10. 关键代码位置索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
@@ -1042,3 +1444,19 @@ Goroutine C: Config.Get("general.host").String() （可能读到旧值）
 | 前端保存状态锁 | `public/assets/pages/adminpage/model_config.js` | 4-15 |
 | 后端读写锁 | `server/common/config.go` | 16-18 |
 | Configuration.mu 锁使用 | `server/common/config.go` | 263, 398, 415, 433 |
+| **配置变更通知** | | |
+| 前端 config$ 单例 | `public/assets/pages/adminpage/model_config.js` | 6-15 |
+| 保存后刷新机制 | `public/assets/pages/adminpage/model_config.js` | 29-44 |
+| 页面单次拉取 | `public/assets/pages/adminpage/ctrl_settings.js` | 27-30 |
+| Session 轮询 | `public/assets/pages/adminpage/model_admin_session.js` | 6-19 |
+| **敏感字段恢复** | | |
+| LoadConfig 解密 | `server/common/config_state.go` | 48-65 |
+| EncryptString/DecryptString | `server/common/crypto.go` | 27-53 |
+| AES-GCM 加密实现 | `server/common/crypto.go` | 128-159 |
+| Hash 密钥派生 | `server/common/crypto.go` | 55-59 |
+| 审计插件接口 | `server/common/types.go` | 65-71 |
+| 审计引擎注册 | `server/common/plugin.go` | 185-193 |
+| 默认审计实现 | `server/model/audit.go` | 58-75 |
+| Admin 密码验证 | `server/ctrl/admin.go` | 57-62 |
+| PASSWORD_DUMMY 掩码 | `server/common/types.go` | 178 |
+| FetchAuditHandler API | `server/ctrl/admin.go` | 138-158 |
