@@ -8,7 +8,10 @@
 - [2. 配置热更新机制](#2-配置热更新机制)
 - [3. 敏感字段处理](#3-敏感字段处理)
 - [4. Admin 后台配置注入链路](#4-admin-后台配置注入链路)
-- [5. 关键代码位置索引](#5-关键代码位置索引)
+- [5. 配置版本迁移与 Schema 演化兼容](#5-配置版本迁移与-schema-演化兼容)
+- [6. 热更新失败回滚机制](#6-热更新失败回滚机制)
+- [7. 多 Admin 并发冲突解决路径](#7-多-admin-并发冲突解决路径)
+- [8. 关键代码位置索引](#8-关键代码位置索引)
 
 ---
 
@@ -508,7 +511,499 @@ InitConfig()
 
 ---
 
-## 5. 关键代码位置索引
+## 5. 配置版本迁移与 Schema 演化兼容
+
+### 5.1 核心设计理念："惰性迁移 + 前向兼容"
+
+Filestash 没有采用显式的版本号迁移脚本，而是采用**"惰性迁移 + 前向兼容"**的设计哲学。所有兼容逻辑都是"代码即迁移"，在代码执行过程中动态完成 schema 演化。
+
+### 5.2 自动创建机制（前向兼容）
+
+**挂载点**：`Configuration.Get()` 方法中的 `traverse` 递归函数
+
+```go
+// server/common/config.go:369-397
+var traverse func(forms *[]Form, path []string) *FormElement
+traverse = func(forms *[]Form, path []string) *FormElement {
+    // ...
+    // 2) `formElement` does not exist, let's create it.
+    (*forms)[i].Elmnts = append(currentForm.Elmnts, 
+        FormElement{Name: path[1], Type: "hidden"})  // ← 自动创建
+    return &(*forms)[i].Elmnts[len(currentForm.Elmnts)]
+    // ...
+    // append a new `form` if the current key doesn't exist
+    *forms = append(*forms, Form{Title: path[0]})  // ← 自动创建分组
+    return traverse(forms, path)
+}
+```
+
+**工作原理**：
+1. 当新版本代码访问 `Config.Get("new.feature.enable")` 时
+2. 如果路径不存在，系统自动创建 `Type: "hidden"` 的配置项
+3. 旧版本配置文件中不存在的字段，在新版本中可以安全访问
+4. 自动创建的配置项默认值为 `nil`，读取时会返回 `FormElement.Default`
+
+**兼容保证**：新版本代码可以无错误地读取旧版本配置文件。
+
+代码位置：`server/common/config.go:385-396`
+
+### 5.3 Schema 提升机制（插件扩展）
+
+**挂载点**：`ConfigElement.Schema()` 方法
+
+```go
+// server/common/config.go:405-409
+func (this *ConfigElement) Schema(fn func(*FormElement) *FormElement) *ConfigElement {
+    fn(this.currentElement)  // ← 插件修改元数据
+    this.cfg.cache.Clear()    // ← 清除缓存
+    return this
+}
+```
+
+**典型用法**：插件在初始化时将自动创建的 `hidden` 配置项"提升"为正式配置项：
+
+```go
+// 插件 init() 函数中调用
+Config.Get("features.collaborative.enable").Schema(func(f *FormElement) *FormElement {
+    f.Name = "enable"
+    f.Type = "enable"           // ← 从 hidden 改为 enable
+    f.Description = "Enable/Disable collaborative editing"
+    f.Default = true
+    return f
+}).Bool()
+```
+
+**迁移时机**：插件加载时（服务启动或插件初始化）
+
+代码位置：`server/common/config.go:405-409`，示例见 `server/plugin/plg_editor_codemirror/config.go:7-18`
+
+### 5.4 默认值回退机制
+
+**挂载点**：`ConfigElement.Interface()` 方法
+
+```go
+// server/common/config.go:475-486
+func (this *ConfigElement) Interface() interface{} {
+    // ...
+    if el.Value == nil {
+        return el.Default  // ← 值为 nil 时返回默认值
+    }
+    return el.Value
+}
+```
+
+**工作原理**：
+- 旧配置文件中不存在的字段，`Value` 为 `nil`
+- 读取时自动回退到 `Default` 值
+- 保证即使配置文件中没有该字段，系统也能正常工作
+
+代码位置：`server/common/config.go:475-486`
+
+### 5.5 环境变量覆盖机制
+
+**挂载点**：`Configuration.Initialise()` 方法
+
+```go
+// server/common/config.go:241-260
+func (this *Configuration) Initialise() {
+    shouldSave := false
+    if env := os.Getenv("ADMIN_PASSWORD"); env != "" {
+        shouldSave = true
+        this.Get("auth.admin").Set(env)  // ← 环境变量覆盖
+    }
+    if env := os.Getenv("APPLICATION_URL"); env != "" {
+        shouldSave = true
+        _ = this.Get("general.host").Set(env).String()
+    }
+    if this.Get("general.secret_key").String() == "" {
+        shouldSave = true
+        key := RandomString(16)          // ← 自动生成缺失字段
+        this.Get("general.secret_key").Set(key)
+    }
+    if shouldSave {
+        this.Save()  // ← 保存迁移后的配置
+    }
+    InitSecretDerivate(this.Get("general.secret_key").String())
+}
+```
+
+**迁移时机**：服务启动时（`InitConfig()` → `Initialise()`）
+
+**兼容场景**：
+- 从环境变量注入配置（容器化部署常用）
+- 自动生成缺失的必填字段（如 `secret_key`）
+- 迁移完成后自动保存到磁盘
+
+代码位置：`server/common/config.go:241-260`
+
+### 5.6 泛型默认值函数
+
+**挂载点**：`defaultValue[T]()` 泛型函数
+
+```go
+// server/common/config.go:506-522
+func defaultValue[T string | int | bool](dval T, envName string) T {
+    if val := os.Getenv(envName); val != "" {
+        // 类型转换...
+        return any(val).(T)  // ← 环境变量优先
+    }
+    return dval  // ← 编译时默认值
+}
+```
+
+**用法示例**：
+```go
+FormElement{Name: "port", Type: "number", 
+    Default: defaultValue(8334, "FILESTASH_PORT"), ...}
+```
+
+代码位置：`server/common/config.go:506-522`
+
+### 5.7 配置数据迁移挂载点汇总
+
+| 挂载点 | 触发时机 | 用途 |
+|--------|----------|------|
+| `Get()` traverse 自动创建 | 访问不存在的配置时 | 前向兼容，自动创建缺失字段 |
+| `Schema()` 方法 | 插件初始化时 | 插件扩展配置 schema |
+| `Interface()` 默认值回退 | 读取配置时 | 缺失字段返回默认值 |
+| `Initialise()` 方法 | 服务启动时 | 环境变量注入、自动生成必填字段 |
+| `OnConfig` 钩子 | 配置热更新后 | 插件响应配置变更 |
+| `config_state.go` 可替换 | 构建时 | 替换整个配置存储层（S3、自定义加密等） |
+
+> **特殊说明**：`config_state.go` 文件头部有警告，说明该文件可以在构建时被插件生成器替换，以支持 S3 存储、自定义加密等场景。这是最高层级的兼容扩展点。
+
+代码位置：`server/common/config_state.go:3-14`
+
+---
+
+## 6. 热更新失败回滚机制
+
+### 6.1 现状分析："部分回滚 + 无完整回滚"
+
+Filestash 的热更新没有完整的事务性回滚机制，而是采用**"分段错误处理"**的策略。不同阶段的失败有不同的处理方式。
+
+### 6.2 热更新的三个阶段
+
+```
+前端发送 JSON
+    ↓
+阶段 1: SaveConfig(b) → 写入磁盘
+    ↓ (成功)
+阶段 2: Config.Load() → 重新加载到内存
+    ↓ (成功)
+阶段 3: Hooks.OnConfig() → 通知插件
+```
+
+### 6.3 各阶段失败处理
+
+#### 阶段 1：写入磁盘失败
+
+**代码**：`server/ctrl/config.go:15-23`
+
+```go
+func PrivateConfigUpdateHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
+    b, _ := io.ReadAll(req.Body)
+    if err := SaveConfig(b); err != nil {  // ← 阶段 1 失败
+        SendErrorResult(res, err)          // ← 返回错误
+        return                             // ← 直接返回，不执行后续步骤
+    }
+    Config.Load()
+    SendSuccessResult(res, nil)
+}
+```
+
+**回滚效果**：✅ **完全回滚**
+- 磁盘文件保持原样（写入失败意味着没有修改）
+- 内存配置保持原样（没有调用 `Load()`）
+- 返回错误给前端，用户可以重试
+
+代码位置：`server/ctrl/config.go:17-19`
+
+#### 阶段 2：加载到内存失败
+
+**代码**：`server/common/config.go:186-219`
+
+```go
+func (this *Configuration) Load() error {
+    cFile, err := LoadConfig()  // ← 从磁盘读取（可能失败）
+    if err != nil {
+        Log.Error("config::load %s", err)
+        return err
+    }
+    
+    // Hydration 过程（逐个字段设置）
+    for path, value := range flattenJSON("", raw) {
+        el := this.Get(path)
+        if el.currentElement != nil && el.currentElement.Value != value {
+            el.currentElement.Value = value  // ← 逐个修改内存
+        }
+    }
+    
+    this.cache.Clear()
+    Log.SetVisibility(this.Get("log.level").String())
+    for _, fn := range Hooks.Get.OnConfig() {
+        fn()  // ← 触发钩子（可能失败）
+    }
+    return nil
+}
+```
+
+**回滚效果**：⚠️ **部分回滚 / 无回滚**
+- 如果 `LoadConfig()` 失败（文件损坏、解密失败）：
+  - 磁盘文件已被修改（阶段 1 成功）
+  - 内存配置**部分修改**（Hydration 是逐个字段进行的，中途失败会导致不一致）
+  - 返回错误，但内存已处于不一致状态
+- 如果 Hydration 中途失败：
+  - 部分字段已更新，部分字段未更新
+  - 没有快照/回滚机制恢复
+- 如果 `OnConfig` 钩子失败：
+  - 内存配置已更新
+  - 部分插件收到通知，部分未收到
+  - 没有补偿机制
+
+**风险场景**：
+1. 写入了损坏的 JSON 到磁盘，下次服务启动失败
+2. 解密失败导致敏感字段丢失
+3. Hydration 中断导致内存配置不完整
+
+代码位置：`server/common/config.go:186-219`
+
+#### 阶段 3：插件钩子失败
+
+**代码**：`server/common/config.go:215-217`
+
+```go
+for _, fn := range Hooks.Get.OnConfig() {
+    fn()  // ← 插件钩子执行，panic 会导致整个服务崩溃？
+}
+```
+
+**回滚效果**：❌ **无回滚**
+- 钩子函数没有错误返回值
+- 如果钩子 panic，整个服务可能崩溃
+- 已执行的钩子没有回滚逻辑
+
+### 6.4 内存操作的原子性保证
+
+虽然没有完整回滚，但内存配置的**单个操作**是线程安全的：
+
+```go
+// server/common/config.go:16-18
+type Configuration struct {
+    mu    sync.RWMutex  // ← 读写锁保护
+    cache sync.Map
+    Form  []Form
+    Conn  []map[string]any
+}
+```
+
+**锁的使用**：
+- `Load()` 中的 Hydration：通过 `Get()` 间接获取写锁
+- `Save()` 中的序列化：使用读锁 `RLock()`
+- `Set()` 方法：使用写锁 `Lock()`
+- `Get()` 方法：使用写锁 `Lock()`（遍历树时需要）
+
+**风险**：`Load()` 不是原子操作，它会多次调用 `Get()`（每次获取锁），期间其他 goroutine 可能读取到部分更新的配置。
+
+### 6.5 现有防护机制
+
+1. **文件权限保护**：`init()` 函数确保配置文件权限为 `0660`，目录为 `0770`
+
+```go
+// server/common/config_state.go:115-123
+func init() {
+    Hooks.Register.Onload(func() {
+        if err := os.Chmod(GetAbsolutePath(CONFIG_PATH), 0770); ...
+        if err := os.Chmod(GetAbsolutePath(CONFIG_PATH, "config.json"), 0660); ...
+    })
+}
+```
+
+2. **JSON 格式验证**：`SaveConfig()` 使用 `PrettyPrint()` 间接验证 JSON 格式
+3. **加密容错**：解密失败时记录警告但继续加载（`CONFIG_ENCRYPT=false` 时跳过解密）
+
+```go
+// server/common/config_state.go:53-57
+t, err := DecryptString(Hash(key, 16), p)
+if err != nil {
+    if !defaultValue(true, "CONFIG_ENCRYPT") {
+        break  // ← 加密被禁用时跳过
+    }
+    Log.Warning(...)
+    continue  // ← 记录警告，继续加载其他字段
+}
+```
+
+### 6.6 建议的改进方向
+
+当前实现存在数据丢失风险，建议添加：
+
+1. **写入前备份**：保存新配置前创建 `config.json.bak`
+2. **原子写入**：先写入 `config.json.tmp`，成功后 rename
+3. **快照回滚**：`Load()` 前创建内存快照，失败时恢复
+4. **钩子容错**：使用 `recover()` 捕获钩子 panic，确保所有钩子都能执行
+
+---
+
+## 7. 多 Admin 并发冲突解决路径
+
+### 7.1 现状分析："最后写入者获胜"（Last Write Wins）
+
+Filestash 没有显式的并发冲突检测和解决机制，而是依赖**"防抖 + 锁 + 最后写入者获胜"**的策略。
+
+### 7.2 前端层面的冲突避免
+
+#### 双重防抖机制
+
+```javascript
+// ctrl_settings.js:56-66
+effect(init$.pipe(
+    useForm$(() => qsa($container, "[data-bind=\"form\"] [name]")),
+    rxjs.debounceTime(250),          // ← 第一重：输入防抖 250ms
+    rxjs.mergeMap((formState) => ...),
+    reshapeConfigBeforeSave,
+    saveConfig(),                     // ← 第二重：保存防抖 800ms
+    rxjs.catchError(ctrlError()),
+));
+```
+
+```javascript
+// model_config.js:29-44
+export function save() {
+    return rxjs.pipe(
+        rxjs.tap(() => isSaving$.next(true)),
+        rxjs.debounceTime(800),        // ← 保存防抖 800ms
+        rxjs.mergeMap((formData) => ajax(...)),
+        rxjs.tap(() => isSaving$.next(false)),
+    );
+}
+```
+
+**效果**：
+- 单个用户快速输入不会触发多次保存
+- 总计约 1 秒的防抖窗口，减少并发冲突概率
+
+#### 保存状态锁
+
+```javascript
+// model_config.js:4-15
+const isSaving$ = new rxjs.BehaviorSubject(false);
+
+const config$ = isSaving$.pipe(
+    rxjs.filter((loading) => !loading),  // ← 保存中不获取新配置
+    rxjs.switchMapTo(ajax(...)),
+    rxjs.shareReplay(1),
+);
+```
+
+**效果**：
+- 保存期间阻止新的配置获取
+- 单个 tab 内不会同时有多个保存请求
+- 但**多个 tab / 多个用户**之间没有协调
+
+代码位置：`public/assets/pages/adminpage/model_config.js:4-15`
+
+### 7.3 后端层面的冲突避免
+
+#### 内存读写锁
+
+```go
+// server/common/config.go:16-18
+type Configuration struct {
+    mu sync.RWMutex  // ← 保护内存结构
+}
+```
+
+**锁的使用场景**：
+| 操作 | 锁类型 | 说明 |
+|------|--------|------|
+| `Get(path)` | 写锁 | 可能需要创建新节点 |
+| `Set(value)` | 写锁 | 修改配置值 |
+| `Save()` | 读锁 | 序列化内存结构 |
+| `Load()` | 多次写锁 | 每个字段 `Get()` 都会获取 |
+
+**局限性**：
+- 只保护内存结构，不保护磁盘文件
+- `Load()` 过程中会多次获取/释放锁，不是原子操作
+- 多个请求可以同时进入 `PrivateConfigUpdateHandler`
+
+#### 缺失的并发控制
+
+后端**没有**以下机制：
+
+1. **文件锁（flock）**：多个进程同时写入可能导致文件损坏
+2. **乐观锁（ETag / If-Match）**：无法检测"读取-修改-写入"之间的冲突
+3. **版本号**：配置文件没有版本字段，无法检测过期修改
+4. **差异合并**：后写入者直接覆盖前写入者的所有修改
+
+### 7.4 实际并发场景分析
+
+#### 场景 1：同一用户多个 tab
+
+```
+Tab A: GET /admin/api/config → 获取版本 1
+Tab B: GET /admin/api/config → 获取版本 1
+Tab A: 修改字段 X → POST（覆盖整个配置）
+Tab B: 修改字段 Y → POST（覆盖整个配置，X 的修改丢失！）
+```
+
+**结果**：Tab A 的修改被 Tab B 覆盖，数据丢失。
+
+#### 场景 2：两个不同 admin 同时修改
+
+```
+Admin A: 修改 log.level = DEBUG
+Admin B: 修改 general.host = files.example.com
+Admin A 的 POST 先到达 → 保存 A 的修改
+Admin B 的 POST 后到达 → 保存 B 的修改（A 的修改被覆盖！）
+```
+
+**结果**：Admin A 的修改丢失。
+
+#### 场景 3：保存 + 读取并发
+
+```
+Goroutine A: Config.Load() （正在 Hydration，已更新部分字段）
+Goroutine B: Config.Get("log.level").String() （可能读到新值）
+Goroutine C: Config.Get("general.host").String() （可能读到旧值）
+```
+
+**结果**：短暂的不一致窗口，读取到部分更新的配置。
+
+### 7.5 为什么"最后写入者获胜"可以接受
+
+虽然存在数据丢失风险，但在 Filestash 的场景下这是可接受的权衡：
+
+1. **低频修改**：配置修改是低频操作，并发概率低
+2. **管理员数量少**：通常只有 1-2 个管理员
+3. **配置字段独立**：大部分场景下管理员修改不同字段
+4. **影响范围有限**：配置修改后可以重新设置
+
+### 7.6 建议的改进方向
+
+如果需要更强的并发保证，可以添加：
+
+1. **ETag 乐观锁**：
+   ```
+   GET /admin/api/config → 返回 ETag: "v123"
+   POST /admin/api/config → 携带 If-Match: "v123"
+   服务端校验 ETag，不匹配返回 412 Precondition Failed
+   ```
+
+2. **部分更新 API**：
+   ```
+   PATCH /admin/api/config/general/host
+   Body: { "value": "files.example.com" }
+   只更新单个字段，减少冲突概率
+   ```
+
+3. **文件锁**：使用 `syscall.Flock()` 防止多进程写入
+
+4. **变更审计**：记录配置变更历史，便于回滚
+
+---
+
+## 8. 关键代码位置索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
@@ -529,3 +1024,21 @@ InitConfig()
 | 前端表单渲染 | `public/assets/components/form.js` | 45-329 |
 | 前端表单逻辑 | `public/assets/lib/form.js` | 1-124 |
 | 设置向导 | `public/assets/pages/adminpage/ctrl_setup.js` | 1-213 |
+| **配置迁移兼容** | | |
+| Get() 自动创建机制 | `server/common/config.go` | 385-396 |
+| Schema() 提升方法 | `server/common/config.go` | 405-409 |
+| Interface() 默认值回退 | `server/common/config.go` | 475-486 |
+| Initialise() 初始化 | `server/common/config.go` | 241-260 |
+| defaultValue 泛型函数 | `server/common/config.go` | 506-522 |
+| config_state 可替换警告 | `server/common/config_state.go` | 3-14 |
+| **热更新回滚** | | |
+| PrivateConfigUpdateHandler | `server/ctrl/config.go` | 15-23 |
+| Configuration.Load() 错误处理 | `server/common/config.go` | 186-219 |
+| 配置文件权限保护 | `server/common/config_state.go` | 115-123 |
+| 解密容错处理 | `server/common/config_state.go` | 53-57 |
+| **并发冲突** | | |
+| 前端双重防抖 | `public/assets/pages/adminpage/ctrl_settings.js` | 56-66 |
+| 前端保存防抖 | `public/assets/pages/adminpage/model_config.js` | 29-44 |
+| 前端保存状态锁 | `public/assets/pages/adminpage/model_config.js` | 4-15 |
+| 后端读写锁 | `server/common/config.go` | 16-18 |
+| Configuration.mu 锁使用 | `server/common/config.go` | 263, 398, 415, 433 |
