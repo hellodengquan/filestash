@@ -13,7 +13,9 @@
 - [7. 多 Admin 并发冲突解决路径](#7-多-admin-并发冲突解决路径)
 - [8. 配置变更通知给在线 Admin 的机制](#8-配置变更通知给在线-admin-的机制)
 - [9. 敏感字段在审计场景下的明文恢复路径](#9-敏感字段在审计场景下的明文恢复路径)
-- [10. 关键代码位置索引](#10-关键代码位置索引)
+- [10. 配置变更在审计记录中的字段对比展示路径](#10-配置变更在审计记录中的字段对比展示路径)
+- [11. 多层级配置合并冲突时的优先级决策](#11-多层级配置合并冲突时的优先级决策)
+- [12. 关键代码位置索引](#12-关键代码位置索引)
 
 ---
 
@@ -1405,7 +1407,638 @@ func (s *Share) MarshalJSON() ([]byte, error) {
 
 ---
 
-## 10. 关键代码位置索引
+## 10. 配置变更在审计记录中的字段对比展示路径
+
+### 10.1 核心结论：无内置字段对比，依赖审计插件扩展
+
+Filestash **没有**内置的配置变更字段对比（diff）功能。配置变更的审计记录完全依赖于**第三方审计插件**的实现。
+
+### 10.2 审计插件接口定义
+
+```go
+// server/common/types.go:65-71
+type IAuditPlugin interface {
+    Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error)
+}
+
+type AuditQueryResult struct {
+    Form       *Form  `json:"form"`   // 查询表单 schema
+    RenderHTML string `json:"render"` // 审计结果渲染 HTML
+}
+```
+
+**设计意图**：
+- `Form` 字段允许审计插件定义自己的查询条件表单（日期范围、操作类型等）
+- `RenderHTML` 字段允许审计插件完全自定义展示内容，包括字段对比 diff
+- 核心系统不干预审计数据的存储和展示格式
+
+代码位置：`server/common/types.go:65-71`
+
+### 10.3 默认审计实现（占位符）
+
+```go
+// server/model/audit.go:58-75
+type SimpleAudit struct{}
+
+func (this SimpleAudit) Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error) {
+    return AuditQueryResult{
+        Form: &AuditForm,
+        RenderHTML: `<style>
+            #alert-audit-missing{
+                background: var(--error); color: var(--super-light);
+                padding: 15px 15px;
+                border-radius: 2px;
+                margin-top: 15px;
+            }
+        </style>
+        <div id="alert-audit-missing">
+            You need to install an audit plugin to use this
+        </div>`,
+    }, nil
+}
+```
+
+**说明**：默认的 `SimpleAudit` 只是提示用户需要安装审计插件，不记录任何数据。
+
+代码位置：`server/model/audit.go:58-75`
+
+### 10.4 审计 API 入口
+
+```go
+// server/ctrl/admin.go:138-158
+func FetchAuditHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
+    plg := Hooks.Get.AuditEngine()
+    if plg == nil {
+        SendErrorResult(res, ErrNotImplemented)
+        return
+    }
+    searchParams := map[string]string{}
+    _get := req.URL.Query()
+    for key, element := range _get {
+        if len(element) == 0 {
+            continue
+        }
+        searchParams[key] = element[0]
+    }
+    result, err := plg.Query(ctx, searchParams)
+    if err != nil {
+        SendErrorResult(res, err)
+        return
+    }
+    SendSuccessResult(res, result)
+}
+```
+
+**前端调用**：
+```javascript
+// public/assets/pages/adminpage/model_audit.js:6-13
+export function get(searchParams = new URLSearchParams()) {
+    return ajax({
+        url: "admin/api/audit?" + searchParams.toString(),
+        responseType: "json"
+    }).pipe(
+        rxjs.map(({ responseJSON }) => responseJSON.result)
+    );
+}
+```
+
+### 10.5 配置变更的审计记录挂载点
+
+#### 挂载点 1：PrivateConfigUpdateHandler（后端保存时）
+
+```go
+// server/ctrl/config.go:15-23
+func PrivateConfigUpdateHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
+    b, _ := io.ReadAll(req.Body)  // 新配置 JSON
+    if err := SaveConfig(b); err != nil {
+        SendErrorResult(res, err)
+        return
+    }
+    Config.Load()  // 加载新配置
+    SendSuccessResult(res, nil)
+}
+```
+
+**插件可以在这里注入审计**：
+- 方法：注册 `OnConfig` 钩子，在配置加载后记录变更
+- 挑战：没有旧值可用（`Load()` 已经覆盖了内存）
+- 解决方案：插件需要自己保存上一次配置的快照
+
+#### 挂载点 2：Set() 方法（程序化修改时）
+
+```go
+// server/common/config.go:429-444
+func (this *ConfigElement) Set(value interface{}) *ConfigElement {
+    if this.currentElement == nil {
+        return this
+    }
+    this.cfg.mu.Lock()
+    changed := this.currentElement.Value != value  // ← 可以在这里获取旧值
+    if changed {
+        this.currentElement.Value = value
+        this.cfg.cache.Clear()
+    }
+    this.cfg.mu.Unlock()
+    if changed {
+        this.cfg.Save()  // ← 保存到磁盘
+    }
+    return this
+}
+```
+
+**插件可以在这里注入审计**：
+- 方法：`changed` 变量可以检测到值变化
+- 优势：可以获取到旧值和新值进行对比
+- 局限：`Set()` 是公共方法，所有代码都可以调用，审计插件需要用 AOP 方式拦截
+
+#### 挂载点 3：前端保存流程（用户交互时）
+
+```javascript
+// public/assets/pages/adminpage/ctrl_settings.js:56-66
+effect(init$.pipe(
+    useForm$(() => qsa($container, "[data-bind=\"form\"] [name]")),
+    rxjs.debounceTime(250),           // ← 250ms 输入防抖
+    rxjs.mergeMap((formState) => config$.pipe(
+        rxjs.first(),
+        rxjs.map((formSpec) => mutateForm(formSpec, formState)),  // ← 应用变更到 formSpec
+    )),
+    reshapeConfigBeforeSave,  // ← 重组配置，添加 middleware/connections
+    saveConfig(),             // ← 发送到后端
+    rxjs.catchError(ctrlError()),
+));
+```
+
+**前端可以在这里注入审计**：
+- 方法：在 `saveConfig()` 之前比较 `formState` 和原始 `formSpec`
+- 优势：前端可以精确知道哪个字段被修改了
+- 局限：前端数据不可信，后端需要二次校验
+
+### 10.6 字段对比的实现路径（审计插件视角）
+
+如果要实现配置变更的字段对比，审计插件需要：
+
+#### 步骤 1：在 OnConfig 钩子中捕获配置快照
+
+```go
+// 审计插件示例代码
+var lastConfigSnapshot map[string]any
+
+func init() {
+    Hooks.Register.OnConfig(func() {
+        // 1. 序列化当前配置
+        currentConfig := serializeConfig(Config)
+        
+        // 2. 如果有上一次快照，计算 diff
+        if lastConfigSnapshot != nil {
+            diff := computeDiff(lastConfigSnapshot, currentConfig)
+            if len(diff) > 0 {
+                // 3. 记录审计日志
+                recordAuditLog("config_change", diff)
+            }
+        }
+        
+        // 4. 保存当前快照
+        lastConfigSnapshot = currentConfig
+    })
+}
+```
+
+#### 步骤 2：使用 flattenJSON 进行路径级对比
+
+```go
+// server/common/config.go:221-238
+func flattenJSON(prefix string, m map[string]any) map[string]any {
+    out := map[string]any{}
+    for k, v := range m {
+        key := k
+        if prefix != "" {
+            key = prefix + "." + k
+        }
+        switch val := v.(type) {
+        case map[string]any:
+            for nk, nv := range flattenJSON(key, val) {
+                out[nk] = nv
+            }
+        default:
+            out[key] = v
+        }
+    }
+    return out
+}
+```
+
+**对比逻辑**：
+```go
+oldFlat := flattenJSON("", oldConfig)
+newFlat := flattenJSON("", newConfig)
+
+for path, oldVal := range oldFlat {
+    newVal, exists := newFlat[path]
+    if !exists {
+        // 字段被删除
+        diff[path] = map[string]any{"op": "remove", "old": oldVal}
+    } else if oldVal != newVal {
+        // 字段被修改
+        diff[path] = map[string]any{"op": "modify", "old": oldVal, "new": newVal}
+    }
+}
+
+for path, newVal := range newFlat {
+    if _, exists := oldFlat[path]; !exists {
+        // 新增字段
+        diff[path] = map[string]any{"op": "add", "new": newVal}
+    }
+}
+```
+
+#### 步骤 3：前端展示字段对比
+
+审计插件可以在 `RenderHTML` 中返回包含 diff 展示的 HTML：
+
+```html
+<!-- 示例 diff 展示 -->
+<div class="config-diff">
+    <h3>配置变更详情</h3>
+    <table>
+        <tr><th>字段路径</th><th>操作</th><th>旧值</th><th>新值</th></tr>
+        <tr class="diff-modify">
+            <td>log.level</td>
+            <td>修改</td>
+            <td class="old-value">INFO</td>
+            <td class="new-value">DEBUG</td>
+        </tr>
+        <tr class="diff-add">
+            <td>features.new_feature.enable</td>
+            <td>新增</td>
+            <td></td>
+            <td class="new-value">true</td>
+        </tr>
+    </table>
+</div>
+```
+
+### 10.7 现有代码中的 diff 能力
+
+项目中只有一处 diff 相关代码：**编辑器的 diff 模式**
+
+```javascript
+// public/assets/pages/viewerpage/application_editor/diff.js
+import "../../../lib/vendor/codemirror/mode/diff/diff.js";
+window.CodeMirror.__mode = "diff";
+export default window.CodeMirror;
+```
+
+这是用于文件内容 diff 展示的 CodeMirror 模式，**不用于配置变更对比**。
+
+### 10.8 字段对比展示路径汇总
+
+| 层级 | 对比能力 | 代码位置 | 备注 |
+|------|----------|----------|------|
+| 后端核心 | ❌ 无内置 | - | 需要审计插件扩展 |
+| OnConfig 钩子 | ⚠️ 可扩展 | `server/common/plugin.go:286-294` | 无旧值，需自行快照 |
+| Set() 方法 | ⚠️ 可扩展 | `server/common/config.go:429-444` | 有旧值，但需 AOP 拦截 |
+| 前端保存流程 | ⚠️ 可扩展 | `public/assets/pages/adminpage/ctrl_settings.js:56-66` | 有表单状态，但不可信 |
+| flattenJSON | ✅ 可用 | `server/common/config.go:221-238` | 可用于路径级 diff 计算 |
+| 审计插件接口 | ✅ 完全自定义 | `server/common/types.go:65-71` | RenderHTML 可展示任意内容 |
+| 编辑器 diff 模式 | ❌ 不适用 | `public/assets/pages/viewerpage/application_editor/diff.js` | 仅用于文件内容 |
+
+---
+
+## 11. 多层级配置合并冲突时的优先级决策
+
+### 11.1 核心结论：四级配置源，高优先级覆盖低优先级
+
+Filestash 的配置系统有**四个层级**的配置源，按照优先级从高到低排列：
+
+| 优先级 | 配置源 | 时机 | 代码位置 |
+|--------|--------|------|----------|
+| 1（最高） | `Config.Set()` 程序化设置 | 运行时 | `server/common/config.go:429-444` |
+| 2 | 环境变量（`Initialise()` 中） | 服务启动 | `server/common/config.go:243-249` |
+| 3 | 配置文件（`config.json`） | 每次 `Load()` | `server/common/config_state.go:40-65` |
+| 4（最低） | 默认值（Schema 定义） | 每次读取 | `server/common/config.go:475-486` |
+
+**决策规则**：高优先级的配置值完全覆盖低优先级的值，没有合并逻辑。
+
+### 11.2 优先级决策代码核对
+
+#### 优先级 1：`Set()` 程序化设置（最高优先级）
+
+```go
+// server/common/config.go:429-444
+func (this *ConfigElement) Set(value interface{}) *ConfigElement {
+    // ...
+    changed := this.currentElement.Value != value
+    if changed {
+        this.currentElement.Value = value  // ← 直接覆盖 Value 字段
+        this.cfg.cache.Clear()
+    }
+    // ...
+    if changed {
+        this.cfg.Save()  // ← 保存到配置文件
+    }
+    return this
+}
+```
+
+**特点**：
+- 直接修改 `FormElement.Value`
+- 自动保存到配置文件（会持久化）
+- 优先级最高，会覆盖所有其他来源
+
+**典型使用场景**：
+```go
+// Initialise() 中设置环境变量
+if env := os.Getenv("ADMIN_PASSWORD"); env != "" {
+    this.Get("auth.admin").Set(env)  // ← 程序化设置
+}
+
+// 自动生成缺失字段
+if this.Get("general.secret_key").String() == "" {
+    key := RandomString(16)
+    this.Get("general.secret_key").Set(key)  // ← 程序化设置
+}
+```
+
+代码位置：`server/common/config.go:429-444`
+
+#### 优先级 2：环境变量（`Initialise()` 中）
+
+```go
+// server/common/config.go:241-260
+func (this *Configuration) Initialise() {
+    shouldSave := false
+    if env := os.Getenv("ADMIN_PASSWORD"); env != "" {
+        shouldSave = true
+        this.Get("auth.admin").Set(env)  // ← 通过 Set() 设置，优先级 1
+    }
+    if env := os.Getenv("APPLICATION_URL"); env != "" {
+        shouldSave = true
+        _ = this.Get("general.host").Set(env).String()  // ← 通过 Set() 设置
+    }
+    // ...
+    if shouldSave {
+        this.Save()  // ← 保存到配置文件
+    }
+    // ...
+}
+```
+
+**注意**：环境变量不是独立的层级，而是通过 `Set()` 方法设置的，所以实际优先级等同于 `Set()`。
+
+#### 优先级 2 变体：`defaultValue[T]()` 编译时环境变量
+
+```go
+// server/common/config.go:506-522
+func defaultValue[T string | int | bool](dval T, envName string) T {
+    if val := os.Getenv(envName); val != "" {
+        switch any(dval).(type) {
+        case int:
+            if n, err := strconv.Atoi(val); err == nil {
+                return any(n).(T)
+            }
+        case bool:
+            if b, err := strconv.ParseBool(val); err == nil {
+                return any(b).(T)
+            }
+        default:
+            return any(val).(T)
+        }
+    }
+    return dval
+}
+```
+
+**使用方式**：
+```go
+// Schema 定义时
+FormElement{
+    Name: "port",
+    Type: "number",
+    Default: defaultValue(8334, "FILESTASH_PORT"),  // ← 环境变量优先
+    // ...
+}
+
+FormElement{
+    Name: "level",
+    Type: "select",
+    Default: defaultValue("INFO", "LOG_LEVEL"),  // ← 环境变量优先
+    // ...
+}
+```
+
+**优先级说明**：
+- 这个环境变量在**编译时**作为 `Default` 值的一部分
+- 优先级低于配置文件（因为配置文件会设置 `Value`，而 `Interface()` 会优先返回 `Value`）
+- 所以实际优先级是：`Set()` > 配置文件 > `defaultValue()` 环境变量 > 硬编码默认值
+
+代码位置：`server/common/config.go:506-522`
+
+#### 优先级 3：配置文件（`config.json`）
+
+```go
+// server/common/config.go:186-211
+func (this *Configuration) Load() error {
+    // ...
+    // 从配置文件加载
+    cFile, err := LoadConfig()  // ← 读取并解密配置文件
+    
+    // 扁平化 JSON
+    raw := map[string]any{}
+    json.Unmarshal(cFile, &raw)
+    
+    // Hydration: 覆盖 Value 字段
+    for path, value := range flattenJSON("", raw) {
+        el := this.Get(path)
+        if el.currentElement != nil && el.currentElement.Value != value {
+            el.currentElement.Value = value  // ← 覆盖 Value
+        }
+    }
+    // ...
+}
+```
+
+**特点**：
+- 覆盖 `FormElement.Value` 字段
+- 每次 `Load()` 都会重新加载
+- 优先级高于 `Default`，低于 `Set()`
+
+#### 优先级 4：默认值（Schema 定义）
+
+```go
+// server/common/config.go:475-486
+func (this *ConfigElement) Interface() interface{} {
+    if this.currentElement == nil {
+        return nil
+    }
+    this.cfg.mu.RLock()
+    el := *this.currentElement
+    this.cfg.mu.RUnlock()
+    if el.Value == nil {
+        return el.Default  // ← Value 为 nil 时返回 Default
+    }
+    return el.Value  // ← 优先返回 Value
+}
+```
+
+**决策点**：
+- `Value != nil` → 返回 `Value`（来自配置文件或 `Set()`）
+- `Value == nil` → 返回 `Default`（来自 Schema 定义，可能包含 `defaultValue()` 环境变量）
+
+代码位置：`server/common/config.go:475-486`
+
+### 11.3 完整优先级决策树
+
+```
+Config.Get("path").String()
+    ↓
+ConfigElement.Interface()
+    ├─ Value != nil ?
+    │   ├─ YES → 返回 Value
+    │   │   ├─ 来源 1：Set() 程序化设置
+    │   │   └─ 来源 2：配置文件 Load()
+    │   └─ NO → 返回 Default
+    │       ├─ Default 来自 defaultValue() ?
+    │       │   ├─ YES → 环境变量存在 ? 返回环境变量值
+    │       │   │                   : 返回硬编码默认值
+    │       │   └─ NO → 返回硬编码默认值
+    │       └─ 来源：Schema 定义
+    └─ currentElement == nil → 返回 nil
+```
+
+### 11.4 冲突场景与决策结果
+
+#### 场景 1：配置文件 vs 环境变量（defaultValue）
+
+```bash
+# 环境变量
+export LOG_LEVEL=DEBUG
+```
+
+```go
+// Schema 定义
+FormElement{
+    Name: "level",
+    Type: "select",
+    Default: defaultValue("INFO", "LOG_LEVEL"),  // Default = "DEBUG"
+}
+```
+
+```json
+// config.json
+{
+    "log": {
+        "level": "WARNING"  // Value = "WARNING"
+    }
+}
+```
+
+**结果**：`Value = "WARNING"` 覆盖 `Default = "DEBUG"` → 返回 `"WARNING"`
+
+#### 场景 2：Set() vs 配置文件
+
+```go
+// 启动时 Initialise()
+if env := os.Getenv("APPLICATION_URL"); env != "" {
+    this.Get("general.host").Set(env)  // Set() 设置 Value = "https://example.com"
+}
+```
+
+```json
+// config.json
+{
+    "general": {
+        "host": "http://localhost:8334"  // 配置文件中的值
+    }
+}
+```
+
+**结果**：
+1. `Load()` 从配置文件加载 → `Value = "http://localhost:8334"`
+2. `Initialise()` 调用 `Set()` → `Value = "https://example.com"`
+3. 最终返回 `"https://example.com"`（`Set()` 优先级更高）
+
+#### 场景 3：多个 Set() 调用
+
+```go
+// 插件 A
+Config.Get("general.upload_pool_size").Set(10)
+
+// 插件 B
+Config.Get("general.upload_pool_size").Set(20)
+```
+
+**结果**：最后调用的 `Set()` 生效 → 返回 `20`
+
+**冲突日志**：
+```go
+// server/common/config.go:418-421
+shouldSave := this.currentElement.Default == nil
+if shouldSave {
+    this.currentElement.Default = value
+} else if this.currentElement.Default != value {
+    Log.Debug("Attempt to set multiple default config value => %+v", this.currentElement)
+}
+```
+
+> 注意：这个日志是针对 `Default` 字段多次设置的警告，不是针对 `Value` 字段。
+
+### 11.5 特殊层级：`constant` 虚拟分组
+
+```go
+// server/common/config.go:488-504
+func (this Configuration) MarshalJSON() ([]byte, error) {
+    return Form{
+        Form: append(this.Form, Form{
+            Title: "constant",
+            Elmnts: []FormElement{
+                {Name: "version", Type: "text", ReadOnly: true, Value: APP_VERSION},
+                {Name: "user", Type: "boolean", ReadOnly: true, Value: username},
+                {Name: "license", Type: "text", ReadOnly: true, Value: LICENSE},
+            },
+        }),
+    }.MarshalJSON()
+}
+```
+
+**特点**：
+- `constant` 分组只在序列化到 JSON 时才存在
+- 字段都是 `ReadOnly: true`
+- 优先级最高（直接硬编码在内存中，无法通过配置文件或环境变量修改）
+
+### 11.6 导出配置的优先级（`Export()`）
+
+```go
+// server/common/config.go:286-362
+func (this *Configuration) Export() interface{} {
+    return struct {
+        Editor                  string `json:"editor"`
+        // ...
+        UploadPoolSize          int    `json:"upload_pool_size"`
+        // ...
+    }{
+        Editor:                  this.Get("general.editor").String(),  // ← 走正常优先级
+        UploadPoolSize:          this.Get("general.upload_pool_size").Int(),
+        // ...
+    }
+}
+```
+
+**说明**：`Export()` 方法通过 `Get()` 读取配置，所以自动遵循优先级规则。
+
+### 11.7 冲突处理的代码核对表
+
+| 冲突场景 | 决策代码 | 结果 |
+|----------|----------|------|
+| 配置文件 vs 默认值 | `Interface()` Value 优先 | 配置文件胜出 |
+| Set() vs 配置文件 | `Set()` 直接覆盖 Value | Set() 胜出 |
+| Set() vs Set() | 后调用的覆盖先调用的 | 后调用者胜出 |
+| defaultValue() 环境变量 vs 配置文件 | Value 优先于 Default | 配置文件胜出 |
+| defaultValue() 环境变量 vs 硬编码默认 | defaultValue() 内部判断 | 环境变量胜出 |
+| constant 分组 vs 所有 | 序列化时硬编码 | constant 胜出 |
+
+---
+
+## 12. 关键代码位置索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
@@ -1460,3 +2093,19 @@ func (s *Share) MarshalJSON() ([]byte, error) {
 | Admin 密码验证 | `server/ctrl/admin.go` | 57-62 |
 | PASSWORD_DUMMY 掩码 | `server/common/types.go` | 178 |
 | FetchAuditHandler API | `server/ctrl/admin.go` | 138-158 |
+| **配置变更审计对比** | | |
+| IAuditPlugin 接口 | `server/common/types.go` | 65-71 |
+| FetchAuditHandler | `server/ctrl/admin.go` | 138-158 |
+| SimpleAudit 默认实现 | `server/model/audit.go` | 58-75 |
+| flattenJSON 工具函数 | `server/common/config.go` | 221-238 |
+| 前端审计模型 | `public/assets/pages/adminpage/model_audit.js` | 1-21 |
+| 前端审计控制器 | `public/assets/pages/adminpage/ctrl_activity_audit.js` | 1-66 |
+| **配置优先级决策** | | |
+| ConfigElement.Set() | `server/common/config.go` | 429-444 |
+| ConfigElement.Interface() | `server/common/config.go` | 475-486 |
+| Configuration.Initialise() | `server/common/config.go` | 241-260 |
+| defaultValue[T]() 泛型函数 | `server/common/config.go` | 506-522 |
+| Configuration.MarshalJSON() | `server/common/config.go` | 488-504 |
+| Configuration.Load() | `server/common/config.go` | 186-219 |
+| Configuration.Export() | `server/common/config.go` | 286-362 |
+| Default 多次设置警告 | `server/common/config.go` | 418-421 |
