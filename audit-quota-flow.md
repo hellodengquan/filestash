@@ -22,9 +22,12 @@ HTTP 请求 → 中间件链 → Controller (ctrl/)
 ## 目录
 
 - [2. 审计日志（操作记录）完整流程](#2-审计日志操作记录完整流程)
+  - [2.2.1 衔接点 10：IAuditPlugin 与 AuthorisationMiddleware 的实现关系与注册流程](#221-衔接点-10iauditplugin-与-authorisationmiddleware-的实现关系与注册流程)
   - [2.4.1 衔接点 7：审计 log 记录持久化与查询索引路径](#241-衔接点-7审计-log-记录持久化与查询索引路径)
+  - [2.4.2 衔接点 11：SimpleAudit 默认实现的全部行为（placeholder 之外）](#242-衔接点-11simpleaudit-默认实现的全部行为placeholder-之外)
   - [2.5 衔接点 1：Save 失败时审计日志如何落地、操作记录与失败结果对齐](#25-衔接点-1save-失败时审计日志如何落地操作记录与失败结果对齐)
   - [2.6.1 衔接点 8：审计检索 API 支持的过滤条件、按时间分页实现](#261-衔接点-8审计检索-api-支持的过滤条件按时间分页实现)
+  - [2.6.2 衔接点 12：批量导出、异步聚合与归档路径](#262-衔接点-12批量导出异步聚合与归档路径)
 - [3. 配额 / 容量限制 完整流程](#3-配额--容量限制-完整流程)
   - [3.2.1 衔接点 9：配额超限通知如何对接邮件 / Webhook / 消息总线](#321-衔接点-9配额超限通知如何对接邮件--webhook--消息总线)
   - [3.3.1 衔接点 3：大文件分块上传 mid-stream 配额检查与最终入库前二次校验](#331-衔接点-3大文件分块上传-mid-stream-配额检查与最终入库前二次校验)
@@ -75,6 +78,143 @@ func init() {
     Hooks.Register.AuditEngine(SimpleAudit{})
 }
 ```
+
+### 2.2.1 衔接点 10：IAuditPlugin 与 AuthorisationMiddleware 的实现关系与注册流程
+
+#### 2.2.1.1 两个接口的职责分离
+
+审计体系由**两个完全独立的接口**协作完成，分别负责"写"和"读"：
+
+| 接口 | 职责 | 方法数 | 注册 Hook | 调用时机 |
+|------|------|--------|-----------|----------|
+| `IAuthorisation` | **操作拦截（写入口）** | 8 个（Ls/Cat/Stat/Mkdir/Rm/Mv/Save/Touch） | `Hooks.Register.AuthorisationMiddleware()` | 每个文件操作**执行前** |
+| `IAuditPlugin` | **审计查询（读出口）** | 1 个（Query） | `Hooks.Register.AuditEngine()` | 管理后台查询审计记录时 |
+
+两个接口在类型系统上**没有任何继承或包含关系**，完全独立。
+
+#### 2.2.1.2 为什么是两个接口而不是一个
+
+设计意图是**关注点分离**：
+
+1. `IAuthorisation` 是通用的权限/授权中间件，**不是专为审计设计的**：
+   - 可以用来做权限控制（返回 error 阻止操作）
+   - 可以用来做审计记录（返回 nil 但顺便记一笔）
+   - 可以用来做事件触发（比如 workflow 的 fileevent trigger）
+
+2. `IAuditPlugin` 是专属的查询接口：
+   - 返回 `Form` 定义搜索条件
+   - 返回 `RenderHTML` 渲染结果表格
+   - 只在管理后台审计页面使用
+
+一个完整的审计插件需要**同时注册到两个 Hook 上**：
+
+```go
+type FullAudit struct{}
+
+// 实现 IAuthorisation → 写
+func (this FullAudit) Ls(ctx *App, path string) error    { writeAudit("ls", path, ctx); return nil }
+func (this FullAudit) Cat(ctx *App, path string) error   { writeAudit("cat", path, ctx); return nil }
+func (this FullAudit) Save(ctx *App, path string) error  { writeAudit("save", path, ctx); return nil }
+// ... 其余 5 个方法
+
+// 实现 IAuditPlugin → 读
+func (this FullAudit) Query(ctx *App, p map[string]string) (AuditQueryResult, error) {
+    return AuditQueryResult{Form: &AuditForm, RenderHTML: renderTable(p)}, nil
+}
+
+func init() {
+    // 同时注册两个 Hook
+    Hooks.Register.AuthorisationMiddleware(FullAudit{})
+    Hooks.Register.AuditEngine(FullAudit{})
+}
+```
+
+#### 2.2.1.3 注册时序与流程
+
+注册分两条线，在不同时间点完成：
+
+**线 A：IAuthorisation（通过 Workflow Trigger 间接注册）**
+
+```
+进程启动 → init() 全部执行
+    │
+    ├─ model/audit.go init()
+    │   └─ Hooks.Register.AuditEngine(SimpleAudit{})
+    │         ↑ 只有 IAuditPlugin 在这里注册
+    │
+    ├─ workflow/trigger/fileaction.go init()
+    │   └─ Hooks.Register.WorkflowTrigger(&FileEventTrigger{})
+    │
+    └─ 所有 plg_* 插件 init()
+        └─ 各自注册自己的东西
+            ↓
+Onload 阶段 → 启动 HTTP server 之前
+    │
+    └─ workflow.Init()
+        ├─ 遍历所有 WorkflowTrigger
+        └─ 每个 trigger.Init()
+            └─ FileEventTrigger.Init()
+                └─ Hooks.Register.AuthorisationMiddleware(hookAuthorisation{})
+                      ↑ 审计写入链的核心中间件在这里才注册
+```
+
+**注意**：`hookAuthorisation` 不是由审计插件注册的，而是由 `FileEventTrigger`（workflow 的 trigger）注册的。它的作用是把文件操作转化为 workflow 事件，不是直接写审计日志。
+
+**线 B：IAuditPlugin（直接注册）**
+
+```
+进程启动 → model/audit.go init()
+    └─ Hooks.Register.AuditEngine(SimpleAudit{})
+       ↑ 默认占位实现
+
+→ 如果安装了自定义审计插件 → 插件 init()
+    └─ Hooks.Register.AuditEngine(MyAudit{})
+       ↑ 覆盖默认的 SimpleAudit（因为 audit 是单例变量，后注册覆盖先注册）
+```
+
+**关键细节**：`audit` 是**单例**（`var audit IAuditPlugin`），后注册的会覆盖先注册的。而 `AuthorisationMiddleware` 是**切片**（`var authorisationMiddleware []IAuthorisation`），注册的都会保留，按顺序调用。
+
+#### 2.2.1.4 调用链上的位置
+
+```
+HTTP 请求 → Controller (FileSave / FileLs / ...)
+                  │
+                  ▼
+         for _, auth := range Hooks.Get.AuthorisationMiddleware() {
+             auth.Save(ctx, path)  ← 写入端：IAuthorisation 链
+             if err != nil { return 403 }
+         }
+                  │
+                  ▼
+         ctx.Backend.Save(path, reader)  ← 实际操作
+                  │
+                  ▼
+管理后台 GET /admin/api/audit
+    │
+    └─ plg := Hooks.Get.AuditEngine()  ← 读取端：IAuditPlugin 单例
+       result := plg.Query(ctx, searchParams)
+```
+
+#### 2.2.1.5 hookAuthorisation 的特殊地位
+
+`hookAuthorisation`（`server/pkg/workflow/trigger/fileaction.go:19-59`）是**默认就有的** AuthorisationMiddleware，它不是审计插件，但它是审计记录的**间接源头**：
+
+```go
+type hookAuthorisation struct{}
+
+func (this hookAuthorisation) Save(ctx *App, path string) error {
+    processFileAction(ctx, map[string]string{"event": "stat", "path": path})
+    return nil  // 永远返回 nil，不阻止操作
+}
+```
+
+它的作用是**把每个文件操作发布为 workflow 事件**，不做持久化。如果用户配置了"文件事件触发 + 自定义 Action"的 workflow，就可以通过 Action 间接实现审计写入（比如 `run/api` 调外部服务写审计库）。
+
+但这种方式有几个局限：
+- 是**异步**的（workflow job 入队，worker 异步执行）
+- 每个操作都要走一遍 workflow 匹配逻辑，有性能开销
+- 无法获取操作的最终结果（成功/失败）
+- 需要用户手动配置 workflow，不是开箱即用
 
 ### 2.3 操作记录的触发链路
 
@@ -331,6 +471,98 @@ func (this DBAuditPlugin) Query(ctx *App, p map[string]string) (AuditQueryResult
 | 按时间过滤 | ❌ 无 | 无（`/admin/api/logs` 只支持倒序 maxSize） | ✅ |
 | 分页 | ❌ 无 | 无 | ✅ |
 | 按用户/路径/后端/操作类型过滤 | ❌ 无 | Workflow `FindWorkflows` 有 trigger 过滤但不是审计表 | ✅ |
+
+### 2.4.2 衔接点 11：SimpleAudit 默认实现的全部行为（placeholder 之外）
+
+`SimpleAudit`（`server/model/audit.go:58-75`）虽然是占位符，但它**不是空的**。除了返回红色提示 HTML 之外，它还做了以下几件事：
+
+#### 2.4.2.1 提供完整的搜索表单定义
+
+`SimpleAudit.Query()` 返回的 `AuditQueryResult` 包含 `Form: &AuditForm`。`AuditForm`（`audit.go:11-56`）是一个包级变量，定义了**9 个搜索字段**的完整表单结构：
+
+```go
+var AuditForm Form = Form{
+    Form: []Form{
+        Form{
+            Title: "search",
+            Elmnts: []FormElement{
+                {Name: "date from", Type: "datetime"},
+                {Name: "date to",   Type: "datetime"},
+                {
+                    Name: "action", Type: "select",
+                    Opts: []string{"", "rename", "list", "download",
+                                   "create_folder", "remove", "move",
+                                   "save_file", "create_file"},
+                },
+                {Name: "path",    Type: "text"},
+                {Name: "backend", Type: "text"},
+                {Name: "session", Type: "text"},
+                {Name: "share",   Type: "text"},
+                {Name: "user",    Type: "text"},
+                {Name: "target",  Type: "text"},
+            },
+        },
+    },
+}
+```
+
+前端拿到这个 Form 后，会自动渲染成搜索栏。也就是说——**即使没有安装审计插件，管理后台的审计页面也有一个完整的搜索表单**，只是搜索结果区域是红色提示。
+
+#### 2.4.2.2 定义了操作类型的标准枚举
+
+`action` 字段的 `Opts` 定义了 8 种标准操作类型：`rename`、`list`、`download`、`create_folder`、`remove`、`move`、`save_file`、`create_file`。
+
+这是**审计操作类型的"官方标准"**，自定义审计插件应该沿用这些枚举值以保持表单兼容。
+
+**注意**：这里的操作类型枚举（`save_file`/`create_file`）与 `hookAuthorisation` 中的事件名（`stat`/`save`/`touch` 等）**不一致**：
+
+| hookAuthorisation event | AuditForm action 选项 | 对应关系 |
+|-------------------------|----------------------|----------|
+| `ls` | `list` / `download` | 列表浏览/文件下载 |
+| `cat` | `download` | 文件下载 |
+| `stat` | `save_file` | 文件上传（Save 操作） |
+| `save` | `create_file` | 文件创建？ |
+| `mkdir` | `create_folder` | 目录创建 |
+| `rm` | `remove` | 删除 |
+| `mv` | `move` / `rename` | 移动/重命名 |
+| `touch` | （无对应） | 创建空文件 |
+
+**这是一个设计不一致点**：事件名和表单枚举不是一一对应的。`Save` 操作对应的 event 是 `stat`（`fileaction.go:47`），而 `Stat` 操作对应的 event 是 `save`（`fileaction.go:52`）— 看起来是写反了。
+
+#### 2.4.2.3 渲染内联 CSS 样式
+
+`RenderHTML` 中除了提示文字，还包含了一段内联的 `<style>`，用来定义 `#alert-audit-missing` 的红色背景样式，使用 CSS 变量（`--error`、`--super-light`）确保与主题色一致。
+
+#### 2.4.2.4 忽略所有搜索参数
+
+`SimpleAudit.Query()` 方法签名里有 `searchParams map[string]string` 参数，但函数体内**完全没有使用它**——无论你传什么过滤条件，都返回同样的占位 HTML。
+
+```go
+func (this SimpleAudit) Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error) {
+    // searchParams 完全没被使用
+    return AuditQueryResult{...}, nil
+}
+```
+
+#### 2.4.2.5 作为单例被注册
+
+`SimpleAudit{}` 在 `init()` 中注册为默认 `AuditEngine`（`audit.go:7-9`）。因为 `audit` 是单例变量，**自定义审计插件的 init() 只要在 model/audit.go 之后执行，就能覆盖默认实现**。
+
+由于 Go 的 `init()` 执行顺序是按包的导入顺序决定的，而 `server/plugin/index.go` 导入了所有插件包，且 `server/model` 包通常被更早导入，所以**自定义插件通常能覆盖 SimpleAudit**。
+
+#### 2.4.2.6 SimpleAudit 不做的事（总结）
+
+| 行为 | SimpleAudit 是否做 |
+|------|-------------------|
+| 返回搜索表单定义（9 个字段） | ✅ |
+| 定义操作类型枚举 | ✅ |
+| 返回占位提示 HTML + CSS | ✅ |
+| 读取/写入任何持久化存储 | ❌ |
+| 解析/使用搜索过滤参数 | ❌ |
+| 按时间分页 | ❌ |
+| 按用户/路径/后端过滤 | ❌ |
+| 返回结构化数据（JSON） | ❌（只返回 HTML 字符串） |
+| 批量导出 | ❌ |
 
 ### 2.5 衔接点 1：Save 失败时审计日志如何落地、操作记录与失败结果对齐
 
@@ -617,6 +849,138 @@ SELECT COALESCE(JSON_GROUP_ARRAY(JSON_OBJECT(...)), JSON_ARRAY()) FROM (
     ORDER BY j.created_at DESC
     LIMIT 3000    -- 硬编码 LIMIT，没有 OFFSET / page 控制
 ) j
+```
+
+### 2.6.2 衔接点 12：批量导出、异步聚合与归档路径
+
+#### 2.6.2.1 核心结论：全部缺失
+
+Filestash 核心框架**完全不提供**以下能力：
+
+| 能力 | 框架默认 | 可复用体系 | 需自建 |
+|------|---------|-----------|--------|
+| 批量导出（CSV/JSON/XLSX） | ❌ 无 | 无 | ✅ |
+| 异步聚合（按天/周/用户统计） | ❌ 无 | 无 | ✅ |
+| 自动归档（历史数据迁移、冷存储） | ❌ 无 | 无 | ✅ |
+| 数据保留策略（N 天后自动删除） | ❌ 无 | 无 | ✅ |
+| 导出进度追踪 | ❌ 无 | 无 | ✅ |
+
+`AuditQueryResult` 的唯一返回格式是 `Form + RenderHTML`（HTML 字符串），**没有 JSON 数据接口，没有流式下载接口**。
+
+#### 2.6.2.2 为什么缺失——设计定位
+
+审计查询接口的设计定位是**"管理后台页面渲染"**，不是"数据导出 API"：
+
+1. **返回 HTML 不是 JSON**：`AuditQueryResult.RenderHTML` 是预渲染好的 HTML 表格，前端直接插入 DOM，不需要额外解析
+2. **查询耦合表单定义**：返回结果同时包含 `Form` 结构，前端用同一个接口既拿表单定义又拿结果
+3. **单页展示为主**：没有分页暗示着默认数据量不会太大，单页展示即可
+
+#### 2.6.2.3 唯一沾边的"导出"：本地日志文件
+
+`/admin/api/logs` 接口（`FetchLogHandler`）能下载纯文本日志，但那是**HTTP 访问日志**，不是审计日志：
+
+- 格式：纯文本行（`2026/06/20 10:30:45 HTTP 200 GET /api/files/cat?path=...`）
+- 不支持过滤：只有 `maxSize` 参数倒序读取尾部 N 字节
+- 不是结构化数据：没法直接做统计分析
+
+#### 2.6.2.4 唯一沾边的"聚合"：Workflow Job 统计
+
+Workflow 的 `GetWorkflow` 查询中附带了 Job 统计（`workflow.go:103-136`）：
+
+```sql
+JSON_OBJECT(
+    'id', w.id,
+    'name', w.name,
+    ...,
+    'jobs', (
+        SELECT COALESCE(JSON_GROUP_ARRAY(JSON_OBJECT(...)), JSON_ARRAY())
+        FROM (
+            SELECT * FROM jobs j
+            WHERE j.related_workflow = w.id
+            ORDER BY j.created_at DESC
+            LIMIT 3000
+        ) j
+    )
+)
+```
+
+但这是 workflow 执行历史，不是审计操作记录。而且是**一次性把 3000 条全部塞进 JSON**，不是流式分页。
+
+#### 2.6.2.5 自定义批量导出方案
+
+```go
+// 注册一个新的 API Handler 用于导出
+func init() {
+    // 方式 1：通过 Middleware 拦截 /admin/api/audit/export 路径
+    Hooks.Register.Middleware(exportMiddleware)
+
+    // 方式 2：在 IAuditPlugin.Query 中识别特殊参数
+    // 比如 searchParams["format"] == "csv" 时返回 CSV
+}
+
+func (this DBAuditPlugin) Query(ctx *App, p map[string]string) (AuditQueryResult, error) {
+    // 如果请求格式是 csv，直接设置响应头返回 csv
+    if p["format"] == "csv" {
+        if w, ok := ctx.Context.Value("response_writer").(http.ResponseWriter); ok {
+            w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+            w.Header().Set("Content-Disposition",
+                "attachment; filename=audit_"+time.Now().Format("20060102")+".csv")
+            // 流式写入 CSV
+            rows, _ := DB.Query("SELECT ... FROM audit_log WHERE ...")
+            fmt.Fprintf(w, "id,event,path,user,backend,status,created_at\n")
+            for rows.Next() {
+                var id int
+                var event, path, user, backend, status, createdAt string
+                rows.Scan(&id, &event, &path, &user, &backend, &status, &createdAt)
+                fmt.Fprintf(w, "%d,%s,%s,%s,%s,%s,%s\n",
+                    id, csvEscape(event), csvEscape(path),
+                    csvEscape(user), csvEscape(backend),
+                    csvEscape(status), createdAt)
+            }
+            return AuditQueryResult{}, nil
+        }
+    }
+    // ... 正常 HTML 渲染
+}
+```
+
+#### 2.6.2.6 自定义异步聚合与归档方案
+
+```go
+func init() {
+    // 在 Onload 中启动聚合 + 归档的定时任务
+    Hooks.Register.Onload(func() {
+        go func() {
+            ticker := time.NewTicker(24 * time.Hour)
+            defer ticker.Stop()
+            for range ticker.C {
+                aggregateAuditLogs()   // 按天聚合
+                archiveOldAuditLogs()  // 归档 90 天前的数据
+                purgeExpiredLogs()     // 删除超过保留期的数据
+            }
+        }()
+    })
+}
+
+func aggregateAuditLogs() {
+    // 生成每日聚合表：audit_daily_stats(date, user_id, backend, event, count)
+    DB.Exec(`
+        INSERT OR REPLACE INTO audit_daily_stats (date, user_id, backend, event, count)
+        SELECT DATE(created_at) as date, user_id, backend, event, COUNT(*)
+        FROM audit_log
+        WHERE created_at >= DATE('now', '-1 day')
+        GROUP BY date, user_id, backend, event
+    `)
+}
+
+func archiveOldAuditLogs() {
+    // 把 90 天前的日志归档到另一张表或外部存储
+    DB.Exec(`
+        INSERT INTO audit_log_archive
+        SELECT * FROM audit_log WHERE created_at < DATE('now', '-90 days')
+    `)
+    DB.Exec(`DELETE FROM audit_log WHERE created_at < DATE('now', '-90 days')`)
+}
 ```
 
 ### 2.7 审计 Form 支持的查询字段
