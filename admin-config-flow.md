@@ -15,7 +15,9 @@
 - [9. 敏感字段在审计场景下的明文恢复路径](#9-敏感字段在审计场景下的明文恢复路径)
 - [10. 配置变更在审计记录中的字段对比展示路径](#10-配置变更在审计记录中的字段对比展示路径)
 - [11. 多层级配置合并冲突时的优先级决策](#11-多层级配置合并冲突时的优先级决策)
-- [12. 关键代码位置索引](#12-关键代码位置索引)
+- [12. 配置变更预览（保存前展示影响范围）](#12-配置变更预览保存前展示影响范围)
+- [13. 审计记录检索过滤机制](#13-审计记录检索过滤机制)
+- [14. 关键代码位置索引](#14-关键代码位置索引)
 
 ---
 
@@ -2038,7 +2040,506 @@ func (this *Configuration) Export() interface{} {
 
 ---
 
-## 12. 关键代码位置索引
+## 12. 配置变更预览（保存前展示影响范围）
+
+### 12.1 核心结论：无显式预览，隐式影响通过 Schema 元数据传达
+
+Filestash **没有**独立的"变更预览"步骤。配置修改后立即通过防抖管道保存，不提供保存前的 diff 预览或影响范围评估。但系统通过**Schema 元数据**和**enable/target 联动**机制，隐式地让用户理解配置变更的影响范围。
+
+### 12.2 前端保存流程中"缺失"的预览环节
+
+#### 当前保存流程（无预览）
+
+```javascript
+// public/assets/pages/adminpage/ctrl_settings.js:56-66
+effect(init$.pipe(
+    useForm$(() => qsa($container, "[data-bind=\"form\"] [name]")),
+    rxjs.debounceTime(250),           // ← 输入防抖
+    rxjs.mergeMap((formState) => config$.pipe(
+        rxjs.first(),
+        rxjs.map((formSpec) => mutateForm(formSpec, formState)),  // ← 应用变更
+    )),
+    reshapeConfigBeforeSave,          // ← 重组配置
+    saveConfig(),                      // ← 直接保存，无预览步骤
+    rxjs.catchError(ctrlError()),
+));
+```
+
+**关键缺失**：`mutateForm()` → `saveConfig()` 之间没有任何对比、确认或预览步骤。
+
+代码位置：`public/assets/pages/adminpage/ctrl_settings.js:56-66`
+
+#### 理想流程（含预览）
+
+```
+用户修改 → mutateForm() → [预览步骤] → saveConfig()
+                           ↑
+                    对比 formSpec 旧值 vs formState 新值
+                    展示变更影响范围
+                    用户确认后继续
+```
+
+### 12.3 隐式影响范围传达机制
+
+虽然没有显式预览，但系统通过以下机制隐式传达配置变更的影响范围：
+
+#### 机制 1：`enable` + `target` 联动
+
+**Schema 定义**：
+
+```go
+// server/common/config.go:119
+FormElement{
+    Name: "enable",
+    Type: "enable",
+    Target: []string{"log_level"},   // ← 控制哪些字段
+    Default: true,
+}
+FormElement{
+    Name: "level",
+    Type: "select",
+    Id: "log_level",                 // ← 被 target 引用
+    Default: defaultValue("INFO", "LOG_LEVEL"),
+    Opts: []string{"DEBUG", "INFO", "WARNING", "ERROR"},
+}
+```
+
+**前端联动实现**：
+
+```javascript
+// public/assets/lib/form.js:63-110
+const canToggleOtherElements = node[key].type === "enable" 
+    && node[key].target 
+    && node[key].target.length > 0;
+
+if (canToggleOtherElements) {
+    // 创建受控容器
+    const $container = window.document.createElement("div");
+    $container.classList.add("advanced_form");
+    
+    // 遍历同组字段，找出 target 匹配的
+    for (const k of Object.keys(node)) {
+        if (!node[k].id) continue;
+        if (node[key].target.indexOf(node[k].id) === -1) continue;
+        // 将匹配字段加入容器
+        const $kleaf = renderLeaf({ ...node[k], path: path.concat(k), label: k });
+        const $kinput = await renderInput({ ...node[k], path: path.concat(k) });
+        // ...
+        $container.appendChild($kleaf);
+    }
+
+    // 初始状态：根据 enable 值显示/隐藏
+    const isToggled = typeof node[key].value === "boolean" 
+        ? node[key].value 
+        : node[key].default;
+    if (!isToggled) $container.style.setProperty("display", "none");
+
+    // 切换事件：动画显示/隐藏
+    $input.onchange = async(e) => {
+        $container.style.setProperty("display", "inherit");
+        if (e.target.checked) {
+            animate($container, {
+                time: Math.max(50, Math.min(clientHeight, 150)),
+                keyframes: [{ height: "0" }, { height: `${clientHeight}px` }]
+            });
+        } else {
+            animate($container, {
+                time: Math.max(25, Math.min(clientHeight, 75)),
+                keyframes: [{ height: `${clientHeight}px` }, { height: "0" }]
+            });
+        }
+    };
+}
+```
+
+**效果**：
+- 关闭 `log.enable` → `log.level` 字段动画隐藏
+- 开启 `log.enable` → `log.level` 字段动画显示
+- 用户在操作时就能看到哪些字段受影响
+
+代码位置：`public/assets/lib/form.js:63-110`
+
+#### 机制 2：`Description` 字段提示
+
+```go
+FormElement{
+    Name: "level",
+    Type: "select",
+    Description: `Default: "INFO". This setting determines the level of detail 
+                   at which log events are written to the log file`,
+}
+FormElement{
+    Name: "enable_chromecast",
+    Type: "boolean",
+    Default: true,
+    Description: "Enable users to stream content on a chromecast device. 
+                   This feature requires the browser to access google's server 
+                   to download the chromecast SDK.",
+}
+```
+
+**前端渲染**：
+
+```javascript
+// public/assets/pages/adminpage/helper_form.js:22-29
+if (description) $el.appendChild(createElement(`
+    <div class="flex">
+        <span class="nothing"></span>
+        <div style="width:100%;">
+            <div class="description">${description}</div>
+        </div>
+    </div>
+`));
+```
+
+每个配置项的 Description 提示了变更后的影响，是"预览"的文本替代。
+
+#### 机制 3：`ReadOnly` 字段防误改
+
+```go
+// server/common/config.go:500-501
+{Name: "user", Type: "boolean", ReadOnly: true, Value: username},
+{Name: "license", Type: "text", ReadOnly: true, Value: LICENSE},
+```
+
+```javascript
+// public/assets/components/form.js:80
+if (readonly) attrs.push(($node) => $node.setAttribute("disabled", ""));
+```
+
+只读字段标记为 `disabled`，防止用户误改不可逆的配置。
+
+### 12.4 后端的影响范围传播链路
+
+配置变更保存后，影响范围通过以下链路传播：
+
+```
+POST /admin/api/config
+    ↓
+PrivateConfigUpdateHandler
+    ↓
+SaveConfig(b) → 写入磁盘
+    ↓
+Config.Load() → 重新加载
+    ├─ this.cache.Clear()          → 缓存失效
+    ├─ Log.SetVisibility(...)      → 日志级别立即生效
+    └─ Hooks.Get.OnConfig()        → 通知所有插件
+         ├─ plg_widget_favourite   → 根据 enable 注册/注销前端补丁
+         ├─ plg_editor_codemirror  → 根据 collaborative.enable 切换协作编辑
+         └─ ...其他插件
+```
+
+**影响范围传播的关键代码**：
+
+```go
+// server/common/config.go:213-217
+this.cache.Clear()                                    // ← 影响所有缓存的读取
+Log.SetVisibility(this.Get("log.level").String())     // ← 影响日志输出
+for _, fn := range Hooks.Get.OnConfig() {
+    fn()                                              // ← 影响所有注册了 OnConfig 的插件
+}
+```
+
+**OnConfig 钩子的实际使用示例**：
+
+```go
+// server/plugin/plg_widget_favourite/index.go:26-32
+Hooks.Register.OnConfig(func() {
+    if PluginEnable() {
+        Hooks.Register.StaticPatch(PATCH, WithID("plg_widget_favourite"))
+    } else {
+        Hooks.Register.StaticPatch([]byte(""), WithID("plg_widget_favourite"))
+    }
+})
+```
+
+当配置变更影响 `favourite` 插件的 enable 状态时，`OnConfig` 钩子动态注册或注销前端 JS 补丁，改变用户界面。
+
+### 12.5 配置变更影响范围汇总
+
+| 变更类别 | 影响范围 | 传播机制 | 时效性 |
+|----------|----------|----------|--------|
+| `general.*` | 前端 UI、上传、编辑器 | `Export()` → 前端拉取 | 保存后立即 |
+| `log.level` | 日志输出 | `Log.SetVisibility()` | 保存后立即 |
+| `log.enable` | HTTP 请求日志 | 中间件 `Config.Get()` | 保存后立即 |
+| `features.*.enable` | 功能开关 | `OnConfig` 钩子 | 保存后立即 |
+| `middleware.*` | 认证/授权 | `Export()` → 前端 | 保存后立即 |
+| `auth.admin` | Admin 认证 | `bcrypt` 验证 | 保存后立即 |
+| `general.secret_key` | 加密/解密 | `InitSecretDerivate()` | **需要重启** |
+| `email.*` | 邮件发送 | `Config.Get()` | 保存后立即 |
+
+**特别注意**：`general.secret_key` 变更后，需要重启服务才能生效（`InitSecretDerivate()` 只在 `Initialise()` 中调用）。
+
+### 12.6 预览功能的实现路径
+
+如果需要添加保存前预览功能，可以在以下位置实现：
+
+#### 前端方案：在 `saveConfig()` 前插入预览步骤
+
+```javascript
+// 理想实现位置：ctrl_settings.js:56-66
+effect(init$.pipe(
+    useForm$(() => qsa($container, "[data-bind=\"form\"] [name]")),
+    rxjs.debounceTime(250),
+    rxjs.mergeMap((formState) => config$.pipe(
+        rxjs.first(),
+        rxjs.map((formSpec) => {
+            const changes = computeChanges(formSpec, formState);
+            if (changes.length > 0) {
+                showPreviewModal(changes);  // ← 新增预览步骤
+            }
+            return mutateForm(formSpec, formState);
+        }),
+    )),
+    // reshapeConfigBeforeSave,
+    // saveConfig(),           ← 确认后才保存
+));
+```
+
+#### 后端方案：新增 dry-run API
+
+```
+POST /admin/api/config/dry-run
+Body: 新配置 JSON
+Response: {
+    "changes": [
+        {"path": "log.level", "old": "INFO", "new": "DEBUG", "impact": "日志输出级别变更"}
+    ],
+    "warnings": [
+        {"path": "general.secret_key", "message": "修改 secret_key 需要重启服务才能生效"}
+    ]
+}
+```
+
+---
+
+## 13. 审计记录检索过滤机制
+
+### 13.1 核心结论：可插拔过滤，核心只传参
+
+Filestash 的审计检索过滤完全委托给审计插件。核心系统只负责**将前端搜索参数透传**给插件的 `Query()` 方法，不执行任何过滤逻辑。
+
+### 13.2 审计检索的完整链路
+
+```
+前端审计页面
+    ↓
+用户填写搜索条件
+    ↓
+GET /admin/api/audit?date_from=...&date_to=...&action=...&path=...
+    ↓
+FetchAuditHandler (server/ctrl/admin.go:138)
+    ├─ 提取 URL 查询参数
+    └─ 调用 AuditEngine.Query(searchParams)
+         ↓
+审计插件执行查询（完全自定义）
+    ├─ 过滤逻辑（插件实现）
+    ├─ 结果渲染（插件生成 HTML）
+    └─ 返回 AuditQueryResult
+         ↓
+前端渲染 RenderHTML
+```
+
+### 13.3 前端过滤参数收集
+
+#### 搜索表单 Schema（默认）
+
+```go
+// server/model/audit.go:11-55
+var AuditForm Form = Form{
+    Form: []Form{
+        Form{
+            Title: "search",
+            Elmnts: []FormElement{
+                FormElement{Name: "date from", Type: "datetime"},
+                FormElement{Name: "date to",   Type: "datetime"},
+                FormElement{Name: "action",    Type: "select",
+                    Opts: []string{"", "rename", "list", "download",
+                                    "create_folder", "remove", "move",
+                                    "save_file", "create_file"}},
+                FormElement{Name: "path",      Type: "text"},
+                FormElement{Name: "backend",   Type: "text"},
+                FormElement{Name: "session",   Type: "text"},
+                FormElement{Name: "share",     Type: "text"},
+                FormElement{Name: "user",      Type: "text"},
+                FormElement{Name: "target",    Type: "text"},
+            },
+        },
+    },
+}
+```
+
+**9 个过滤维度**：
+1. `date from` / `date to` — 时间范围
+2. `action` — 操作类型（rename/list/download 等）
+3. `path` — 文件路径
+4. `backend` — 后端标识
+5. `session` — 会话 ID
+6. `share` — 分享链接 ID
+7. `user` — 用户标识
+8. `target` — 操作目标
+
+代码位置：`server/model/audit.go:11-55`
+
+#### 前端参数收集与提交
+
+```javascript
+// public/assets/pages/adminpage/ctrl_activity_audit.js:49-65
+effect(rxjs.of(null).pipe(
+    useForm$(() => qsa($page, "form [name]")),
+    rxjs.tap(() => setLoader(true)),
+    rxjs.debounceTime(1000),               // ← 1 秒防抖
+    rxjs.first(),                           // ← 只触发一次
+    rxjs.map(() => qs($page, "form")),
+    rxjs.map(($form) => {
+        const formData = new FormData($form);
+        const p = new URLSearchParams();
+        for (const [key, value] of formData.entries()) {
+            if (!value) continue;           // ← 空值跳过
+            // 移除 "search." 前缀
+            p.set(key.replace(new RegExp("^search\."), ""), `${value}`);
+        }
+        return p;
+    }),
+    // 递归调用 updateLoop，传入新搜索参数
+    rxjs.tap((p) => updateLoop($page, getAudit(p).pipe(rxjs.share()))),
+));
+```
+
+**关键行为**：
+1. 用户修改搜索条件后，1 秒防抖触发
+2. 空值参数被过滤（不会发送空字符串）
+3. 搜索表单的 `name` 属性带 `search.` 前缀，提交时移除
+4. 搜索结果通过 `getAudit(params)` 重新获取
+
+代码位置：`public/assets/pages/adminpage/ctrl_activity_audit.js:49-65`
+
+### 13.4 后端参数透传
+
+```go
+// server/ctrl/admin.go:138-158
+func FetchAuditHandler(ctx *App, res http.ResponseWriter, req *http.Request) {
+    plg := Hooks.Get.AuditEngine()
+    if plg == nil {
+        SendErrorResult(res, ErrNotImplemented)  // ← 无插件时返回 501
+        return
+    }
+    searchParams := map[string]string{}
+    _get := req.URL.Query()
+    for key, element := range _get {
+        if len(element) == 0 {
+            continue
+        }
+        searchParams[key] = element[0]  // ← 只取第一个值
+    }
+    result, err := plg.Query(ctx, searchParams)  // ← 透传给插件
+    if err != nil {
+        SendErrorResult(res, err)
+        return
+    }
+    SendSuccessResult(res, result)
+}
+```
+
+**特点**：
+- 核心系统**不解析、不验证**搜索参数
+- 参数以 `map[string]string` 透传给审计插件
+- 每个参数只取第一个值（不支持多值）
+- 无插件时返回 `ErrNotImplemented`
+
+代码位置：`server/ctrl/admin.go:138-158`
+
+### 13.5 审计过滤机制的挂载点
+
+| 挂载点 | 层级 | 可定制内容 | 代码位置 |
+|--------|------|-----------|----------|
+| `AuditForm` Schema | 默认 | 搜索表单的字段定义 | `server/model/audit.go:11-55` |
+| `IAuditPlugin.Query()` | 插件 | 过滤逻辑 + 结果渲染 | `server/common/types.go:65-67` |
+| `FetchAuditHandler` | 核心 | 参数透传（不可定制） | `server/ctrl/admin.go:138-158` |
+| `model_audit.js` | 前端 | HTTP 请求（不可定制） | `public/assets/pages/adminpage/model_audit.js:6-13` |
+| `ctrl_activity_audit.js` | 前端 | 防抖时间、参数格式 | `public/assets/pages/adminpage/ctrl_activity_audit.js:49-65` |
+| `AuditQueryResult.Form` | 插件 | 自定义搜索表单 | `server/common/types.go:68-71` |
+| `AuditQueryResult.RenderHTML` | 插件 | 自定义结果展示 | `server/common/types.go:68-71` |
+
+### 13.6 审计插件自定义过滤的实现路径
+
+#### 自定义搜索表单
+
+审计插件可以返回自己的 `Form`，替代默认的 `AuditForm`：
+
+```go
+func (myAudit MyAudit) Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error) {
+    return AuditQueryResult{
+        Form: &Form{
+            Form: []Form{
+                Form{
+                    Title: "search",
+                    Elmnts: []FormElement{
+                        FormElement{Name: "date from", Type: "datetime"},
+                        FormElement{Name: "date to", Type: "datetime"},
+                        FormElement{Name: "action", Type: "select",
+                            Opts: []string{"", "config_change", "login", "file_op"}},
+                        FormElement{Name: "field", Type: "text"},    // ← 新增过滤维度
+                        FormElement{Name: "old_value", Type: "text"}, // ← 新增过滤维度
+                        FormElement{Name: "new_value", Type: "text"}, // ← 新增过滤维度
+                    },
+                },
+            },
+        },
+        RenderHTML: "...</table>",
+    }, nil
+}
+```
+
+#### 自定义过滤逻辑
+
+```go
+func (myAudit MyAudit) Query(ctx *App, searchParams map[string]string) (AuditQueryResult, error) {
+    // 1. 从搜索参数构建数据库查询
+    query := db.Where("1=1")
+    if dateFrom, ok := searchParams["date from"]; ok {
+        query = query.Where("timestamp >= ?", dateFrom)
+    }
+    if dateTo, ok := searchParams["date to"]; ok {
+        query = query.Where("timestamp <= ?", dateTo)
+    }
+    if action, ok := searchParams["action"]; ok {
+        query = query.Where("action = ?", action)
+    }
+    
+    // 2. 执行查询
+    var results []AuditRecord
+    query.Find(&results)
+    
+    // 3. 生成 HTML
+    html := renderAuditTable(results)
+    
+    return AuditQueryResult{
+        Form:       &AuditForm,
+        RenderHTML: html,
+    }, nil
+}
+```
+
+### 13.7 过滤机制的代码核对表
+
+| 核对项 | 代码位置 | 状态 |
+|--------|----------|------|
+| 搜索表单由审计插件定义 | `server/model/audit.go:11-55` | ✅ 默认9维度，插件可覆盖 |
+| 前端1秒防抖触发搜索 | `ctrl_activity_audit.js:52` | ✅ |
+| 空值参数被过滤 | `ctrl_activity_audit.js:59` | ✅ `if (!value) continue` |
+| `search.` 前缀被移除 | `ctrl_activity_audit.js:60` | ✅ `key.replace(/^search\./, "")` |
+| 参数以 `map[string]string` 透传 | `server/ctrl/admin.go:144-151` | ✅ |
+| 多值参数只取第一个 | `server/ctrl/admin.go:149` | ✅ `element[0]` |
+| 无插件时返回 501 | `server/ctrl/admin.go:140-142` | ✅ `ErrNotImplemented` |
+| 插件完全控制过滤逻辑 | `server/common/types.go:66` | ✅ `Query()` 完全自定义 |
+| 插件完全控制结果渲染 | `server/common/types.go:70` | ✅ `RenderHTML` 自定义 |
+| 递归搜索更新结果 | `ctrl_activity_audit.js:64` | ✅ `updateLoop` 递归调用 |
+| 搜索结果缓存加载状态 | `model_audit.js:15-17` | ✅ `isLoading$` |
+
+---
+
+## 14. 关键代码位置索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
@@ -2109,3 +2610,19 @@ func (this *Configuration) Export() interface{} {
 | Configuration.Load() | `server/common/config.go` | 186-219 |
 | Configuration.Export() | `server/common/config.go` | 286-362 |
 | Default 多次设置警告 | `server/common/config.go` | 418-421 |
+| **配置变更预览** | | |
+| enable+target 联动 | `public/assets/lib/form.js` | 63-110 |
+| enable 联动 Schema 定义 | `server/common/config.go` | 119 |
+| Description 提示渲染 | `public/assets/pages/adminpage/helper_form.js` | 22-29 |
+| ReadOnly 字段防误改 | `public/assets/components/form.js` | 80 |
+| OnConfig 钩子影响传播 | `server/common/config.go` | 213-217 |
+| OnConfig 实际使用示例 | `server/plugin/plg_widget_favourite/index.go` | 26-32 |
+| secret_key 需重启生效 | `server/common/config.go` | 259 |
+| **审计检索过滤** | | |
+| 默认 AuditForm Schema | `server/model/audit.go` | 11-55 |
+| IAuditPlugin.Query() 接口 | `server/common/types.go` | 65-67 |
+| FetchAuditHandler 透传 | `server/ctrl/admin.go` | 138-158 |
+| 前端参数收集+防抖 | `public/assets/pages/adminpage/ctrl_activity_audit.js` | 49-65 |
+| 前端审计 HTTP 请求 | `public/assets/pages/adminpage/model_audit.js` | 6-13 |
+| updateLoop 递归搜索 | `public/assets/pages/adminpage/ctrl_activity_audit.js` | 40-66 |
+| AuditQueryResult 结构 | `server/common/types.go` | 68-71 |
