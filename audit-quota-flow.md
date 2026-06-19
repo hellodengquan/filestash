@@ -19,6 +19,18 @@ HTTP 请求 → 中间件链 → Controller (ctrl/)
 
 ---
 
+## 目录
+
+- [2. 审计日志（操作记录）完整流程](#2-审计日志操作记录完整流程)
+  - [2.5 衔接点 1：Save 失败时审计日志如何落地、操作记录与失败结果对齐](#25-衔接点-1save-失败时审计日志如何落地操作记录与失败结果对齐)
+- [3. 配额 / 容量限制 完整流程](#3-配额--容量限制-完整流程)
+  - [3.3.1 衔接点 3：大文件分块上传 mid-stream 配额检查与最终入库前二次校验](#331-衔接点-3大文件分块上传-mid-stream-配额检查与最终入库前二次校验)
+  - [3.5 衔接点 2：同一用户多后端连接时容量限制的跨后端聚合路径](#35-衔接点-2同一用户多后端连接时容量限制的跨后端聚合路径)
+- [4. 后端插件与审计/配额的衔接机制](#4-后端插件与审计配额的衔接机制)
+- [5. 关键文件索引](#5-关键文件索引)
+
+---
+
 ## 2. 审计日志（操作记录）完整流程
 
 ### 2.1 接口定义
@@ -144,7 +156,108 @@ for _, auth := range Hooks.Get.AuthorisationMiddleware() {
 - 创建 Job 并放入工作队列
 - worker 池异步执行关联的 Action（如发邮件、调用 API 等）
 
-### 2.5 审计日志的查询接口
+### 2.5 衔接点 1：Save 失败时审计日志如何落地、操作记录与失败结果对齐
+
+#### 2.5.1 两条独立的日志链
+
+Filestash 有两条独立的日志链路，**默认设计没有将它们关联**：
+
+| 链路 | 触发时机 | 执行方式 | 能拿到什么 | 位置 |
+|------|----------|----------|-----------|------|
+| **Audit Workflow 链** | `auth.Save()` 调用时（**操作前**） | 同步发布，异步执行 | 操作类型、路径、会话、用户 | `server/pkg/workflow/trigger/fileaction.go:91-98` |
+| **HTTP Logger 链** | 请求处理完成后（**操作后**） | 异步 goroutine | HTTP 状态码、请求/响应详情 | `server/middleware/index.go:35` |
+
+时序对比（以 `FileSave` 为例）：
+
+```
+T0: auth.Save(ctx, path) → processFileAction() → TriggerEvents()
+    ↑ 这里已经发布了 audit event，但 Backend.Save 还没执行
+    ↑ workflow job 已经创建，状态是 READY
+T1: ctx.Backend.Save(path, req.Body) → 返回 ErrQuotaExceeded
+    ↑ 配额超限，操作失败
+T2: SendErrorResult(res, NewError(err.Error(), 403))
+    ↑ 写响应，status=403
+T3: go logger(&app, &resw, req)
+    ↑ 这里能拿到 status=403，但 audit event 早已发布
+```
+
+#### 2.5.2 默认设计的核心问题
+
+- Audit Workflow 链**在操作执行前**就发布了事件，Job 的 `input` 中只有操作元数据（event、path、session 等），没有最终执行结果
+- HTTP Logger 链**在操作完成后**异步执行，能拿到 `resw.Status()`，但默认只写入 telemetry buffer，不与 audit 表关联
+- 两条链通过 `X-Request-ID` 可以关联，但默认没有任何代码做这件事
+
+#### 2.5.3 对齐机制（需要自定义插件实现）
+
+要让操作记录包含成功/失败状态，自定义审计插件需要**同时注册两个 Hook**：
+
+```go
+type FullAuditPlugin struct {
+    db *sql.DB
+}
+
+// 1. 注册为 AuthorisationMiddleware，在操作前写入 audit 表（状态=PENDING）
+func (this FullAuditPlugin) Save(ctx *App, path string) error {
+    requestID := ctx.Context.Value("X-Request-ID").(string)
+    _, err := this.db.Exec(`
+        INSERT INTO audit (request_id, event, path, session_id, user_id, status, created_at)
+        VALUES (?, 'save', ?, ?, ?, 'PENDING', CURRENT_TIMESTAMP)
+    `, requestID, path, GenerateID(ctx.Session), getUser(ctx.Session))
+    return err
+}
+// ... 实现其他 7 个 IAuthorisation 方法
+
+// 2. 注册为 Middleware，在请求完成后更新 audit 表的状态
+func (this FullAuditPlugin) Middleware(next HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        next(ctx, res, req)
+        if obj, ok := res.(*middleware.ResponseWriter); ok {
+            status := obj.Status()
+            requestID := res.Header().Get("X-Request-ID")
+            auditStatus := "SUCCESS"
+            if status >= 400 {
+                auditStatus = "FAILURE"
+            }
+            go func() {
+                this.db.Exec(`
+                    UPDATE audit SET status = ?, finished_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND status = 'PENDING'
+                `, auditStatus, requestID)
+            }()
+        }
+    })
+}
+
+// 3. 注册为 IAuditPlugin 提供查询能力
+func (this FullAuditPlugin) Query(ctx *App, params map[string]string) (AuditQueryResult, error) {
+    // 查询 audit 表，支持按 status 过滤成功/失败记录
+}
+
+func init() {
+    Hooks.Register.AuthorisationMiddleware(FullAuditPlugin{db: db})
+    Hooks.Register.Middleware(FullAuditPlugin{db: db}.Middleware)
+    Hooks.Register.AuditEngine(FullAuditPlugin{db: db})
+}
+```
+
+#### 2.5.4 X-Request-ID 的生成位置
+
+`server/middleware/telemetry.go:73-80` 中为每个请求生成唯一 ID：
+
+```go
+RequestID: func() string {
+    if req.Header.Get("X-Request-ID") != "" {
+        return req.Header.Get("X-Request-ID")
+    }
+    b := make([]byte, 16)
+    rand.Read(b)
+    return hex.EncodeToString(b)
+}(),
+```
+
+这个 ID 会被放入 `LogEntry.RequestID`，并通过 `res.Header().Set("X-Request-ID", point.RequestID)` 返回给客户端。
+
+### 2.6 审计日志的查询接口
 
 **路由**：`server/routes.go:48` → `GET /admin/api/audit`
 
@@ -278,6 +391,179 @@ if proto == "tus" && req.Method == http.MethodPost {
 }
 ```
 
+### 3.3.1 衔接点 3：大文件分块上传 mid-stream 配额检查与最终入库前二次校验
+
+#### 3.3.1.1 TUS 分块上传的流式架构
+
+分块上传的核心是 `io.Pipe` + goroutine 的流式设计（`server/ctrl/files.go:672-685`）：
+
+```go
+func createChunkedUploader(save func(path string, file io.Reader) error, 
+                           path string, size uint64) *chunkedUpload {
+    r, w := io.Pipe()
+    done := make(chan error, 1)
+    go func() {
+        done <- save(path, r)  // 后台 goroutine 立即开始流式写入
+    }()
+    return &chunkedUpload{
+        fn:     save,
+        stream: w,
+        done:   done,
+        offset: 0,
+        size:   size,
+    }
+}
+```
+
+完整时序：
+
+```
+TUS POST (创建会话):
+  ├─ auth.Save(ctx, path)                ← ★ 审计/配额预检查触发点
+  │                                      ← 这里可以拿到 Upload-Length 做预检查
+  ├─ 解析 Upload-Length (totalSize)
+  ├─ b, _ := ctx.Backend.Init(...)       ← 创建新的后端实例
+  ├─ createChunkedUploader(b.Save, path, size)
+  │   ├─ r, w := io.Pipe()
+  │   └─ go func() { done <- save(path, r) }()  ← 立即启动流式写入
+  └─ 返回 201 Created
+
+TUS PATCH (上传第 N 块):
+  ├─ 校验 Upload-Offset 匹配
+  ├─ uploader.Next(reader)
+  │   ├─ io.Copy(this.stream, body)      ← 数据通过 pipe 流向 save()
+  │   │                                  ← 如果 save() 中途 quota exceeded，
+  │   │                                  ← pipe 会返回错误，io.Copy 终止
+  │   ├─ 累计 offset
+  │   └─ 返回 err（如果有）
+  ├─ 校验 checksum
+  └─ 如果 newOffset == totalSize:
+      ├─ uploader.Close()
+      │   ├─ this.stream.Close()         ← 关闭写端，通知 save() 没有更多数据
+      │   └─ err := <-this.done          ← ★ 等待 save() 最终返回值（二次校验点）
+      └─ 删除缓存
+```
+
+#### 3.3.1.2 配额检查的三个可能位置
+
+| 检查位置 | 时机 | 能拿到什么 | 怎么自定义 | 现有代码是否有 |
+|----------|------|-----------|-----------|----------------|
+| **预检查** | TUS POST 时，`auth.Save()` 中 | `Upload-Length`（文件总大小） | 自定义 `AuthorisationMiddleware.Save()`，从 req.Header 拿 `Upload-Length` | ❌ 没有 |
+| **Mid-stream 检查** | TUS PATCH 时，`io.Copy` 过程中 | 实际写入的字节流 | 由 `Backend.Save()` 在流式写入时检查，通过 `io.Pipe` 反向传播错误 | ✅ 靠后端 |
+| **最终校验** | `uploader.Close()` 等待 `done` channel | `save()` 的最终返回值 | 框架本身已有，但只是透传，没有额外校验 | ✅ 透传 |
+
+#### 3.3.1.3 Mid-stream 错误传播机制
+
+当 `Backend.Save()` 中途返回 quota exceeded 时：
+
+```go
+// 后台 goroutine 中的 save() 流式写入
+func (sftp *Sftp) Save(path string, file io.Reader) error {
+    for {
+        buf := make([]byte, 32*1024)
+        n, err := file.Read(buf)
+        if n > 0 {
+            // 写入到后端存储
+            if _, err := sftp.client.WriteAt(buf[:n], offset); err != nil {
+                // 比如 SFTP 返回 FX_QUOTA_EXCEEDED (15)
+                if statusCode == 15 {
+                    return NewError("Quota exceeded", 400)
+                }
+            }
+        }
+        if err == io.EOF {
+            break
+        }
+    }
+    return nil
+}
+```
+
+当 `Save()` 返回错误时，`io.Pipe` 的读端会关闭，下一次 `io.Copy` 到写端时会收到 `io.ErrClosedPipe` 错误：
+
+```go
+// chunkedUpload.Next() 中的 io.Copy
+func (this *chunkedUpload) Next(body io.ReadCloser) error {
+    n, err := io.Copy(this.stream, body)
+    // 如果 save() 已经返回错误并关闭了 pipe 读端，
+    // 这里的 err 就是 io.ErrClosedPipe
+    body.Close()
+    this.mu.Lock()
+    this.offset += uint64(n)
+    this.mu.Unlock()
+    return err
+}
+```
+
+这个错误会一路返回到 Controller，最终以 `403 Forbidden` 返回给客户端。
+
+#### 3.3.1.4 入库前二次校验的缺失
+
+**框架层没有配额的二次校验**，只有以下校验：
+
+1. `offset == totalSize` 校验（`files.go:649-655`）- 防止 offset 异常
+2. `checksum` 校验（`files.go:645-647`）- 防止数据损坏
+3. `uploader.Close()` 等待 `save()` 的最终返回值（`files.go:657-661`）- 只是透传后端的最终错误
+
+**没有**：
+- 已写入字节数的二次确认
+- 文件最终大小与 `Upload-Length` 的一致性校验
+- 配额的二次计算（used + newFileSize <= limit）
+
+#### 3.3.1.5 如何自定义完整的配额检查链路
+
+```go
+type FullQuotaChecker struct{}
+
+// 1. 预检查：在 TUS POST 时检查总大小
+func (this FullQuotaChecker) Save(ctx *App, path string) error {
+    // 注意：需要自定义 Middleware 把 req 放到 ctx 中
+    req := ctx.Context.Value("http_request").(*http.Request)
+    if _, ok := req.Header["Tus-Resumable"]; ok && req.Method == http.MethodPost {
+        uploadLen, _ := strconv.ParseUint(req.Header.Get("Upload-Length"), 10, 0)
+        used := GetUserBackendUsage(GenerateID(ctx.Session))
+        limit := GetBackendQuota(GenerateID(ctx.Session))
+        if used + int64(uploadLen) > limit {
+            return NewError("Quota exceeded (pre-check)", 400)
+        }
+    }
+    return nil
+}
+
+// 2. Mid-stream 检查：包装 Backend.Save，统计实际写入字节
+func (this *QuotaBackend) Save(path string, r io.Reader) error {
+    counter := &CountingReader{Reader: r}
+    err := this.real.Save(path, counter)
+    if err == nil {
+        // 3. 入库前二次校验：实际写入大小与预期一致
+        if counter.BytesRead != expectedSize {
+            this.real.Rm(path) // 回滚
+            return NewError("Size mismatch", 400)
+        }
+        AddUsedStorage(this.backendID, counter.BytesRead)
+    }
+    return err
+}
+```
+
+#### 3.3.1.6 缓存过期的清理机制
+
+`chunkedUploadCache` 有 24 小时 TTL，过期时会自动清理（`files.go:687-700`）：
+
+```go
+chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+    c := value.(*chunkedUpload)
+    if err := c.Close(); err != nil {
+        Log.Warning("ctrl::files::chunked::cleanup action=close err=%s", err.Error())
+    }
+})
+```
+
+这意味着：
+- 24 小时内没有续传的上传会被自动取消
+- `Close()` 会等待 `save()` 返回最终错误
+- 配额超限的错误在这里也能被捕获
+
 ### 3.4 访问层：后端连接白名单
 
 `server/model/files.go:9-50` 的 `NewBackend` 中强制检查：
@@ -305,6 +591,133 @@ if !isAllowed() {
 ```
 
 这防止用户绕过配置连接到任意后端。
+
+### 3.5 衔接点 2：同一用户多后端连接时容量限制的跨后端聚合路径
+
+#### 3.5.1 核心结论
+
+**Filestash 核心框架本身不做跨后端的容量聚合**。每个后端连接是独立的，配额/容量由各后端自行管理。
+
+#### 3.5.2 身份标识体系
+
+Filestash 有两套身份标识，粒度不同：
+
+| 标识 | 生成方式 | 粒度 | 用途 |
+|------|----------|------|------|
+| `GenerateID(ctx.Session)` | 对 session 参数哈希 | 按**后端连接** | 区分不同的后端连接实例 |
+| `getUser(ctx.Session)` | 从 session 提取 `user`/`username` 字段 | 按**用户** | 同一个用户在不同后端可能有相同/不同的用户名 |
+
+`GenerateID` 的实现（`server/common/crypto.go:193-218`）：
+
+```go
+func GenerateID(params map[string]string) string {
+    p := ""
+    orderedKeys := make([]string, len(params))
+    for key, _ := range params {
+        orderedKeys = append(orderedKeys, key)
+    }
+    sort.Strings(orderedKeys)
+
+    for _, key := range orderedKeys {
+        switch key {
+        case "password":
+        case "path":
+        case "session":
+        case "timestamp":
+        default:
+            if val := params[key]; val != "" {
+                p += key + "=>" + params[key] + ", "
+            }
+        }
+    }
+    // 会包含 type、hostname、username 等字段
+    // 所以不同的后端连接（即使同一个用户）会生成不同的 ID
+    p += "salt=>" + SECRET_KEY
+    return Hash(p, 20)
+}
+```
+
+**关键**：`GenerateID` 会包含 `type`、`hostname`、`username` 等连接参数，所以**同一个用户挂 SFTP 和 S3 两个后端会生成两个不同的 ID**。
+
+#### 3.5.3 跨后端聚合的缺失路径
+
+核心框架中没有以下逻辑：
+
+1. **没有按用户维度的 storage usage 表** - 所有的使用量都是各后端自己维护的
+2. **没有统一的配额配置入口** - 配额是在后端存储系统中配置的，不是在 Filestash 中
+3. **没有聚合查询 API** - 没有接口能返回"用户 A 在所有后端的总使用量"
+
+在现有插件的实现中可以看到，`tenantID` 都是用 `GenerateID(ctx.Session)`：
+
+- `plg_widget_recent/index.go:74` - `StoreRecent(GenerateID(ctx.Session), ...)`
+- `plg_widget_description/handler.go:24` - `WHERE backend = ?` 用 `GenerateID(ctx.Session)`
+- `plg_metadata_sqlite/index.go:34` - `tenantID := GenerateID(ctx.Session)`
+
+这说明所有的插件数据都是按**后端连接**隔离的，不是按用户聚合的。
+
+#### 3.5.4 如何自定义跨后端聚合
+
+如果需要实现"用户总配额 = 所有后端使用量之和不能超过 X"，需要自定义插件：
+
+```go
+type CrossBackendQuota struct {
+    db *sql.DB
+}
+
+func (this CrossBackendQuota) Save(ctx *App, path string) error {
+    // 1. 获取用户标识（注意：不同后端 session 中的 user 字段可能不同）
+    user := getUser(ctx.Session)
+    if user == "" || user == "unknown" {
+        return nil // 无法识别用户，跳过
+    }
+
+    // 2. 获取本次上传的大小（从 Upload-Length header 拿）
+    // 注意：这需要在 Controller 层把 req 传到 ctx 中，或者自定义 Middleware
+    // uploadSize := ctx.Context.Value("upload_size").(int64)
+
+    // 3. 统计该用户所有后端连接的已用空间
+    var totalUsed int64
+    err := this.db.QueryRow(`
+        SELECT SUM(bytes_used) 
+        FROM storage_usage 
+        WHERE user_id = ?
+    `, user).Scan(&totalUsed)
+    if err != nil {
+        return err
+    }
+
+    // 4. 检查总配额
+    var totalLimit int64 = 10 * 1024 * 1024 * 1024 // 10GB
+    if totalUsed + uploadSize > totalLimit {
+        return NewError("Total quota exceeded across all backends", 400)
+    }
+
+    return nil
+}
+
+// 5. 还需要一个定时任务或在操作成功后，同步各后端的使用量到 storage_usage 表
+func syncBackendUsage(user string, backendType string, backendID string) {
+    // 调用各后端的 Stat/Ls 递归计算使用量
+    // 更新 storage_usage 表
+}
+```
+
+#### 3.5.5 多后端连接的会话存储
+
+`server/middleware/session.go` 中管理会话 cookie：
+
+```go
+func CookieName(idx int) string {
+    if idx == 0 {
+        return COOKIE_NAME_AUTH
+    }
+    return COOKIE_NAME_AUTH + strconv.Itoa(idx)
+}
+```
+
+用户可以同时连接多个后端，每个后端的 session 存在不同的 cookie 中（`auth`、`auth1`、`auth2`...）。这就是"同一用户挂多个后端连接"的实现方式。
+
+当用户切换后端时，`SessionStart` 中间件会从对应 cookie 中解密出 session map，`GenerateID(ctx.Session)` 就会生成对应后端连接的 ID。
 
 ---
 
@@ -485,21 +898,28 @@ func (b *QuotaBackend) Save(path string, r io.Reader) error {
 | `server/common/plugin.go` | Hook 注册/获取机制（`Hooks.Register.*` / `Hooks.Get.*`） |
 | `server/common/backend.go` | Backend Driver 注册与获取 |
 | `server/common/config.go` | 配置定义（上传并发、分块等） |
+| `server/common/crypto.go` | `GenerateID()` 实现，按后端连接生成唯一标识 |
+| `server/common/utils.go` | 通用工具函数 |
 | `server/model/audit.go` | 默认 `SimpleAudit` 实现、AuditForm 定义 |
 | `server/model/files.go` | `NewBackend` 连接白名单检查 |
 | `server/model/permissions.go` | `CanRead/CanEdit/CanUpload/CanShare` 权限函数 |
-| `server/ctrl/files.go` | 文件操作 Controller，AuthorisationMiddleware 调用点 |
+| `server/ctrl/files.go` | 文件操作 Controller，TUS 分块上传实现 |
 | `server/ctrl/admin.go` | `FetchAuditHandler` 审计查询 Handler |
 | `server/routes.go` | 路由注册，`/admin/api/audit` 端点 |
 | `server/middleware/index.go` | `NewMiddlewareChain` 中间件组装，`logger()` 调用点 |
-| `server/middleware/session.go` | `SessionStart`，`_extractBackend` 初始化 |
-| `server/middleware/telemetry.go` | HTTP 访问日志记录（LogEntry） |
-| `server/pkg/workflow/index.go` | Workflow 初始化、worker 池 |
+| `server/middleware/session.go` | `SessionStart`，`_extractBackend` 初始化，多 cookie 管理 |
+| `server/middleware/telemetry.go` | HTTP 访问日志记录（LogEntry、RequestID 生成） |
+| `server/pkg/workflow/index.go` | Workflow 初始化、worker 池、Job 执行 |
+| `server/pkg/workflow/job.go` | `ExecuteJob`，Job 状态流转 |
+| `server/pkg/workflow/model/job.go` | `CreateJob`、`NextJob`、`UpdateJob`，Job 持久化 |
 | `server/pkg/workflow/trigger/fileaction.go` | ★ `hookAuthorisation` 审计触发核心 |
 | `server/pkg/workflow/trigger/index.go` | `TriggerEvents` 事件分发 |
 | `server/plugin/index.go` | 所有后端/认证插件的导入入口 |
 | `server/plugin/plg_authorisation_example/index.go` | 授权中间件示例 |
 | `server/plugin/plg_backend_local/index.go` | Local 后端实现（配额靠 OS） |
 | `server/plugin/plg_backend_sftp/index.go` | SFTP 后端（配额错误码映射） |
+| `server/plugin/plg_widget_recent/index.go` | `getUser()` 实现示例，`GenerateID` 使用示例 |
+| `server/plugin/plg_widget_description/utils.go` | 另一个 `getUser()` 实现示例 |
+| `server/plugin/plg_metadata_sqlite/index.go` | `tenantID` 使用示例，按后端连接隔离 |
 | `public/assets/pages/adminpage/model_audit.js` | 前端审计查询模型 |
 | `public/assets/pages/adminpage/ctrl_activity_audit.js` | 前端审计页面控制器 |
