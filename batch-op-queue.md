@@ -776,3 +776,580 @@ func createChunkedUploader(save func(path string, file io.Reader) error, path st
 | 失败重试 | `public/assets/pages/filespage/ctrl_upload.js` | 195-257, 353-361 |
 | TUS后端 | `server/ctrl/files.go` | 479-670 |
 | 文件选择 | `public/assets/pages/filespage/state_selection.js` | 26-119 |
+
+---
+
+## 5. Worker 数量配置如何影响吞吐量与队列堆积
+
+### 5.1 核心常量与调度器
+
+**文件**: `public/assets/pages/filespage/ctrl_upload.js:100`
+
+```javascript
+const MAX_WORKERS = 4;
+```
+
+`MAX_WORKERS` 是硬编码常量，不可通过配置修改。它决定了同一时刻最多有多少个上传任务可以并发执行。
+
+调度器使用一个长度为 `MAX_WORKERS` 的布尔数组 `reservations` 作为"槽位簿记"：
+
+**文件**: `public/assets/pages/filespage/ctrl_upload.js:259-325`
+
+```javascript
+let tasks = [];                                              // 全局任务池
+const reservations = new Array(MAX_WORKERS).fill(false);     // 槽位：false=空闲 true=占用
+
+workers$.subscribe(async({ tasks: newTasks, loading = false }) => {
+    if (loading) return;
+    tasks = tasks.concat(newTasks);                          // 新任务入池
+
+    while (!$page.classList.contains("hidden")) {
+        const nworker = reservations.indexOf(false);         // 找第一个空闲槽位
+        if (nworker === -1) break;                           // 池满，不再启动新 worker
+        reservations[nworker] = true;                        // 占位
+        noFailureAllowed(processWorkerQueue.bind(null, nworker))
+            .then(() => reservations[nworker] = false);      // 完成后释放
+    }
+    reservations.fill(false);                                // 所有 worker 完成后重置
+});
+```
+
+### 5.2 吞吐量模型
+
+每个 worker 运行 `processWorkerQueue`，在 while 循环中**串行**消费任务：
+
+**文件**: `public/assets/pages/filespage/ctrl_upload.js:261-304`
+
+```javascript
+const processWorkerQueue = async(nworker) => {
+    while (tasks.length > 0) {
+        const task = nextTask(tasks);        // 从池中取一个就绪任务
+        if (!task) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));  // 无就绪任务则等1秒
+            continue;
+        }
+
+        // 去重检查：同一文件不能有两个 worker 同时上传
+        const $tasks = qsa($page, `[data-path="${task.path}"][data-status="running"]`);
+        if ($tasks.length > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            tasks.unshift(task);             // 放回队首
+            continue;
+        }
+
+        const exec = task.exec({ progress, speed });
+        updateDOMWithStatus($task, { exec, status: "doing", nworker });
+        try {
+            await exec.run(task);            // 阻塞直到当前任务完成
+            updateDOMWithStatus($task, { exec, status: "done", nworker });
+        } catch (err) {
+            updateDOMWithStatus($task, { exec, status: "error", nworker });
+        }
+        updateTotal.incrementCompleted();
+        task.done = true;
+    }
+};
+```
+
+**吞吐量分析**：
+
+```
+理论吞吐量 = MAX_WORKERS × 单 worker 处理速率
+
+其中：
+- 单 worker 处理速率 = 1 / (网络RTT + 传输时间 + 后端处理时间)
+- 当 MAX_WORKERS=4 时，最多 4 个任务同时处于 "doing" 状态
+- 其余任务在 tasks[] 中排队，状态为 "Waiting"
+```
+
+**不同 MAX_WORKERS 值的场景对比**：
+
+| MAX_WORKERS | 并发数 | 10个文件总耗时（假设单文件10s） | 队列中等待数 | 网络带宽占用 |
+|:-----------:|:------:|:------------------------------:|:------------:|:----------:|
+| 1 | 1 | 100s | 9 | 低 |
+| 2 | 2 | 50s | 8 | 中 |
+| 4（当前值） | 4 | 30s | 6 | 高 |
+| 8 | 8 | 20s | 2 | 饱和 |
+| 16 | 16 | 10s | 0 | 可能超限 |
+
+### 5.3 队列堆积的三个关键点
+
+**关键点1：去重保护导致任务"弹回"**
+
+当同一路径的任务正在执行时，新取出的同路径任务会被放回队首并等1秒：
+
+```javascript
+// ctrl_upload.js:273-278
+const $tasks = qsa($page, `[data-path="${task.path}"][data-status="running"]`);
+if ($tasks.length > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    tasks.unshift(task);     // 放回队首，1秒后重试
+    continue;
+}
+```
+
+**影响**：如果 A 文件正在上传，B worker 又取到了 A，B 会空转1秒。在极端情况下，4 个 worker 可能都在等同一个文件，造成吞吐量骤降。
+
+**关键点2：依赖感知调度导致的"饥饿等待"**
+
+拖拽目录上传时，子文件的 `ready()` 会检查父目录是否已完成：
+
+```javascript
+// ctrl_upload.js:698-710
+task.ready = () => {
+    const isInDirectory = (filepath, folder) => folder.indexOf(filepath) === 0;
+    for (let i=0; i<tasks.length; i++) {
+        if (tasks[i].path === task.path) break;
+        else if (tasks[i].type === "file") continue;
+        else if (isInDirectory(tasks[i].path, task.path) === false) continue;
+        if (tasks[i].done === false) return false;   // 父目录未完成 → 任务不就绪
+    }
+    return true;
+};
+```
+
+**影响**：假设上传 `/docs/` 目录结构：
+```
+/docs/             → task[0], type=directory, ready=true
+/docs/a.txt        → task[1], type=file, ready() => task[0].done
+/docs/b.txt        → task[2], type=file, ready() => task[0].done
+/docs/sub/         → task[3], type=directory, ready() => task[0].done
+/docs/sub/c.txt    → task[4], type=file, ready() => task[3].done
+```
+
+如果 task[0]（目录 `/docs/`）的 mkdir 请求很慢，task[1]-task[4] 全部处于"不就绪"状态。即使 MAX_WORKERS=4，所有 worker 也会在 `nextTask` 中返回 null 后进入1秒轮询等待：
+
+```javascript
+// ctrl_upload.js:305-313
+const nextTask = (tasks) => {
+    for (let i=0; i<tasks.length; i++) {
+        const possibleTask = tasks[i];
+        if (!possibleTask.ready()) continue;    // 跳过不就绪任务
+        tasks.splice(i, 1);
+        return possibleTask;
+    }
+    return null;    // 无就绪任务
+};
+```
+
+**关键点3：错误不阻塞队列**
+
+`noFailureAllowed` 保证 worker 异常不会中断整个调度循环：
+
+```javascript
+// ctrl_upload.js:314
+const noFailureAllowed = (fn) => fn().catch(() => noFailureAllowed(fn));
+```
+
+任务失败时，`updateDOMWithStatus` 将该任务标记为 "error" 状态并显示重试按钮，但 worker 不阻塞，继续处理下一个任务：
+
+```javascript
+// ctrl_upload.js:293-296
+} catch (err) {
+    updateDOMWithStatus($task, { exec, status: "error", nworker });
+}
+updateTotal.incrementCompleted();  // 无论成功失败都计数
+task.done = true;                  // 标记完成，解除子任务依赖
+```
+
+> **注意**：`task.done = true` 在失败时也被设置为 true。这意味着依赖此任务的子任务会被放行，即使父任务（如 mkdir）实际失败了。子文件上传时可能因目录不存在而再次失败，用户需要手动重试。
+
+### 5.4 全局速度统计的 worker 数量依赖
+
+**文件**: `public/assets/pages/filespage/ctrl_upload.js:183-193`
+
+```javascript
+const updateDOMGlobalSpeed = (function(workersSpeed) {
+    let last = 0;
+    return (nworker, currentWorkerSpeed) => {
+        workersSpeed[nworker] = currentWorkerSpeed;      // 按槽位号记录速度
+        if (new Date().getTime() - last <= 500) return;  // 500ms 节流
+        last = new Date().getTime();
+        const speed = workersSpeed.reduce((acc, el) => acc + el, 0);  // 所有活跃 worker 速度求和
+        const $speed = assert.type($page.firstElementChild?.nextElementSibling?.firstElementChild, HTMLElement);
+        $speed.textContent = formatSpeed(speed);
+    };
+}(new Array(MAX_WORKERS).fill(0))));   // 初始化 MAX_WORKERS 个槽位
+```
+
+全局速度 = 所有活跃 worker 速度之和。`MAX_WORKERS` 决定了速度数组的长度。如果改为更大值，全局速度统计自然更准确（更多槽位）；但当前值 4 已足够覆盖浏览器对同一域名的 HTTP 并发连接数限制（通常 6 个），实际 4 个并发上传已接近浏览器网络栈的实用上限。
+
+---
+
+## 6. 网络断连后的进度推送恢复流程
+
+### 6.1 项目中不存在 WebSocket
+
+**重要发现**：本项目**没有使用 WebSocket 或 SSE** 进行进度推送。进度信息完全依赖浏览器原生 `XMLHttpRequest.upload.onprogress` 事件，这是一个**请求级**的回调机制，在请求中断后事件流自然终止。
+
+因此，"断连后进度推送恢复"实际上包含两个层面：
+1. **上传请求中断**：当前 XHR 请求失败，需要重新发起
+2. **TUS 断点续传**：利用 TUS 协议在服务端保存的上传偏移量，从断点继续上传
+
+### 6.2 网络断连时 XHR 的行为
+
+**文件**: `public/assets/pages/filespage/ctrl_upload.js:527-585`
+
+```javascript
+function executeHttp(url, { method, headers, body, progress, speed }) {
+    const xhr = new XMLHttpRequest();
+    return new Promise((resolve, reject) => {
+        // ...
+        xhr.upload.onprogress = (e) => {       // ← 进度回调只在连接存活时触发
+            if (!e.lengthComputable) return;
+            const percent = Math.floor(100 * e.loaded / e.total);
+            progress(percent);                  // 推送到 DOM
+            // ... 速度计算
+        };
+
+        xhr.upload.onabort = () => reject(ABORT_ERROR);   // 用户取消
+        xhr.onerror = (e) => reject(new AjaxError("failed", e, "FAILED"));  // ← 网络断连触发
+        xhr.onload = () => { /* ... */ };
+        xhr.send(body);
+    });
+}
+```
+
+**断连时的调用链**：
+
+```
+网络断开
+    ↓
+XMLHttpRequest 触发 onerror
+    ↓
+reject(new AjaxError("failed", e, "FAILED"))
+    ↓
+executeHttp 的 Promise 被 reject
+    ↓
+调用方 catch 块执行
+```
+
+### 6.3 上传失败后的错误传播路径
+
+以分块上传为例，跟踪从 XHR 失败到 UI 重试按钮的完整路径：
+
+**Step 1: TUS 分片上传失败**
+
+```javascript
+// ctrl_upload.js:447-458
+await executeHttp.call(this, uploadURL, {
+    method: "PATCH",
+    headers,
+    body: chunk,
+    progress: (p) => { /* ... */ },
+    speed,
+});
+offset += chunkSize;
+```
+
+如果网络断开，`executeHttp` reject，控制流跳到 catch：
+
+```javascript
+// ctrl_upload.js:461-465
+} catch (err) {
+    virtual.afterError();              // 1. 虚拟层回滚UI
+    if (err === ABORT_ERROR) return;   // 2. 用户主动取消则静默
+    throw err;                          // 3. 网络错误向上抛出
+}
+```
+
+**Step 2: workerImplFile.run() 抛出异常**
+
+```javascript
+// ctrl_upload.js:353-361
+async run({ file, path, virtual }) {
+    const _file = await file();
+    const executeJob = () => this.prepareJob({ file: _file, path, virtual });
+    this.retry = () => {
+        virtual.before();
+        return executeJob();
+    };
+    return executeJob();               // ← 异常从此处抛出
+}
+```
+
+注意：`this.retry` 在 `run()` 中被绑定，**即使 run 失败，retry 方法仍然可用**。
+
+**Step 3: processWorkerQueue 捕获异常**
+
+```javascript
+// ctrl_upload.js:290-295
+try {
+    await exec.run(task);
+    updateDOMWithStatus($task, { exec, status: "done", nworker });
+} catch (err) {
+    updateDOMWithStatus($task, { exec, status: "error", nworker });  // ← 进入 error 状态
+}
+updateTotal.incrementCompleted();
+task.done = true;
+```
+
+**Step 4: UI 显示重试按钮**
+
+```javascript
+// ctrl_upload.js:227-249
+case "error":
+    const $retry = assert.type($iconRetry.cloneNode(true), HTMLElement);
+    updateDOMGlobalTitle($page, t("Error"));
+    updateDOMTaskProgress($task, t("Error"));
+
+    $task.classList.add("error_color");
+    $task.querySelector(".file_control").appendChild($retry);
+
+    $retry.onclick = async() => {
+        executeMutation("todo");            // 1. 状态重置为待执行
+        executeMutation("doing");           // 2. 状态切换为执行中
+        try {
+            await exec.retry();             // 3. 调用之前绑定的 retry 方法
+            executeMutation("done");        // 4. 成功
+        } catch (err) {
+            executeMutation("error");       // 5. 再次失败，可继续重试
+        }
+    };
+    break;
+```
+
+### 6.4 重试时 TUS 断点续传的恢复
+
+用户点击重试按钮后，`exec.retry()` 被调用，其绑定的函数为：
+
+```javascript
+// ctrl_upload.js:356-359
+this.retry = () => {
+    virtual.before();       // 重新显示 loading 状态
+    return executeJob();    // 重新执行 prepareJob
+};
+```
+
+`prepareJob` 开头的 TUS HEAD 请求是**断点续传的关键**：
+
+```javascript
+// ctrl_upload.js:397-412
+try {
+    const resp = await executeHttp.call(this, apiURL, {
+        method: "HEAD",                         // ← 查询服务端已上传偏移量
+        headers: { ...tusHeaders },
+        body: null,
+        progress: () => {},
+        speed,
+    });
+    if (file.size === parseInt(resp.headers["upload-length"])) {
+        const tmp = parseInt(resp.headers["upload-offset"]);  // ← 获取已上传字节数
+        if (tmp > 0) {
+            offset = tmp;                        // ← 从断点继续
+            uploadURL = apiURL;
+        }
+    }
+} catch (err) {}    // HEAD 失败不阻塞，会创建新上传会话
+```
+
+**后端 HEAD 请求处理**：
+
+**文件**: `server/ctrl/files.go:554-567`
+
+```go
+if proto == "tus" && req.Method == http.MethodHead {
+    c := chunkedUploadCache.Get(cacheKey)
+    if c == nil {
+        SendErrorResult(res, ErrNotFound)
+        return
+    }
+    offset, length := c.(*chunkedUpload).Meta()
+    h.Set("Tus-Resumable", "1.0.0")
+    h.Set("Upload-Offset", fmt.Sprintf("%d", offset))    // ← 返回已上传偏移量
+    h.Set("Upload-Length", fmt.Sprintf("%d", length))     // ← 返回总大小
+    h.Set("Cache-Control", "no-store")
+    res.WriteHeader(http.StatusNoContent)
+    return
+}
+```
+
+**后端缓存的生命周期**：
+
+**文件**: `server/ctrl/files.go:688-700`
+
+```go
+func initChunkedUploader() {
+    chunkedUploadCache = NewAppCache(60*24, 1)  // 保留 60×24=1440 分钟 = 24 小时
+    chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+        c := value.(*chunkedUpload)
+        if err := c.Close(); err != nil {
+            Log.Warning("ctrl::files::chunked::cleanup action=close err=%s", err.Error())
+        }
+    })
+}
+```
+
+缓存 key 由路径和会话 ID 组成：
+
+```go
+// server/ctrl/files.go:543-546
+cacheKey := map[string]string{
+    "path":    path,
+    "session": GenerateID(ctx.Session),
+}
+```
+
+### 6.5 完整断连恢复时序
+
+```
+时间轴                    前端                              后端
+─────────────────────────────────────────────────────────────────
+t0    用户上传100MB文件，chunkSize=10MB
+t1    POST /api/files/save              →     创建 chunkedUpload，设入 cache
+      Tus-Resumable: 1.0.0                    Upload-Length: 104857600
+      Upload-Length: 104857600           ←     201 Created, Location: /api/files/save?path=...
+t2    PATCH 上传 chunk0 (0-10MB)        →     io.PipeWriter 写入 10MB
+      Upload-Offset: 0
+      progress(0%) → progress(8%) → progress(10%)
+t3    PATCH 上传 chunk1 (10-20MB)       →     写入 20MB
+      Upload-Offset: 10485760
+      progress(10%) → progress(18%) → progress(20%)
+      ...
+t7    PATCH 上传 chunk5 (50-60MB)       →     写入 60MB
+      Upload-Offset: 52428800
+      progress(50%) → progress(58%)
+      
+      ╳ ═══ 网络断开 ═══ ╳
+      
+      XHR onerror → reject("FAILED")
+      ↓
+      virtual.afterError() → 回滚 UI
+      ↓
+      processWorkerQueue catch → updateDOMWithStatus("error")
+      ↓
+      UI: 显示 "Error" + 重试按钮
+                                               offset=60MB 保存在 cache 中
+                                               (24小时内有效)
+
+t8    ╳ ═══ 网络恢复 ═══ ╳
+
+t9    用户点击重试按钮
+      ↓
+      exec.retry()
+      ↓
+      virtual.before() → 重新显示 loading
+      ↓
+      prepareJob() 被重新调用
+      ↓
+      HEAD /api/files/save?path=...     →     从 cache 读取 chunkedUpload
+      Tus-Resumable: 1.0.0                   Meta() → offset=62914560, size=104857600
+                                            ←
+      Upload-Offset: 62914560                204 No Content
+      Upload-Length: 104857600
+      ↓
+      offset = 62914560 (60MB)               ← 断点续传！从第7个分片开始
+      ↓
+      for (i=6; i<10; i++) {
+          PATCH chunk6 (60-70MB)       →     继续写入
+          Upload-Offset: 62914560
+          progress(60%) → progress(68%)
+          ...
+          PATCH chunk9 (90-100MB)      →     写入完成
+          Upload-Offset: 94371840
+          progress(92%) → progress(100%)
+      }
+      ↓
+      virtual.afterSuccess()          →     chunkedUpload.Close() → cache 删除
+      UI: "Done" ✓
+```
+
+### 6.6 断连恢复的边界情况
+
+**情况1：服务端 cache 已过期（超过24小时）**
+
+HEAD 请求返回 404，前端 catch 后静默忽略，`offset` 保持为 0：
+
+```javascript
+// ctrl_upload.js:397-412
+try {
+    const resp = await executeHttp.call(this, apiURL, { method: "HEAD", ... });
+    // ... 解析 offset
+} catch (err) {}    // HEAD 失败 → offset=0 → 从头开始
+if (offset === 0) {
+    // 创建新的 TUS 上传会话，从头上传
+    const resp = await executeHttp.call(this, apiURL, { method: "POST", ... });
+    uploadURL = resp.headers.location;
+}
+```
+
+**情况2：普通上传（非 TUS）的断连恢复**
+
+当 `upload_chunk_size` 配置为 0（默认值）或文件小于 chunkSize 时，走普通上传路径：
+
+```javascript
+// ctrl_upload.js:374-391
+if (chunkSize === 0 || numberOfChunks === 0 || numberOfChunks === 1) {
+    try {
+        await executeHttp.call(this, apiURL, {
+            method: "POST",
+            body: file,        // ← 整个文件一次性上传
+            progress,
+            speed,
+        });
+        virtual.afterSuccess();
+    } catch (err) {
+        virtual.afterError();
+        if (err === ABORT_ERROR) return;
+        throw err;              // ← 失败后无断点续传，重试从头开始
+    }
+    return;
+}
+```
+
+**普通上传断连后**：进度丢失，重试从头开始。没有 TUS 的偏移量查询机制，因为整个文件只有一个请求。
+
+**情况3：批量删除/移动的网络断连**
+
+批量删除使用 `rxjs.forkJoin` 并行发起，无队列、无进度条、无重试按钮：
+
+```javascript
+// model_files.js:62-69
+export const rm = (...paths) => rxjs.forkJoin(paths.map((path) => ajax({
+    url: withURLParams(`api/files/rm?path=${encodeURIComponent(path)}`),
+    method: "POST",
+    responseType: "json",
+}))).pipe(
+    handleSuccess(...),
+    handleError,               // ← 失败只显示通知，无重试机制
+);
+```
+
+网络断连时，`forkJoin` 中任意一个请求失败就会导致整个 observable 出错，`handleError` 仅弹出一个错误通知。
+
+**情况4：ls 请求的离线降级**
+
+`model_files.js` 中的 `ls` 函数有离线感知逻辑：
+
+```javascript
+// model_files.js:116-120
+rxjs.merge(
+    rxjs.of(navigator.onLine),              // 初始在线状态
+    rxjs.fromEvent(window, "online"),       // 监听恢复
+    rxjs.fromEvent(window, "offline"),      // 监听断开
+)
+
+// model_files.js:113
+rxjs.catchError((err) => navigator.onLine ? rxjs.throwError(err) : rxjs.EMPTY),
+// 在线时失败=真错误，离线时失败=静默忽略
+
+// model_files.js:127-129
+if (navigator.onLine) res["files"] = files;
+else res["files"] = files.map((file) => file.type === "file" ? { ...file, offline: true } : file);
+// 离线时给文件标记 offline: true，前端显示为不可操作
+```
+
+但这是文件列表查询的降级策略，**上传队列模块本身没有在线/离线事件监听**。网络断开时，上传队列只是通过 XHR 的 `onerror` 识别失败并显示重试按钮，需要用户手动触发重试。
+
+### 6.7 总结：断连恢复策略对比
+
+| 操作类型 | 进度推送机制 | 断连检测 | 断点续传 | 重试方式 |
+|---------|------------|---------|---------|---------|
+| 普通上传 | XHR onprogress | XHR onerror | ❌ 无 | 手动点击重试，从头开始 |
+| TUS 分块上传 | XHR onprogress（分片级） | XHR onerror | ✅ HEAD 查偏移量 | 手动点击重试，从断点继续 |
+| 批量删除 | 无进度条 | ajax 报错 | ❌ 无 | 仅通知，无重试 |
+| 批量移动 | 无进度条 | ajax 报错 | ❌ 无 | 仅通知，无重试 |
+| 目录创建 | setInterval 模拟 | XHR onerror | ❌ 无 | 手动点击重试 |
+| 文件列表 | 无 | navigator.onLine | N/A | 自动：online 事件触发刷新 |
+
+**核心结论**：本项目的进度推送不依赖 WebSocket/SSE，而是完全基于 XHR 的请求级事件。断连恢复依赖两个机制：(1) **用户手动重试**（点击重试按钮），(2) **TUS 协议的 HEAD 查询**（自动获取已上传偏移量）。没有自动重连和自动重试逻辑。
