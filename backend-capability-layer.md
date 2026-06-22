@@ -833,3 +833,411 @@ PUT 新 URN, If-None-Match: *   → 新写（防止覆盖）
 4. **Git 的"最终一致"风险窗口**：从本地 `SafeOsRename` 返回成功到 `git.push` 完成之间，存在不一致窗口。如果此时进程崩溃，且 `Close()` 删除了工作区，变更会永久丢失。
 
 5. **S3 目录移动的数据重复**：CopyObject 是服务端异步的，对于大目录，网络中断时可能已完成上千次 Copy，这些重复数据只能靠用户手工清理或脚本 dedup。
+
+---
+
+## 14. 深度分析：客户端缓存层与服务器端缓存失效协同机制
+
+### 14.1 缓存全景图：6 类独立缓存各司其职
+
+整个后端能力层涉及 **6 类独立缓存**，分布在不同层级，TTL 和失效策略完全不同：
+
+| 缓存 | 类型 | 作用 | TTL | 位置 |
+|------|------|------|-----|------|
+| `*Cache`（后端连接级） | AppCache | FTP/SFTP/Git/Dav 等长连接复用；S3 region；Tmp chroot 路径 | 默认 5 分钟（或自定义） | 各 backend plugin init() |
+| `file_cache`（控制器级下载缓存） | AppCache | Range 请求时把后端非 seekable 流落盘到临时文件，支持多次 seek | 5 分钟（默认） | `ctrl/files.go:37` |
+| `chunkedUploadCache`（控制器级上传缓存） | AppCache | TUS 断点续传的 uploader 状态，含 io.Pipe + offset | 24 小时（1440 分钟） | `ctrl/files.go:477` |
+| `DavCache`（后端 Ls 结果缓存） | AppCache | CardDAV/CalDAV 的 PROPFIND 结果缓存，避免每次 Ls 重复请求 | 5 分钟（默认） | `plg_backend_dav/index.go:17` |
+| `S3Cache`（后端 region 探测缓存） | AppCache | S3 GetBucketLocation 探测结果（按 {bucket, params} 哈希） | 5 分钟（默认） | `plg_backend_s3/index.go:27` |
+| HTTP 协商缓存（协议级） | HTTP Header | Last-Modified / If-Modified-Since / ETag / If-None-Match | 由浏览器决定 | `ctrl/files.go` FileCat |
+
+### 14.2 后端连接级缓存 `*Cache`：复用 + 驱逐关闭
+
+以 FTP 缓存为例，位置：`server/plugin/plg_backend_ftp/index.go:19-38`
+
+```go
+var FtpCache AppCache
+
+func init() {
+    FtpCache = NewAppCache()
+    FtpCache.OnEvict(func(key string, value interface{}) {
+        if value == nil { return }
+        f := value.(*Ftp)
+        if f == nil { return }
+        // 驱逐前优雅关闭 TCP 连接（等待 in-flight 请求完成）
+        f.wg.Wait()
+        f.Close()
+    })
+}
+```
+
+**Init 时缓存命中流程**：
+```
+用户请求携带的 params（全量连接参数哈希）
+   │
+   ▼
+FtpCache.Get(params)
+   ├─ 命中 → 返回已有的 Ftp 实例，跳过握手+TLS 协商
+   └─ 未命中 → 走三级 TLS 协商 → FtpCache.Set(params, ftpInstance)
+```
+
+**显式失效触发点**（只有 FTP 的自动重连会主动 Del）：
+```go
+// FTP.Execute(): 遇到 421 / EOF 时自动重连
+if code == 421 || (code == 0 && err.Error() == "EOF") {
+    f.Close()
+    FtpCache.Set(f.p, nil)   // 置 nil 触发 OnEvict 关闭旧连接
+    b, _ := f.Init(f.p, ...)  // 重新建连
+}
+```
+
+### 14.3 DavCache：写操作后的主动失效
+
+Dav (CardDAV/CalDAV) 的 Ls 依赖耗时的 PROPFIND 请求，结果缓存 5 分钟。但任何写操作都必须主动失效，否则用户看不到自己刚创建的联系人：
+
+位置：`server/plugin/plg_backend_dav/index.go` 多处
+
+| 操作 | 失效时机 |
+|------|---------|
+| `Mkdir(path)` | 创建通讯录/日历成功后 → `DavCache.Del(this.params)` |
+| `Rm(path)` | 删除资源成功后 → `DavCache.Del(this.params)` |
+| `Save(path, reader)` | 写成功后自动隐式失效（URN 重映射，下次 Ls 直接看不到旧 URN） |
+
+**失效粒度**：按整个后端实例 params 失效，而不是按 path。这意味着用户在一个通讯录里新建联系人，另一个通讯录的缓存也被清掉 —— 简单粗暴但正确。
+
+### 14.4 `file_cache`：Range 请求的 Seek 能力补齐
+
+位置：`server/ctrl/files.go:232-358` (FileCat)
+
+问题背景：`IBackend.Cat()` 返回的是 `io.ReadCloser`，不保证能 `Seek`。但浏览器播放音视频、PDF 阅读器需要 HTTP Range（`bytes=start-end`），Range 必须对资源随机访问。
+
+**协同流程**：
+
+```
+第 1 次请求（Range: bytes=1000-2000）:
+   │
+   ├─ file_cache.Get(ctx.Session) → nil（还没缓存）
+   │
+   ├─ 后端 Cat(path) → io.ReadCloser（不可 seek）
+   │
+   ├─ 检测到 !io.Seeker → 落到本地临时文件:
+   │     tmpPath := /tmp/filestash/file_XXXXX.dat
+   │     io.Copy(tmpFile, catReader)  // 全量下载到磁盘
+   │     file_cache.Set(ctx.Session, tmpPath)  // key = 会话哈希
+   │
+   └─ 打开 tmpFile 作为 *os.File（可 seek）→ 读 Range 1000-2000 → 返回给浏览器
+
+
+第 2 次请求（Range: bytes=5000-6000，同会话同文件）:
+   │
+   ├─ file_cache.Get(ctx.Session) → hit → tmpPath
+   │
+   ├─ os.OpenFile(tmpPath) → *os.File（可 seek）
+   │
+   └─ 直接读 Range 5000-6000 → 不再触发后端 Cat
+```
+
+**缓存键设计**：`ctx.Session`（整个会话对象哈希），而不是 path。这意味着**同一个会话同时打开两个文件时会互相覆盖缓存** —— 假设用户一个 tab 放视频，另一个 tab 放大 PDF，Range 请求会反复失效落盘。
+
+**驱逐与清理**（`ctrl/files.go:69-71`）：
+```go
+file_cache.OnEvict(func(key string, value interface{}) {
+    os.RemoveAll(filepath.Join(GetAbsolutePath(TMP_PATH), key))
+})
+```
+5 分钟 TTL 到期后，自动删除临时 `.dat` 文件。
+
+### 14.5 `chunkedUploadCache`：24 小时长 TTL + 驱逐即上传完成
+
+位置：`server/ctrl/files.go:687-700`
+
+```go
+chunkedUploadCache = NewAppCache(60*24, 1)  // retention=24h, cleanup=1min
+chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+    c := value.(*chunkedUpload)
+    c.Close()   // 关闭 io.Pipe → 触发后端 Save 完成
+})
+```
+
+**缓存键**：`{path: "/a/b/c.zip", session: GenerateID(ctx.Session)}` 哈希
+
+**三种失效路径**：
+1. **正常完成**：最后一个 PATCH 到达，`offset == totalSize` → `chunkedUploadCache.Del(cacheKey)` → 触发 OnEvict 关闭 Pipe → 后端 Save 返回
+2. **用户主动 HEAD 查询发现不存在**：重新 POST 创建时，若缓存里已有旧 uploader，先 `chunkedUploadCache.Del()` 清掉
+3. **24 小时超时驱逐**：用户传了一半断网超过 24 小时 → OnEvict 自动 Close Pipe → 后端 Save 用已收到的部分字节落盘（产生截断文件）
+
+### 14.6 HTTP 协商缓存：Last-Modified / ETag
+
+位置：`server/ctrl/files.go` FileCat 多处、`SendSuccessResultWithEtagAndGzip`
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    缩略图（thumbnail=true）                        │
+│                                                                   │
+│  Stat → ModTime → Last-Modified 响应头                            │
+│         │                                                         │
+│         ▼                                                         │
+│  下次请求带 If-Modified-Since                                     │
+│         │                                                         │
+│         ├─ 时间匹配 → 304 Not Modified（不生成缩略图）             │
+│         └─ 不匹配 → 重新生成 + 更新 Last-Modified                  │
+└───────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                    JSON API 响应                                   │
+│                                                                   │
+│  mode + JSON 内容做 hash → ETag 响应头                             │
+│         │                                                         │
+│         ▼                                                         │
+│  下次请求带 If-None-Match                                          │
+│         │                                                         │
+│         ├─ 匹配 → 304 Not Modified（不返回 JSON body）            │
+│         └─ 不匹配 → 返回新内容 + 新 ETag                           │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**关键点**：HTTP 层缓存完全独立于后端 `*Cache`。后端 Ls 结果可能 5 分钟前已缓存（旧数据），HTTP 层仍然基于**这次 Ls 返回的旧数据**计算 ETag → 浏览器看到 304 但实际数据可能已过期。这是一个"嵌套缓存一致性"的弱设计。
+
+### 14.7 S3Cache：Bucket Region 按需探测缓存
+
+位置：`server/plugin/plg_backend_s3/utils.go:57-77`
+
+```
+用户访问 s3://mybucket/photo.jpg
+   │
+   ▼
+createSession("mybucket"):
+   newParams = {bucket: "mybucket", ...所有连接参数...}
+   │
+   ├─ S3Cache.Get(newParams) 命中 → 直接用缓存的 Region
+   │
+   └─ 未命中 → GetBucketLocation API 查询
+              ├─ 成功 → this.config.Region = 查询结果
+              ├─ 失败 → 保持默认 us-east-1
+              └─ S3Cache.Set(newParams, this.config.Region)
+```
+
+**失效机制**：5 分钟 TTL 自动过期。**没有主动失效** —— Bucket 迁移 Region 的话最多 5 分钟后才会重新探测。
+
+### 14.8 TmpStorage ChrootCache：用户临时目录持久化
+
+位置：`server/plugin/plg_backend_tmp/index.go:18-30`
+
+```go
+ChrootCache = NewAppCache(60 * 24 * 30)  // 30 天！
+ChrootCache.OnEvict(func(key string, value interface{}) {
+    os.RemoveAll(chroot)   // 驱逐 = 删除用户的整个 /tmp/filestash_tmp/{userID}/
+})
+```
+
+这是最长 TTL 的缓存。30 天不活动的用户，临时目录会被整体删除。
+
+### 14.9 缓存协同的关键洞察
+
+1. **缓存之间无联动**：`DavCache.Del()` 不会触发 HTTP ETag 重算；`file_cache` 的 5 分钟失效与 `FtpCache` 的 5 分钟失效独立计时。没有任何"写操作全局失效"的广播机制。
+
+2. **写操作失效粒度极粗**：Dav 写操作清整个 params 级缓存（而不是 path 级），S3 完全不主动失效 Region 缓存。简单粗暴是设计原则。
+
+3. **会话级 file_cache 的冲突**：缓存键是整个 session 哈希而非 path，同会话多文件 Range 请求互相覆盖 —— 是 bug 还是"够用就行"的有意设计，代码中没有注释。
+
+4. **驱逐副作用**：`*Cache.OnEvict` 不只删内存条目，还会关 TCP 连接、删磁盘文件、完成截断上传。驱逐回调是"资源清理"而不仅是"缓存失效"。
+
+---
+
+## 15. 深度分析：大文件分片上传和断点续传的跨后端兼容
+
+### 15.1 双层上传架构：TUS 协议层 + 后端 Save 能力层
+
+filestash 采用 **双层架构**，把所有后端都兼容到分片上传：
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│              TUS 协议层（ctrl/files.go FileSave）                  │
+│                                                                   │
+│  OPTIONS → 协商能力（creation, checksum: sha1/crc32）              │
+│  POST    → 创建 uploader，建立 io.Pipe，启动 goroutine 调用        │
+│            后端 Save(path, pipeReader)                             │
+│  HEAD    → 查询当前 Upload-Offset / Upload-Length                 │
+│  PATCH   → 追加 bytes 到 pipe；offset 对齐校验；可选校验和          │
+│  完成    → offset == size → Close Pipe → 后端 Save 返回            │
+│                                                                   │
+│  存储: chunkedUploadCache (24h TTL) 存 uploader {pipe, offset}    │
+└────────────────────────────────────┬──────────────────────────────┘
+                                     │ io.Pipe (流式桥接)
+                                     ▼
+┌───────────────────────────────────────────────────────────────────┐
+│              后端 Save 能力层（每个后端自己实现）                    │
+│                                                                   │
+│  S3:      s3manager.Uploader (SDK 自带分片并发，5MB part 默认)     │
+│  FTP:     client.Store(path, reader) — 协议级流式写入             │
+│  SFTP:    SFTPClient.OpenFile + io.Copy — 协议级流式写入          │
+│  WebDAV:  HTTP PUT + body — 协议级流式写入                        │
+│  Local:   os.OpenFile + io.Copy — 本地流式写入                    │
+│  Git:     本地 Save → git add + commit + push                     │
+│  Dav:     PUT 新 URN (If-None-Match:*) → DELETE 旧 URN            │
+│  GDrive/Dropbox: SDK 文件 Create 接口                             │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**核心设计思路**：TUS 层对后端完全屏蔽"分片"概念 —— 后端看到的就是一个普通的 `Save(path, io.Reader)`，Reader 另一端由 TUS 的 PATCH 请求源源不断喂数据。**后端不需要任何分片能力即可支持断点续传**。
+
+### 15.2 TUS 协议状态机：完整时序
+
+位置：`server/ctrl/files.go:479-670`
+
+```
+前端                                    服务端
+  │                                       │
+  │  OPTIONS /api/files/save              │
+  │    Tus-Resumable: 1.0.0               │
+  │ ─────────────────────────────────────►│
+  │                                       │ 协商支持：creation, checksum
+  │◄───────────────────────────────────── │ 算法：sha1, crc32
+  │                                       │
+  │  POST /api/files/save?path=/a.zip     │
+  │    Tus-Resumable: 1.0.0               │
+  │    Upload-Length: 1073741824          │  ← 1GB
+  │ ─────────────────────────────────────►│
+  │                                       │
+  │                                       │ 1. 重新 Init 后端实例（新 context）
+  │                                       │ 2. createChunkedUploader(b.Save, path, 1GB):
+  │                                       │    - r, w := io.Pipe()
+  │                                       │    - go func() { done <- b.Save(path, r) }()
+  │                                       │ 3. chunkedUploadCache.Set(key, uploader)
+  │                                       │    key = hash({path, session})
+  │◄───────────────────────────────────── │
+  │  201 Created                          │
+  │  Location: /api/files/save?path=...   │
+  │                                       │
+  │  PATCH /api/files/save?path=/a.zip    │
+  │    Tus-Resumable: 1.0.0               │
+  │    Upload-Offset: 0                   │
+  │    Upload-Checksum: sha1 XXXXX        │
+  │    Content-Type: application/offset+octet-stream
+  │    Body: [bytes 0~5MB]                │
+  │ ─────────────────────────────────────►│
+  │                                       │
+  │                                       │ 1. 从 cache 取出 uploader
+  │                                       │ 2. 校验 Upload-Offset == uploader.offset
+  │                                       │ 3. io.Copy(uploader.stream, body)
+  │                                       │ 4. 校验 sha1/crc32
+  │                                       │ 5. offset += 5MB
+  │◄───────────────────────────────────── │
+  │  204 No Content                       │
+  │  Upload-Offset: 5242880               │
+  │                                       │
+  │    ... (反复 PATCH, 每片 5MB) ...      │
+  │                                       │
+  │  PATCH ... 最后一片 (offset=1068MB)   │
+  │ ─────────────────────────────────────►│
+  │                                       │ 检测到 offset == 1GB
+  │                                       │   uploader.stream.Close()
+  │                                       │   等待 <-done（后端 Save 返回）
+  │                                       │   chunkedUploadCache.Del(key)
+  │◄───────────────────────────────────── │
+  │  204 No Content                       │
+  │                                       │
+  │                                       │
+  │  === 如果中途断网，前端恢复流程 ===      │
+  │                                       │
+  │  HEAD /api/files/save?path=/a.zip     │
+  │    Tus-Resumable: 1.0.0               │
+  │ ─────────────────────────────────────►│
+  │                                       │ chunkedUploadCache.Get(key)
+  │                                       │   → uploader.Meta(): {offset=100MB, size=1GB}
+  │◄───────────────────────────────────── │
+  │  204 No Content                       │
+  │  Upload-Offset: 104857600             │
+  │  Upload-Length: 1073741824            │
+  │                                       │
+  │  PATCH ... (从 100MB 续传)            │
+  │ ─────────────────────────────────────►│  ...继续
+```
+
+### 15.3 兼容性对比：各后端 Save 与分片的适配
+
+| 后端 | Save 实现方式 | 流式写入 | 分片由谁处理 | 最大文件限制 | 失败原子性 |
+|------|-------------|---------|-------------|------------|----------|
+| **S3** | `s3manager.Uploader`（aws-sdk-go） | ✓ | **SDK 自动分片**（默认 5MB part，并发 5） | 5TB（S3 限制） | 非原子（MPU 失败残留 parts，SDK 自动 Abort） |
+| **Local** | `os.OpenFile` + `io.Copy` | ✓ | 操作系统 page cache | 磁盘限制 | ✓ 原子（O_TRUNC 覆盖） |
+| **FTP** | `client.Store(path, reader)` | ✓ | FTP 协议数据连接流式传输 | 服务端依赖 | 非原子（半写入） |
+| **SFTP** | `SFTPClient.OpenFile` + `io.Copy` | ✓ | SSH channel 流式传输 | 服务端依赖 | 非原子（半写入） |
+| **WebDAV** | `HTTP PUT` body streamed | ✓ | HTTP chunked encoding | 服务端依赖 | 非原子（半写入） |
+| **Git** | Local Save → git add → commit → push | ✓ 本地流式 | 本地文件系统 + Git | Git 仓库限制 | 非原子（§13.6 所述的最终一致） |
+| **Dav** (Card/Cal) | PUT 新 URN（If-None-Match:*）→ DELETE 旧 | ✓（小文件） | HTTP 流式 | URN 映射机制限制 | 非原子（DELETE 失败双份副本） |
+| **GDrive / Dropbox** | SDK 文件 Create | ✓ | SDK 内部 | 服务端限制 | 非原子 |
+
+### 15.4 S3 后端的特殊地位：双层分片
+
+S3 后端存在 **双层分片**，容易混淆：
+
+```
+第 1 层（TUS 层，服务端可控）:
+  PATCH 1 (5MB) → Pipe → PATCH 2 (5MB) → Pipe → ...
+  控制方：filestash 前端（chunk size 由 JS 决定）
+  作用：断点续传
+
+第 2 层（S3 SDK 层，服务端黑盒）:
+  PipeReader → s3manager.Uploader →
+    ├─ 缓冲 5MB → UploadPart #1
+    ├─ 缓冲 5MB → UploadPart #2 （并发）
+    └─ ...
+    └─ 所有 Part 完成 → CompleteMultipartUpload
+  控制方：aws-sdk-go（默认 PartSize=5MB, Concurrency=5）
+  作用：绕开 S3 单 PUT 5GB 限制，支持大文件 + 并发加速
+```
+
+**双层分片的冲突**：
+- TUS 层每片 5MB + SDK 层每片 5MB → 对齐
+- 但如果前端修改 TUS chunk size（比如 1MB），SDK 内部仍然要缓冲到 5MB 才发 UploadPart，可能出现内存堆积
+- `s3manager` 会自动判断文件大小：< 5MB 走普通 PutObject，≥ 5MB 自动走 MultipartUpload
+
+### 15.5 后端无分片能力时的兼容：流式桥接的价值
+
+**以 FTP 为例**：FTP `STOR` 命令根本没有分片概念，也没有断点续传（REST 命令扩展不普遍支持）。但通过 TUS + io.Pipe 架构：
+
+```
+前端 TUS PATCH (5MB 分片 1)
+   │
+   ▼
+io.PipeWriter ← 写入 5MB
+io.PipeReader → FTP client.Store(path, pipeReader)
+   │                  │
+   │                  └─ FTP STOR 持续读，有数据就发，没数据就等（阻塞）
+   │
+前端 TUS PATCH (5MB 分片 2，1 小时后来的，用户断网刚恢复)
+   │
+   ▼
+io.PipeWriter ← 再写 5MB
+   │
+   ▼
+FTP client.Store 被唤醒，继续发数据
+   ...
+```
+
+**关键前提**：FTP 控制连接 + 数据连接在 24 小时（`chunkedUploadCache` TTL）内不被服务端踢掉。如果被踢，FTP `Execute` 有自动重连机制（§6.5），但 `Store` 流已断 → 只能从头开始。
+
+### 15.6 错误处理路径与边界场景
+
+位置：`server/ctrl/files.go:554-667`
+
+| 错误场景 | 处理方式 | 后果 |
+|---------|---------|------|
+| HEAD 查询时 cache 中找不到 uploader | 返回 404 NotFound | 前端只能重新 POST 创建（从头传） |
+| PATCH 时 cache miss | 返回 409 Conflict | 同上 |
+| PATCH 的 Upload-Offset ≠ 服务端 offset | 返回 405 ErrNotValid | 前端应 HEAD 查询后从正确位置重传 |
+| Upload-Checksum (sha1/crc32) 不匹配 | 返回 460 Checksum Mismatch | 这一片无效，重新传（offset 不变） |
+| newOffset > totalSize | Close Pipe + Del cache + 403 | 异常，上传终止，远端可能有截断文件 |
+| 24 小时 TTL 驱逐 | OnEvict → `c.Close()` → 关闭 Pipe | 远端 Save 落盘的是当前已接收部分（截断文件） |
+| 后端 Save 返回错误 | Close 返回错误 → 从 PATCH 的 204 响应中体现？不，等 Close 时 PATCH 已经走了 | **错误丢失**：当前实现中 `uploader.Next()` 只看 Copy 错误，Save 的错误要到 Close 才暴露；如果是最后一个 PATCH，Close 错误会返回 405；否则静默存在 |
+
+### 15.7 分片上传的关键洞察
+
+1. **TUS 层是"万能胶水"**：通过 io.Pipe 把"前端分片异步喂数据"和"后端需要一个连续 Reader"桥接起来，对后端零侵入 —— 所有后端天然支持断点续传，不需要各自实现。
+
+2. **S3 的双层分片冗余**：TUS 层分片+缓存实现断点续传，SDK 层分片实现大文件并发上传。两层各自独立，没有协调，存在边界条件（TUS 分片小于 SDK PartSize 时 SDK 内部缓冲堆积）。
+
+3. **无服务端持久化**：`chunkedUploadCache` 纯内存（带 TTL），进程重启所有断点续传状态丢失 → 用户必须重新上传。
+
+4. **长连接依赖**：FTP/SFTP 等长连接协议的 Store 在 Pipe 阻塞期间必须保持连接不被服务端超时关闭。FTP 自动重连只能在操作之间生效，不能在一个 Store 流中间恢复。
+
+5. **错误丢失风险**：`chunkedUpload.done` channel 中的后端 Save 错误，只有最后一片 PATCH 触发 Close 时才会被检查；非最后一片时，即使后端 Save 已出错（如磁盘满、权限拒绝），后续 PATCH 仍然不断写 Pipe 并返回 204，直到 Close 才暴露问题 —— 用户传完了才发现失败。
