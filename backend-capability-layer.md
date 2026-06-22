@@ -1241,3 +1241,240 @@ FTP client.Store 被唤醒，继续发数据
 4. **长连接依赖**：FTP/SFTP 等长连接协议的 Store 在 Pipe 阻塞期间必须保持连接不被服务端超时关闭。FTP 自动重连只能在操作之间生效，不能在一个 Store 流中间恢复。
 
 5. **错误丢失风险**：`chunkedUpload.done` channel 中的后端 Save 错误，只有最后一片 PATCH 触发 Close 时才会被检查；非最后一片时，即使后端 Save 已出错（如磁盘满、权限拒绝），后续 PATCH 仍然不断写 Pipe 并返回 204，直到 Close 才暴露问题 —— 用户传完了才发现失败。
+
+---
+
+### 15.8 S3 Multipart Upload 中途失败的 Abort 清理路径
+
+**结论先行**：aws-sdk-go 的 `s3manager.Uploader` 默认会自动清理失败的 multipart upload，但 TUS 层 `context.Background()` 的特殊设计使得"用户取消请求"无法触发 SDK 的 abort，产生孤立 parts 泄漏风险。
+
+#### 15.8.1 s3manager.Uploader 的默认 Abort 机制
+
+位置：`server/plugin/plg_backend_s3/index.go:569-587` + aws-sdk-go 内部行为
+
+```go
+func (this S3Backend) Save(path string, file io.Reader) error {
+    uploader := s3manager.NewUploader(this.createSession(p.bucket))
+    input := s3manager.UploadInput{...}
+    // ⚠ 没有设置 uploader.LeavePartsOnError = true
+    // ⚠ 使用 this.app.Context 传递给 SDK
+    _, err := uploader.UploadWithContext(this.app.Context, &input)
+    return err
+}
+```
+
+**aws-sdk-go s3manager 默认行为**：
+- `LeavePartsOnError` 默认为 `false`
+- 当 `UploadWithContext` 的 `ctx` 被取消（`ctx.Done()`）或返回错误时，SDK 自动调用 `AbortMultipartUpload` API 删除已上传的 parts
+- Abort 调用使用同一个 context，如果 context 已被取消，Abort 请求也会立即超时
+
+#### 15.8.2 三条失败路径的清理效果
+
+| 失败场景 | 触发点 | Context 状态 | Abort 是否执行 | 后果 |
+|---------|--------|-------------|---------------|------|
+| **路径 1：SDK 内部错误**（如网络断开、S3 5xx） | UploadPart 调用失败 | `this.app.Context` 正常 | ✓ 自动 Abort | 已上传 parts 被清理，无泄漏 |
+| **路径 2：this.app.Context 取消**（如 TUS 24h 驱逐） | `ctx.Done()` 触发 | context 被取消 | ⚠ 尽力但不可靠 | SDK 收到 Done 信号后尝试 Abort，但 context 已取消导致 Abort 请求可能超时失败 → **孤立 parts 泄漏** |
+| **路径 3：TUS POST 创建上传**（用户取消 HTTP 请求） | 见下 | `context.Background()` | ✗ 完全不会触发 | **最严重的泄漏路径** |
+
+#### 15.8.3 关键设计缺陷：TUS POST 替换为 `context.Background()`
+
+位置：`server/ctrl/files.go:578-586`
+
+```go
+if proto == "tus" && req.Method == http.MethodPost {
+    // ...
+    // ⚠⚠⚠ 关键：这里把 context 替换成了 Background，永不取消
+    ctx.Context = context.Background()
+    
+    // 用新的永不到期的 context 重新 Init 后端
+    b, err := ctx.Backend.Init(ctx.Session, ctx)
+    
+    uploader := createChunkedUploader(b.Save, path, size)
+    // uploader goroutine 内部调用 b.Save(path, r)
+    // b.Save 对于 S3 就是 uploader.UploadWithContext(ctx.Background(), ...)
+    chunkedUploadCache.Set(cacheKey, uploader)
+    // ...
+}
+```
+
+**完整错误链路分析（路径 3）**：
+
+```
+用户浏览器 POST /api/files/save?path=/big.zip
+   Tus-Resumable: 1.0.0
+   Upload-Length: 5368709120  (5GB)
+   │
+   ▼
+服务端 FileSave:
+   1. ctx.Context = context.Background()  // 永久 context
+   2. b = ctx.Backend.Init(ctx.Session, ctx)  // S3 实例持有这个 context
+   3. createChunkedUploader(b.Save, ...):
+      go func() {
+          // 这个 goroutine 脱离了 HTTP 请求生命周期
+          done <- b.Save(path, pipeReader)
+          // b.Save 内部调用 uploader.UploadWithContext(ctx.Background(), ...)
+      }()
+   4. 返回 201 Created
+   │
+   ▼
+用户浏览器断网/关闭标签页 → HTTP 连接断开
+   │
+   ▼
+http.Server 检测到连接断开 → 原始 req.Context() 被取消
+   │
+   ├─ BUT → ctx.Context 已经是 Background()，不受影响
+   │
+   ▼
+uploader goroutine 继续运行：
+   pipeReader 永远等不到后续 PATCH 数据 → 阻塞在 io.Copy
+   │
+   ▼
+24 小时后 chunkedUploadCache.OnEvict 触发:
+   c.Close() → stream.Close() → pipeReader 收到 io.EOF
+   │
+   ▼
+S3 SDK UploadWithContext 收到 EOF → 文件大小不够 → 返回错误
+   │
+   ▼
+LeavePartsOnError=false → 尝试 AbortMultipartUpload
+   │
+   ▼
+Abort 调用成功 → 已上传 parts 被清理 ✓
+   (如果 Abort 调用失败 → 孤立 parts 永久泄漏，只能等 bucket 生命周期策略清理)
+```
+
+**最严重的场景**：用户上传了 3GB 后取消，浏览器断开连接。剩下的 2GB 永远等不到，goroutine 阻塞 24 小时。期间 3GB 的 parts 一直占用 S3 存储计费，直到 24 小时后被 Abort。
+
+#### 15.8.4 孤立 parts 的最终兜底
+
+- 如果 S3 bucket 配置了 **AbortIncompleteMultipartUpload** 生命周期规则（如 1 天后自动清理），则最终会被清理
+- 如果没有配置，这些 parts 永久存在并持续计费
+- filestash 代码中没有主动列出并清理孤立 multipart upload 的逻辑
+
+---
+
+### 15.9 Git 后端大仓库 Clone 中途取消的中断处理
+
+**结论先行**：go-git v6 `PlainClone` 支持 Context 取消，但 filestash 没有传递 Context，用户取消 HTTP 请求不会中断正在进行的 clone；临时目录在进程退出或 cache 驱逐时才会被清理。
+
+#### 15.9.1 Git 后端初始化与 Clone 流程
+
+位置：`server/plugin/plg_backend_git/index.go:52-105`
+
+```go
+func (git Git) Init(params map[string]string, app *App) (IBackend, error) {
+    // 先查缓存
+    if obj := git_cache.Get(params); obj != nil {
+        return obj.(*Git), nil
+    }
+    
+    // ...参数初始化...
+    
+    // 创建临时工作目录
+    hash := GenerateID(params)
+    p.basePath = GetAbsolutePath(TMP_PATH, "git_"+hash) + "/"
+    
+    // ⚠ 调用 open 执行 clone，传递的是 params 和 basePath，
+    //   没有传递 app.Context 用于取消
+    repo, err := g.git.open(p, p.basePath)
+    g.git.repo = repo
+    // ...
+}
+```
+
+#### 15.9.2 `open` 函数的 Clone 调用（无 Context）
+
+位置：`server/plugin/plg_backend_git/index.go:341-362`
+
+```go
+func (g *GitLib) open(params *GitParams, path string) (*git.Repository, error) {
+    g.params = params
+    
+    if _, err := os.Stat(g.params.basePath); os.IsNotExist(err) {
+        auth, err := g.auth()
+        if err != nil { return nil, err }
+        
+        // ⚠ go-git v6 CloneOptions 支持 Context 字段，但 filestash 没有设置
+        g, err := git.PlainClone(path, &git.CloneOptions{
+            URL:           g.params.repo,
+            Depth:         1,                    // 浅克隆
+            ReferenceName: plumbing.ReferenceName(
+                fmt.Sprintf("refs/heads/%s", g.params.branch)),
+            SingleBranch:  true,
+            ClientOptions: auth,
+            // ⚠ 缺失: Context: app.Context,
+        })
+        if err == transport.ErrEmptyRemoteRepository {
+            return g, nil
+        }
+        return g, err
+    }
+    return git.PlainOpen(g.params.basePath)
+}
+```
+
+#### 15.9.3 三条中断路径的处理效果
+
+| 中断场景 | 触发点 | Context 传递 | Clone 是否中断 | 临时目录是否清理 | 后果 |
+|---------|--------|-------------|---------------|-----------------|------|
+| **路径 1：用户在 Ls 页面等不及，关闭浏览器** | HTTP 请求取消，`req.Context()` Done | ✗ 未传递给 PlainClone | ✗ goroutine 继续 clone，直到完成 | ✗ 目录残留，直到 cache 5 分钟驱逐 | 后台静默完成 clone，浪费带宽和磁盘 |
+| **路径 2：git_cache 5 分钟 TTL 驱逐** | `OnEvict` 触发 `g.Close()` | — | ✗ Clone 已在进行中，无法中断 | ✓ `os.RemoveAll(basePath)` 删除目录 | 已下载的对象被清理，但 clone goroutine 可能 panic（目录被删） |
+| **路径 3：Clone 中途网络错误/认证失败** | `PlainClone` 返回错误 | — | ✓ 立即返回 | ✗ 部分下载的 `.git/objects` 残留 | Init 返回错误，临时目录没人删 → **永久泄漏** |
+| **路径 4：进程重启/退出** | 进程终止 | — | ✓ 强制终止 | 不确定（取决于 Close 是否被调用） | 临时目录可能永久残留 |
+
+#### 15.9.4 关键设计缺陷：中断信号链断裂
+
+完整调用链：
+```
+浏览器 HTTP 请求 /api/files/ls?path=/
+   │
+   ▼
+model.NewBackend(...) → Git.Init(params, app)
+   │                   app.Context 可用，但未往下传
+   ▼
+g.git.open(params, path)
+   │
+   ▼
+git.PlainClone(path, &git.CloneOptions{...})
+   ▲
+   │ 缺失 Context 字段
+   │
+用户关闭浏览器 → req.Context() 取消 → 但 CloneOptions 没有 Context → 无法中断
+```
+
+**go-git v6 本可以支持中断**：go-git v6 的 `CloneOptions` 有 `Context` 字段，如果设置了，HTTP/SSH 客户端会监听 `ctx.Done()` 信号并中止传输。filestash 缺失这一行。
+
+#### 15.9.5 临时目录泄漏清理路径
+
+```
+临时目录: /tmp/filestash/git_{params_hash}/
+   │
+   ├─ 正常流程: Init 成功 → 存入 git_cache
+   │                 │
+   │                 └─ 5 分钟后驱逐 → OnEvict → g.Close()
+   │                                                 │
+   │                                                 ▼
+   │                                          os.RemoveAll(basePath)
+   │
+   └─ 异常流程: Init 中途失败（网络错误/认证失败）
+                     │
+                     ├─ 错误返回给上层
+                     └─ ✗ 没有代码删除已创建的 basePath
+                        （即使只 mkdir 了空目录）
+```
+
+**泄漏场景修复缺失**：`open` 函数在返回错误前，应该 `os.RemoveAll(path)` 清理已创建的临时目录。当前代码没有这个清理步骤。
+
+---
+
+## 16. 中断处理的关键洞察总结
+
+1. **S3 孤立 parts 的双重风险**：`context.Background()` + 24 小时 TTL 导致用户取消后已上传 parts 继续计费 24 小时；Abort 调用本身也可能因 context 问题失败。
+
+2. **Git 泄漏的隐形成本**：大仓库浅 clone 可能下载几百 MB ~ 几 GB，中途失败的临时目录无人清理，长期累积可能耗尽磁盘。
+
+3. **TUS 设计的双刃剑**：`context.Background()` 保证了"断网 23 小时后回来还能续传"，但代价是中断信号完全丢失，资源泄漏窗口长达 24 小时。
+
+4. **SDK 默认行为依赖**：S3 abort 清理完全依赖 aws-sdk-go 的 `LeavePartsOnError=false` 默认值，没有显式设置也没有兜底扫描机制。
+
+5. **缺乏统一中断模型**：整个后端抽象层没有传递 `context.Context` 的统一约定，各后端自行决定是否支持取消。Context 传递是"可选的"而不是"强制的"。
