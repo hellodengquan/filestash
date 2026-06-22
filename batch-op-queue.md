@@ -1353,3 +1353,486 @@ else res["files"] = files.map((file) => file.type === "file" ? { ...file, offlin
 | 文件列表 | 无 | navigator.onLine | N/A | 自动：online 事件触发刷新 |
 
 **核心结论**：本项目的进度推送不依赖 WebSocket/SSE，而是完全基于 XHR 的请求级事件。断连恢复依赖两个机制：(1) **用户手动重试**（点击重试按钮），(2) **TUS 协议的 HEAD 查询**（自动获取已上传偏移量）。没有自动重连和自动重试逻辑。
+
+---
+
+## 7. Worker 异常崩溃时 In-Progress 任务的接管转移路径
+
+### 7.1 崩溃的定义与来源
+
+在当前架构中，"worker 崩溃"有两种含义：
+
+1. **JS 层异常**：`processWorkerQueue` 内部的 `await exec.run(task)` 抛出未预期的异常
+2. **浏览器标签页崩溃**：整个页面进程终止（如 OOM、浏览器强制杀掉标签页）
+
+两者的恢复路径截然不同。
+
+### 7.2 JS 层异常：`noFailureAllowed` 自愈循环
+
+**文件**: `public/assets/pages/filespage/ctrl_upload.js:314`
+
+```javascript
+const noFailureAllowed = (fn) => fn().catch(() => noFailureAllowed(fn));
+```
+
+这个递归函数是 worker 崩溃后的**第一道防线**。它的调用位置：
+
+```javascript
+// ctrl_upload.js:322
+noFailureAllowed(processWorkerQueue.bind(null, nworker))
+    .then(() => reservations[nworker] = false);
+```
+
+**完整恢复链路**：
+
+```
+processWorkerQueue 内部 await exec.run(task) 抛出异常
+    ↓
+processWorkerQueue 的 try-catch 捕获，走 "error" 分支
+    ↓
+updateDOMWithStatus($task, { exec, status: "error", nworker })
+    ↓
+task.done = true  ←  标记完成（即使失败）
+    ↓
+while 循环继续 → nextTask(tasks) → 取下一个任务
+    ↓
+（如果 while 循环自身也崩溃了呢？）
+    ↓
+noFailureAllowed 捕获 → 递归调用自身 → processWorkerQueue 重新启动
+    ↓
+reservations[nworker] = false 仅在 processWorkerQueue 正常退出时才执行
+    → 如果 noFailureAllowed 递归重启，槽位仍然被占用
+    → 重启后的 processWorkerQueue 继续处理 tasks[] 中的剩余任务
+```
+
+**关键细节**：`noFailureAllowed` 保证的是**整个 worker 循环不会终止**，但它不能恢复**当前正在执行的那个任务**。
+
+### 7.3 In-Progress 任务的命运：不可转移，只能重试
+
+当一个 task 在 `exec.run(task)` 执行过程中出现异常（如 TUS 分片网络错误），该任务的恢复完全依赖 `exec.retry()` 方法。**没有其他 worker 会接管这个 in-progress 任务**。
+
+原因分析：
+
+**1. 任务已被从全局池中移除**
+
+```javascript
+// ctrl_upload.js:305-313
+const nextTask = (tasks) => {
+    for (let i=0; i<tasks.length; i++) {
+        const possibleTask = tasks[i];
+        if (!possibleTask.ready()) continue;
+        tasks.splice(i, 1);    // ← 任务从 tasks[] 中移除
+        return possibleTask;
+    }
+    return null;
+};
+```
+
+任务被 `splice` 移出后，只存在于当前 worker 的局部变量 `task` 中，其他 worker 无法看到它。
+
+**2. 执行器是即时创建的，与 worker 绑定**
+
+```javascript
+// ctrl_upload.js:282-288
+const exec = task.exec({
+    progress: (progress) => updateDOMTaskProgress($task, formatPercent(progress)),
+    speed: (speed) => {
+        updateDOMTaskSpeed($task, speed);
+        updateDOMGlobalSpeed(nworker, speed);
+    },
+});
+```
+
+`exec` 实例绑定了特定 worker 的 `nworker` 编号和特定 `$task` DOM 元素。即使其他 worker 想接管，也**无法获取另一个 worker 创建的 `exec` 实例**。
+
+**3. 重试按钮是唯一的恢复入口**
+
+```javascript
+// ctrl_upload.js:240-249
+$retry.onclick = async() => {
+    executeMutation("todo");
+    executeMutation("doing");
+    try {
+        await exec.retry();        // ← 使用 run() 时绑定的 retry 方法
+        executeMutation("done");
+    } catch (err) {
+        executeMutation("error");  // ← 失败可继续重试
+    }
+};
+```
+
+重试执行 `exec.retry()`，而不是把任务放回队列让其他 worker 接管。重试时仍然使用原始 `exec` 实例和原始 `nworker` 绑定的 DOM 更新回调。
+
+### 7.4 In-Progress 任务失败后的完整状态转换
+
+```
+任务生命周期（失败路径）：
+
+[nextTask 取出] ─→ task 从 tasks[] 移除
+       │
+       ↓
+[exec = task.exec({...})] ─→ 创建执行器，绑定 nworker 和 DOM
+       │
+       ↓
+[updateDOMWithStatus("doing")] ─→ UI: 显示进度条和停止按钮
+       │
+       ↓
+[await exec.run(task)]
+       │
+       ├─ 成功 → updateDOMWithStatus("done") → task.done=true → 继续下一任务
+       │
+       └─ 异常 → updateDOMWithStatus("error")
+                    │
+                    ├─ UI: 显示 "Error" + 重试按钮
+                    ├─ task.done = true ← 解除子任务依赖
+                    ├─ updateTotal.incrementCompleted() ← 计数+1
+                    └─ 继续下一任务（不阻塞 worker）
+
+[用户点击重试]
+       │
+       ↓
+[exec.retry()] ─→ virtual.before() + executeJob()
+       │
+       ├─ TUS: HEAD 查偏移量 → 从断点续传
+       └─ 普通上传: 从头开始
+```
+
+### 7.5 浏览器标签页崩溃：无恢复机制
+
+如果浏览器标签页整个崩溃（OOM、手动杀掉进程等）：
+
+1. **前端状态全部丢失**：`tasks[]`、`reservations[]`、DOM 中的 `exec` 实例全部消失
+2. **后端 TUS 会话保留**：`chunkedUploadCache` 中保存着 `io.PipeWriter` 和已上传偏移量，24 小时后自动过期
+3. **用户重新打开页面**：上传队列为空，不会自动恢复之前未完成的任务
+4. **TUS 缓存的后果**：后端的 `io.PipeWriter` 永远不会有写入者，后端的 `io.PipeReader` 永远不会有读取者。`save` goroutine 阻塞在 `io.Copy`，直到 cache 过期触发 `OnEvict` → `Close()` 关闭 Pipe
+
+**后端 Pipe 泄露的防护**：
+
+```go
+// server/ctrl/files.go:688-700
+func initChunkedUploader() {
+    chunkedUploadCache = NewAppCache(60*24, 1)   // 24小时过期，每1分钟清理
+    chunkedUploadCache.OnEvict(func(key string, value interface{}) {
+        c := value.(*chunkedUpload)
+        if c == nil { return }
+        if err := c.Close(); err != nil {         // Close() 关闭 PipeWriter
+            Log.Warning("ctrl::files::chunked::cleanup action=close err=%s", err.Error())
+            return
+        }
+    })
+}
+```
+
+```go
+// server/ctrl/files.go:721-728
+func (this *chunkedUpload) Close() error {
+    this.stream.Close()      // ← 关闭 PipeWriter
+    err := <-this.done       // ← 等待 save goroutine 返回
+    this.once.Do(func() {
+        close(this.done)
+    })
+    return err
+}
+```
+
+当 PipeWriter 被关闭后，`io.Copy(stream, r)` 返回 `io.ErrClosedPipe`，save goroutine 退出，资源释放。
+
+### 7.6 总结：In-Progress 任务接管路径对比
+
+| 崩溃类型 | In-Progress 任务是否可恢复 | 恢复机制 | 数据损失 |
+|---------|:----------------------:|---------|---------|
+| exec.run() 网络异常 | ✅ | 重试按钮 → exec.retry() → TUS 断点续传 | 无（TUS）/ 从头（普通） |
+| exec.run() 未知异常 | ✅ | 重试按钮 → exec.retry() | 可能丢进度 |
+| processWorkerQueue 循环崩溃 | ✅ | noFailureAllowed 自动重启 worker | 当前任务重试按钮恢复 |
+| DOM 异常导致 UI 不一致 | ⚠️ | 无自动恢复，任务可能卡在 doing 状态 | 进度丢失 |
+| 浏览器标签页崩溃 | ❌ | 无前端恢复，后端 TUS cache 24h 后自动清理 | 全部丢失 |
+
+---
+
+## 8. 跨用户共享 Worker 池场景下的优先级调度
+
+### 8.1 架构前提：Worker 池的隔离边界
+
+**关键结论：本项目不存在跨用户共享的 Worker 池。**
+
+Worker 池完全运行在浏览器前端，每个标签页有自己独立的 JS 运行时。需要区分三层隔离：
+
+```
+┌─────────────────────────────────────────────────────┐
+│  服务器（Go 进程）                                     │
+│                                                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
+│  │ User A 请求  │  │ User B 请求  │  │ User C 请求  │  │
+│  │ (session_1) │  │ (session_2) │  │ (session_3) │  │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │
+│         │                │                │          │
+│         ↓                ↓                ↓          │
+│  ┌──────────────────────────────────────────────┐   │
+│  │        chunkedUploadCache（全局共享）           │   │
+│  │  key: {path, session} → chunkedUpload        │   │
+│  └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│  浏览器 User A                                        │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  MAX_WORKERS=4 的独立 Worker 池               │   │
+│  │  tasks[] = [A1, A2, A3, ...]                 │   │
+│  │  reservations = [true, true, false, false]   │   │
+│  └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│  浏览器 User B                                        │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  MAX_WORKERS=4 的独立 Worker 池               │   │
+│  │  tasks[] = [B1, B2, ...]                     │   │
+│  │  reservations = [true, false, false, false]  │   │
+│  └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
+
+### 8.2 前端 Worker 池的隔离性分析
+
+**workers$ 是模块级单例**：
+
+```javascript
+// ctrl_upload.js:16
+const workers$ = new rxjs.BehaviorSubject({ tasks: [], size: null });
+```
+
+`workers$` 定义在模块顶层，但每个浏览器标签页有独立的 JS 运行时，因此：
+
+- **同一用户同一标签页**：共享同一个 `workers$`，同一个 `tasks[]`
+- **同一用户不同标签页**：各自有独立的 `workers$`，互不干扰
+- **不同用户**：各自有独立的 `workers$`，完全隔离
+
+**同标签页内的多入口共享**：
+
+```javascript
+// ctrl_upload.js:20-38
+export default async function(render) {
+    if (!document.querySelector(`[is="component_upload_queue"]`)) {
+        const $queue = createElement(`<div is="component_upload_queue"></div>`);
+        document.body.appendChild($queue);
+        componentUploadQueue(createRender($queue), { workers$ });
+    }
+
+    effect(getPermission().pipe(
+        rxjs.filter(() => calculatePermission(currentPath(), "upload")),
+        rxjs.tap(() => {
+            componentFilezone(createRender(...), { workers$ });
+            componentUploadFAB(createRender(...), { workers$ });
+        }),
+    ));
+}
+```
+
+上传队列组件（`componentUploadQueue`）在 DOM 中以 `component_upload_queue` 标记做单例检查，确保同一标签页只有一个队列实例。文件拖放区（`componentFilezone`）和 FAB 按钮（`componentUploadFAB`）都通过同一个 `workers$` 注入任务。
+
+### 8.3 后端资源的跨用户竞争
+
+虽然前端 Worker 池是隔离的，但后端的 `chunkedUploadCache` 是**进程级全局共享**的：
+
+```go
+// server/ctrl/files.go:477
+var chunkedUploadCache AppCache
+```
+
+每个用户的 TUS 上传会话通过 cache key 隔离：
+
+```go
+// server/ctrl/files.go:543-546
+cacheKey := map[string]string{
+    "path":    path,
+    "session": GenerateID(ctx.Session),   // ← session 隔离
+}
+```
+
+`GenerateID` 基于 session 中的关键字段（type、host、user 等）生成唯一标识：
+
+```go
+// server/common/crypto.go:193-214
+func GenerateID(params map[string]string) string {
+    p := ""
+    orderedKeys := make([]string, len(params))
+    for key, _ := range params {
+        orderedKeys = append(orderedKeys, key)
+    }
+    sort.Strings(orderedKeys)
+    for _, key := range orderedKeys {
+        switch key {
+        case "password":    // 敏感字段不参与
+        case "path":
+        case "session":
+        case "timestamp":
+        default:
+            if val := params[key]; val != "" {
+                p += key + "=>" + params[key] + ", "
+            }
+        }
+    }
+    if p == "" { return "na" }
+    return Hash(p, 20)
+}
+```
+
+**跨用户竞争的关键点**：
+
+1. **cache 容量无上限**：`NewAppCache(60*24, 1)` 只设了过期时间（24小时），没有容量限制。多用户并发上传时，cache 会无限增长直到内存耗尽
+2. **无并发控制**：后端对同时进行的上传请求数没有信号量或速率限制
+3. **无优先级**：所有请求按 HTTP 到达顺序处理，无优先级队列
+
+### 8.4 跨标签页的协同：BroadcastChannel
+
+项目中唯一的跨标签页通信机制是 `BroadcastChannel`：
+
+```javascript
+// model_files.js:82
+const bc = new BroadcastChannel("filestash::ls::refresh");
+
+// model_files.js:157
+export const refresh = () => {
+    window.dispatchEvent(new KeyboardEvent("keydown", { keyCode: 82 }));
+    bc.postMessage(null);     // ← 通知其他标签页刷新文件列表
+};
+```
+
+```javascript
+// model_files.js:110
+rxjs.fromEvent(bc, "message"),
+```
+
+**但 BroadcastChannel 不涉及上传队列**。它仅用于文件列表刷新的跨标签页同步。上传队列的 `workers$` 是完全独立的，同一用户在两个标签页上传文件会创建两个独立的 Worker 池。
+
+### 8.5 实际的"跨用户调度"场景分析
+
+尽管没有显式的跨用户 Worker 池，但以下场景等效于跨用户资源竞争：
+
+**场景1：同一用户开多个标签页上传**
+
+```
+标签页 A: MAX_WORKERS=4, 上传 20 个文件
+标签页 B: MAX_WORKERS=4, 上传 10 个文件
+──────────────────────────────────────
+浏览器对同一域名 HTTP 并发连接数限制 ≈ 6
+实际并发 ≈ 6（不是 4+4=8）
+两个标签页互相争抢连接，彼此降低吞吐量
+```
+
+浏览器层面，HTTP/1.1 对同一域名的并发连接数限制约为 6 个（Chrome 默认）。两个标签页各自有 4 个 worker，但浏览器总共只允许 6 个并发连接。这导致了隐式的"跨标签页调度"，由浏览器的连接管理器控制，无优先级可言。
+
+**场景2：多用户同时上传到同一后端**
+
+```
+User A: 4 个并发上传请求 → 后端同步处理 → 存储后端 (S3/SFTP/...)
+User B: 4 个并发上传请求 → 后端同步处理 → 存储后端 (S3/SFTP/...)
+User C: 4 个并发上传请求 → 后端同步处理 → 存储后端 (S3/SFTP/...)
+───────────────────────────────────────────────────────────
+后端无并发控制，所有请求竞争存储后端 I/O
+可能导致：存储后端 API 限流、连接池耗尽、内存压力
+```
+
+后端 `FileSave` 对请求的处理是同步阻塞的：
+
+```go
+// server/ctrl/files.go:530-539
+if proto == "" && req.Method == http.MethodPost {
+    err = ctx.Backend.Save(path, req.Body)   // ← 同步阻塞，直到写完
+    req.Body.Close()
+    // ...
+    SendSuccessResult(res, nil)
+    return
+}
+```
+
+每个上传请求都会占用一个 Go HTTP handler goroutine，直到 `ctx.Backend.Save()` 返回。如果存储后端慢（如 S3 高延迟），大量并发请求会积累大量 goroutine。
+
+**场景3：TUS 分块上传的全局资源竞争**
+
+```go
+// server/ctrl/files.go:672-684
+func createChunkedUploader(save func(path string, file io.Reader) error, path string, size uint64) *chunkedUpload {
+    r, w := io.Pipe()
+    done := make(chan error, 1)
+    go func() {
+        done <- save(path, r)     // ← 每个 TUS 上传占一个 goroutine
+    }()
+    // ...
+}
+```
+
+每个 TUS 上传会话占用：
+- 1 个 `chunkedUpload` 结构体（内存）
+- 1 个 `io.Pipe`（读写两端）
+- 1 个 goroutine（执行 `save`）
+
+这些资源在 cache 过期前一直占用，没有按用户配额回收。
+
+### 8.6 调度优先级的现状
+
+**前端**：FIFO（先进先出），无优先级
+
+```javascript
+// ctrl_upload.js:305-313
+const nextTask = (tasks) => {
+    for (let i=0; i<tasks.length; i++) {    // ← 按数组顺序遍历
+        const possibleTask = tasks[i];
+        if (!possibleTask.ready()) continue;
+        tasks.splice(i, 1);
+        return possibleTask;
+    }
+    return null;
+};
+```
+
+任务严格按入队顺序（数组下标）调度，唯一的"优先级"来自 `ready()` 函数——目录创建任务天然比其子文件任务优先（因为子文件 `ready()` 返回 false 直到目录 `done`）。
+
+**后端**：无调度，HTTP 请求按到达顺序处理
+
+Go 的 `net/http` 包使用 goroutine-per-connection 模型，每个请求独立处理，没有全局队列或优先级。
+
+### 8.7 跨用户调度的改进方向（代码层面的差距）
+
+如果要实现跨用户优先级调度，需要以下改动，当前代码**均不存在**：
+
+| 改动点 | 当前状态 | 所需改动 |
+|-------|---------|---------|
+| 前端任务优先级字段 | task 对象无 priority 字段 | 在 processFiles/processItems 中添加 `task.priority = 0` |
+| nextTask 优先级排序 | 按数组下标 FIFO | 改为按 priority 排序后再遍历 |
+| 后端请求速率限制 | 无 | 引入 `rate.Limiter` 或信号量 |
+| 后端用户配额 | 无 per-user 限制 | 在 middleware 中实现 per-session 并发限制 |
+| chunkedUploadCache 容量 | 无上限 | 添加 `cache.MaxItems()` 或 per-session 计数 |
+| 跨标签页队列协调 | 无 | 使用 SharedWorker 或 BroadcastChannel 同步上传状态 |
+| 后端优先级队列 | 无 | TUS 会话按用户优先级排队处理 |
+
+**最接近"跨用户调度"的现有机制**：`chunkedUploadCache` 的 per-session 隔离（通过 `GenerateID(ctx.Session)` 作为 cache key），确保不同用户的 TUS 会话不会互相干扰——但这只是**隔离**，不是**调度**。
+
+### 8.8 完整的调度层级总结
+
+```
+第1层：浏览器 HTTP 连接池
+    └─ 同一域名最多 6 个并发连接（HTTP/1.1）
+    └─ 无优先级，先到先得
+    └─ 影响：同一用户多标签页上传时互相争抢
+
+第2层：前端 Worker 池（per 标签页）
+    └─ MAX_WORKERS = 4 个并发 worker
+    └─ FIFO 调度（nextTask 按数组顺序）
+    └─ 依赖感知：目录 → 子文件（隐式优先级）
+    └─ 完全隔离：标签页之间无共享
+
+第3层：后端 HTTP 处理（Go net/http）
+    └─ goroutine-per-request
+    └─ 无并发限制、无速率限制
+    └─ 无优先级，同步阻塞处理
+
+第4层：后端 TUS 会话缓存（全局共享）
+    └─ chunkedUploadCache：per-session 隔离
+    └─ 24 小时过期，无容量限制
+    └─ 每个 TUS 会话占一个 goroutine + Pipe
+
+第5层：存储后端（S3/SFTP/Samba/...）
+    └─ 各自的连接池和速率限制
+    └─ 最慢的瓶颈层
+```
