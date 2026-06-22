@@ -369,3 +369,343 @@ _extractBackend
 5. **Proof cookie**：加密 + HttpOnly + SameSite=None + Secure，有效期 30 天
 6. **验证码**：10 分钟有效期，一次性使用后立即删除
 7. **链接过期**：`Share.IsValid()` 在每次 `_extractShare` 和 `ShareVerifyProof` 中调用，毫秒级精度校验
+
+---
+
+## 九、链接撤销与已建立会话的失效路径
+
+### 9.1 撤销入口
+
+```
+DELETE /api/share/{share}  →  ShareDelete
+```
+
+中间件链：`ApiHeaders → SecureHeaders → SecureOrigin → CanManageShare → PluginInjector`
+
+前端 `modal_share.js:97-103` 中，用户点击删除按钮后调用 `DELETE /api/share/{id}`，删除成功后从前端 `state.links` 数组中移除该条目。
+
+### 9.2 ShareDelete 控制器 (`server/ctrl/share.go:96-104`)
+
+```go
+func ShareDelete(ctx *App, res http.ResponseWriter, req *http.Request) {
+    share_target := mux.Vars(req)["share"]
+    if err := model.ShareDelete(share_target); err != nil {
+        Log.Debug("share::delete '%s'", err.Error())
+        SendErrorResult(res, err)
+        return
+    }
+    SendSuccessResult(res, nil)
+}
+```
+
+### 9.3 ShareDelete 模型层 (`server/model/share.go:141-148`)
+
+```go
+func ShareDelete(id string) error {
+    stmt, err := DB.Prepare("DELETE FROM Share WHERE id = ?")
+    if err != nil { return err }
+    _, err = stmt.Exec(id)
+    return err
+}
+```
+
+仅执行一条 `DELETE FROM Share WHERE id = ?`，**不做任何额外清理**：不清除客户端的 Proof cookie，不吊销已建立的 Backend 连接缓存。
+
+### 9.4 已建立会话的失效路径——"无状态即时失效"模型
+
+Filestash 的共享会话**没有服务端 session 状态**，因此不存在"吊销会话"的操作。失效完全依赖每次请求时的实时校验：
+
+```
+已持有 Proof cookie 的用户继续访问 /s/{share_id}
+         │
+         ▼
+   SessionStart → _extractShare(req)
+         │
+         │  1. _extractShareId(req) → 提取 share_id
+         │  2. model.ShareGet(share_id)
+         │     → DB 查询：DELETE 后已无此记录
+         │     → 返回 ErrNotFound
+         │  3. _extractShare 收到 err != nil
+         │     → 返回 Share{}, nil（空 Share，不报错！）
+         │
+         ▼
+   _extractSession(req, ctx)
+         │
+         │  ctx.Share.Id == ""（空 Share）
+         │  → 走普通登录分支
+         │  → 需要有效的 Authorization cookie/token
+         │  → 匿名访问者没有 Authorization → session 为空 map
+         │
+         ▼
+   _extractBackend(req, ctx)
+         │
+         │  model.NewBackend(ctx, ctx.Session)
+         │  → 空 session 无法建立后端连接 → err
+         │
+         ▼
+   SessionStart 返回 ErrNotAuthorized (401)
+```
+
+**关键发现**：`_extractShare` 中 `ShareGet` 返回错误时（包括 `ErrNotFound`），函数返回的是 `Share{}, nil`——**空 Share 且无错误**，而非将错误传递出去。这意味着撤销后的链接不会触发显式的"链接已删除"提示，而是静默降级为需要正常登录的状态。
+
+### 9.5 Proof cookie 的残留与无害性
+
+链接被撤销后，用户浏览器中仍残留加密的 `"proof"` cookie（有效期 30 天），但这不构成安全风险：
+
+1. **Proof 无独立效力**：Proof cookie 只存储"已通过哪些验证"的记录，它必须与 DB 中存在的 Share 记录配合使用
+2. **ShareGet 是硬依赖**：`_extractShare` 首先从 DB 获取 Share 记录，若记录不存在，后续的 Proof 匹配逻辑完全不会执行
+3. **无回收机制**：服务端不会主动清除客户端的 Proof cookie，但 cookie 会在 30 天后自然过期
+
+### 9.6 已缓存的 Backend 连接
+
+`model.NewBackend` 内部可能有连接缓存，但每次请求都经过 `_extractShare → ShareGet` 的实时 DB 查询，因此：
+
+- 即使 Backend 对象在缓存中存活，`_extractShare` 的 DB 查询失败会阻断整个请求链
+- 缓存的 Backend 连接仅在 Share 记录仍然存在时才能被复用
+
+### 9.7 过期导致的失效路径
+
+与撤销不同，过期**不会**删除 DB 记录，而是通过 `Share.IsValid()` 判定：
+
+```go
+// server/common/types.go:196-204
+func (s Share) IsValid() error {
+    if s.Expire != nil {
+        now := time.Now().UnixNano() / 1000000
+        if now > *s.Expire {
+            return NewError("Link has expired", 410)
+        }
+    }
+    return nil
+}
+```
+
+过期的处理链路：
+
+```
+_extractShare → ShareGet(成功，记录仍在) → s.IsValid() → err="Link has expired"
+→ _extractShare 返回 Share{}, NewError("Link has expired", 410)
+→ SessionStart 返回 410 错误给客户端
+```
+
+`ShareVerifyProof` 中也调用 `s.IsValid()`（`server/ctrl/share.go:141-145`），确保过期链接无法继续验证新 Proof。
+
+### 9.8 前端失效处理 (`public/assets/pages/ctrl_sharepage.js`)
+
+前端 `ctrl_sharepage.js:84-97` 中的 `verify` 函数在每次加载分享页面时首先调用 `POST /api/share/{shareID}/proof`（body 为 null）：
+
+- 若服务端返回 `key=""`（无待验证 Proof） → 进入 `"done"` 状态 → 跳转到文件浏览页
+- 若服务端返回 `key="password"/"email"/"code"` → 显示对应的验证表单
+- 若服务端返回错误（链接已删除 → 401，链接已过期 → 410） → 被 `ctrlError` 捕获 → 显示错误页面
+
+### 9.9 撤销/过期失效路径对比
+
+| 维度 | 链接撤销（DELETE） | 链接过期（Expire） |
+|------|-------------------|-------------------|
+| DB 记录 | 被删除 | 仍存在 |
+| `_extractShare` 行为 | `ShareGet` 返回 `ErrNotFound` → 返回空 Share | `ShareGet` 成功 → `IsValid()` 返回 410 错误 |
+| HTTP 状态码 | 401（Not authorised） | 410（Gone） |
+| 客户端体验 | 静默降级为登录页 | 显式"Link has expired"错误 |
+| Proof cookie | 残留但无害 | 残留但无用（IsValid 阻断在先） |
+| 可逆性 | 不可逆（需重新创建 Share） | 不可逆（需更新 Expire 字段） |
+
+---
+
+## 十、附密码场景下的暴力破解防护机制
+
+### 10.1 防护层次总览
+
+```
+                  请求进入
+                    │
+         ┌──────────┼──────────┐
+         ▼          ▼          ▼
+   第1层: HTTP    第2层: Proof  第3层: bcrypt
+   RateLimiter   验证逻辑内    计算成本
+   (全局限流)    sleep 延迟    (算法固有)
+```
+
+### 10.2 第1层：HTTP 全局速率限制 (`server/middleware/http.go:107-121`)
+
+```go
+var limiter = rate.NewLimiter(10, 1000)
+
+func RateLimiter(fn HandlerFunc) HandlerFunc {
+    return HandlerFunc(func(ctx *App, res http.ResponseWriter, req *http.Request) {
+        if limiter.Allow() == false {
+            Log.Warning("middleware::http::ratelimit too many requests")
+            SendErrorResult(res, NewError(http.StatusText(429), 429))
+            return
+        }
+        fn(ctx, res, req)
+    })
+}
+```
+
+- 使用 `golang.org/x/time/rate` 令牌桶算法
+- **参数**：速率 10 QPS，桶容量 1000
+- **作用域**：**全局单例**（非 per-IP），所有限流共享同一个 limiter
+- **覆盖路由**：`POST /api/session`（登录）和 `POST /admin/api/session`（管理员登录）
+
+**关键发现**：`POST /api/share/{share}/proof`（Proof 验证端点）的中间件链中**没有 RateLimiter**：
+
+```
+// server/routes.go:75
+share.HandleFunc("/{share}/proof", NewMiddlewareChain(ShareVerifyProof,
+    []Middleware{ApiHeaders, SecureHeaders, SecureOrigin, BodyParser, PluginInjector}))
+```
+
+这意味着 Proof 验证接口**不受 HTTP 层速率限制保护**，暴力破解防护完全依赖第2层和第3层。
+
+### 10.3 第2层：验证逻辑内的 sleep 延迟 (`server/model/share.go:150-164`)
+
+```go
+func ShareProofVerifier(s Share, proof Proof) (Proof, error) {
+    p := proof
+
+    if proof.Key == "password" {
+        if s.Password == nil {
+            return p, NewError("No password required", 400)
+        }
+
+        v, ok := ShareProofVerifierPassword(*s.Password, proof.Value)
+        if ok == false {
+            time.Sleep(1000 * time.Millisecond)  // ← 失败后强制等待 1 秒
+            return p, ErrInvalidPassword
+        }
+        p.Value = v
+    }
+
+    if proof.Key == "email" {
+        // ...
+        v, ok := ShareProofVerifierEmail(*s.Users, proof.Value)
+        if ok == false {
+            time.Sleep(1000 * time.Millisecond)  // ← 邮箱匹配失败也等待 1 秒
+            return p, ErrNotAuthorized
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+- **延迟策略**：密码或邮箱验证失败时，`time.Sleep(1s)` 阻塞当前 goroutine
+- **效果**：单次密码尝试至少耗时 1 秒（加上 bcrypt 计算时间），将理论最大尝试速率限制在约 1 次/秒
+- **局限**：
+  - 这是**协程级**阻塞，不影响其他并发请求
+  - 攻击者可通过大量并发连接绕过单连接限速
+  - 没有递增延迟（如指数退避），也没有锁定机制
+
+### 10.4 第3层：bcrypt 计算成本 (`server/model/share.go:92-93`)
+
+```go
+hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(*p.Password), bcrypt.DefaultCost)
+```
+
+```go
+func ShareProofVerifierPassword(hashed string, given string) (string, bool) {
+    if err := bcrypt.CompareHashAndPassword([]byte(hashed), []byte(given)); err != nil {
+        return "", false
+    }
+    return hashed, true
+}
+```
+
+- **cost 因子**：`bcrypt.DefaultCost = 10`，即 2^10 = 1024 轮迭代
+- **单次验证耗时**：在现代 CPU 上约 70-100ms
+- **安全效果**：即使没有 sleep 延迟，纯 bcrypt 的计算成本也将暴力尝试速率限制在约 10-14 次/秒/核心
+- **与 sleep 叠加**：每次失败尝试 = bcrypt 计算（~100ms）+ sleep（1000ms）≈ 1.1 秒
+
+### 10.5 Proof 数量溢出保护 (`server/ctrl/share.go:129-140`)
+
+```go
+if len(verifiedProof) > 20 || len(requiredProof) > 20 {
+    http.SetCookie(res, &http.Cookie{
+        Name:   COOKIE_NAME_PROOF,
+        Value:  "",
+        MaxAge: -1,
+        Path:   COOKIE_PATH,
+    })
+    Log.Debug("share::verify::validate 'proof issue' ...")
+    SendErrorResult(res, ErrNotValid)
+    return
+}
+```
+
+- 限制已验证 Proof 和所需 Proof 的数量均不超过 20
+- 超出则**立即清除 Proof cookie**（`MaxAge: -1`），迫使攻击者从头开始验证
+- 这防止了通过不断追加伪造 Proof 来进行填充攻击
+
+### 10.6 Proof cookie 长度限制 (`server/model/share.go:300-301`)
+
+```go
+func ShareProofGetAlreadyVerified(req *http.Request) []Proof {
+    // ...
+    if len(cookieValue) > 500 {
+        return p  // cookie 过长则忽略，返回空 Proof 列表
+    }
+    // ...
+}
+```
+
+- Proof cookie 解密前先检查长度，超过 500 字节则直接丢弃
+- 防止恶意构造的超长 cookie 耗尽解密资源
+
+### 10.7 验证码防护 (`server/model/share.go:178-258`)
+
+邮箱验证流程中的防护：
+
+1. **一次性使用**：验证码被成功使用后立即 `DELETE FROM Verification WHERE code = ?`（`share.go:252-255`）
+2. **时间限制**：Verification 表中 `expire DATETIME DEFAULT (datetime('now', '+10 minutes'))`，查询时 `WHERE expire > datetime('now')`（`share.go:233`）
+3. **自动清理**：后台每 6 小时执行 `DELETE FROM Verification WHERE expire < datetime('now')`（`model/index.go:41-46`）
+4. **短验证码**：仅 4 位随机字符（`RandomString(4)`），本身存在碰撞风险，但结合10分钟有效期和邮件投递门槛，实际威胁有限
+
+### 10.8 前端交互层的反馈 (`public/assets/pages/ctrl_sharepage.js:111-138`)
+
+```javascript
+// STEP2: attempt to login
+rxjs.switchMap((creds) => verify(render, { shareID, body: creds, setState }).pipe(
+    rxjs.catchError((err) => {
+        if (err instanceof AjaxError) {
+            switch (err.code()) {
+            case "INTERNAL_SERVER_ERROR":
+                return rxjs.throwError(err);
+            case "FORBIDDEN":
+                return rxjs.of(false);  // ← 密码错误返回 false
+            }
+        }
+        // ...
+    })
+)),
+// STEP3: update the UI when authentication fails
+rxjs.filter((ok) => !ok),
+rxjs.mapTo(["name", "arrow_right"]), applyMutation(qs($page, "component-icon"), "setAttribute"),
+rxjs.mapTo(""), stateMutation(qs($page, "input"), "value"),
+rxjs.mapTo(["error"]), applyMutation(qs($page, ".input_group"), "classList", "add"),
+rxjs.delay(300), applyMutation(qs($page, ".input_group"), "classList", "remove"),
+```
+
+- 密码错误时前端显示 "error" CSS 类（红色边框闪烁 300ms），然后清空输入框
+- **无尝试次数限制**：前端不限制最大重试次数，不显示剩余次数
+- **无验证码/CAPTCHA**：多次失败后不触发人机验证
+- **无账户锁定**：不锁定 Share 链接
+
+### 10.9 暴力破解防护综合评估
+
+| 防护层 | 机制 | 强度 | 局限 |
+|--------|------|------|------|
+| bcrypt 计算成本 | cost=10, ~100ms/次 | 中 | GPU 加速仍可达数千次/秒 |
+| sleep 延迟 | 失败后 1s | 中 | 仅阻塞单协程，并发可绕过 |
+| Proof 数量限制 | >20 则清 cookie | 低 | 主要防填充攻击，非防暴力破解 |
+| cookie 长度限制 | >500 字节忽略 | 低 | 防资源耗尽，非防暴力破解 |
+| HTTP RateLimiter | 10 QPS / 桶容量 1000 | 高 | **但未覆盖 Proof 验证端点** |
+| 验证码 (email) | 10 分钟有效，一次性 | 中 | 仅限 email+code 场景 |
+| 前端限制 | 无 | 低 | 无重试次数限制、无 CAPTCHA |
+
+**主要安全缺口**：Proof 验证端点（`POST /api/share/{share}/proof`）缺少 per-IP 速率限制。攻击者可以并发方式绕过 sleep 延迟，利用 GPU 加速 bcrypt 破解，理论上在合理时间内尝试大量密码。
+
+**改进建议**：
+1. 为 Proof 验证端点增加 per-IP 速率限制（如 5 次/分钟/IP）
+2. 实现指数退避：连续失败后 sleep 时间递增（1s → 2s → 4s → ...）
+3. 引入 CAPTCHA 机制：连续 N 次失败后要求人机验证
+4. 增加审计日志：记录密码验证失败事件，便于异常检测
