@@ -709,3 +709,377 @@ rxjs.delay(300), applyMutation(qs($page, ".input_group"), "classList", "remove")
 2. 实现指数退避：连续失败后 sleep 时间递增（1s → 2s → 4s → ...）
 3. 引入 CAPTCHA 机制：连续 N 次失败后要求人机验证
 4. 增加审计日志：记录密码验证失败事件，便于异常检测
+
+---
+
+## 十一、链接过期边界问题
+
+### 11.1 IsValid() 边界定义
+
+```go
+// server/common/types.go:196-204
+func (s Share) IsValid() error {
+    if s.Expire != nil {
+        now := time.Now().UnixNano() / 1000000  // 当前时间，毫秒精度
+        if now > *s.Expire {                    // 严格大于 → 过期
+            return NewError("Link has expired", 410)
+        }
+    }
+    return nil
+}
+```
+
+**边界语义**：`now > expire` 为严格大于，`now == expire` 时仍有效。过期时间是**闭区间右开**语义：`[创建时间, 过期时间)`。
+
+### 11.2 过期检查的两个关键位置
+
+| 检查位置 | 代码行 | 检查时机 | 影响范围 |
+|----------|--------|----------|----------|
+| `_extractShare` | `server/middleware/session.go:217` | 请求进入 SessionStart 中间件时 | 所有共享链接访问（ls/cat/save/zip 等） |
+| `ShareVerifyProof` | `server/ctrl/share.go:141-145` | 用户提交 Proof 验证时 | Proof 验证流程本身 |
+
+**关键观察**：`IsValid()` 检查**只发生在请求的入口处**（中间件层），在 IO 过程中不会再次检查。
+
+### 11.3 过期时间点前开始的请求
+
+场景：用户在 T0 时刻（T0 < expire）发起请求，请求处理时间较长，在 T1 时刻（T1 > expire）才完成。
+
+```
+   T0                    T_expire                 T1
+   │───────────────────────│──────────────────────│
+   发起请求               过期时间               请求完成
+              请求处理在过期时间点之后继续
+```
+
+处理逻辑：
+
+```
+GET /api/files/cat?path=large_file.iso
+    │
+    ▼
+SessionStart → _extractShare
+    │
+    │  T0 < *s.Expire → IsValid() → nil → 通过
+    │  ctx.Share 已设置，权限已合成
+    │
+    ▼
+FileCat handler
+    │
+    │  1. CanRead(ctx) → ctx.Share.CanRead → true
+    │  2. PathBuilder(ctx, path) → 路径校验通过
+    │  3. ctx.Backend.Cat(path) → 返回 io.Reader
+    │  4. io.Copy(w, f) → 流式写入 ResponseWriter
+    │     ↑ 这个过程可能耗时数分钟到数小时
+    │     ↑ 期间不会再次调用 IsValid()
+    │
+    ▼
+   请求完成（即使 T1 > expire）
+```
+
+**结论**：过期检查是"**进门检查**"，一旦通过 SessionStart 中间件，后续 IO 过程不会再次校验过期时间。长耗时请求（如下载大文件、流式 ZIP 打包）可以在过期时间点之后继续完成。
+
+### 11.4 过期时间点后发起的新请求
+
+```
+用户在 T1 > expire 时发起新请求
+    │
+    ▼
+SessionStart → _extractShare
+    │
+    │  1. model.ShareGet(share_id) → 成功，记录仍在
+    │  2. s.IsValid() → T1 > *s.Expire → err = "Link has expired"
+    │  3. _extractShare 返回 Share{}, err
+    │
+    ▼
+SessionStart 捕获错误 → SendErrorResult(res, err)
+    │
+    ▼
+返回 410 Gone，body: {"error": "Link has expired"}
+```
+
+### 11.5 长连接 / 流式传输场景下的过期边界
+
+#### 11.5.1 文件下载（FileCat / Downloader）
+
+- **FileCat**（`/api/files/cat`）：仅在入口检查一次，流式传输过程中不检查
+- **FileDownloader**（`/api/files/zip`）：仅在入口检查一次，ZIP 打包和流式传输过程中不检查
+
+**重要配置**：`features.protection.zip_timeout`（默认 60 秒）限制 ZIP 打包总时长，与过期检查相互独立。
+
+#### 11.5.2 分片上传（TUS 协议）
+
+分片上传较为复杂，涉及多个 HTTP 请求：
+
+```
+POST   /api/files/cat?proto=tus   → 创建上传会话（入口检查 IsValid）
+OPTIONS /api/files/cat?proto=tus  → 无 IsValid 检查
+HEAD   /api/files/cat?proto=tus  → 查询偏移量
+PATCH  /api/files/cat?proto=tus  → 上传分片
+```
+
+检查点分析：
+
+1. **创建会话（POST）**：经过 SessionStart → 检查 IsValid → 必须在过期前调用
+2. **上传分片（PATCH）**：也经过 SessionStart → **每次 PATCH 都会检查 IsValid**
+3. **会话缓存**：`chunkedUploadCache` 按 `(path, GenerateID(ctx.Session))` 缓存，与过期检查独立
+
+**分片上传的过期边界**：
+
+| 场景 | 行为 |
+|------|------|
+| POST 创建会话在过期前，PATCH 分片也在过期前 | ✅ 正常上传 |
+| POST 在过期前，第一个 PATCH 在过期前，后续 PATCH 在过期后 | ❌ 后续 PATCH 会失败（410），已上传分片留在缓存，1 天过期 |
+| POST 在过期后 | ❌ 创建失败（410） |
+
+#### 11.5.3 WebDAV 连接
+
+WebDAV 是按请求（method）处理的，每个请求都经过 SessionStart 中间件：
+
+```
+PROPFIND /s/{share}/dir → SessionStart → IsValid()
+GET      /s/{share}/file → SessionStart → IsValid()
+PUT      /s/{share}/file → SessionStart → IsValid()
+```
+
+每个 WebDAV 请求都会独立检查过期时间。若 GET 请求下载文件耗时较长，行为与 FileCat 相同——进门后不再检查。
+
+#### 11.5.4 WOPI / OnlyOffice 在线编辑
+
+`plg_editor_wopi/handler.go:282` 和 `plg_editor_onlyoffice/index.go:331` 会将 `ctx.Share.Id` 附加到编辑会话 ID 中：
+
+```go
+// plg_editor_wopi/handler.go:282-283
+if ctx.Share.Id != "" {
+    wopiSRC += "::" + ctx.Share.Id
+}
+```
+
+但编辑会话本身有自己的生命周期管理。当 Share 链接过期后，后续的 WOPI 回调请求经过 SessionStart 时会被拒绝，但已加载到前端的文档可能仍可编辑（只是无法保存）。
+
+### 11.6 Proof cookie 在过期后的残留
+
+Proof cookie 有效期 30 天，与 Share 过期时间独立。链接过期后：
+
+1. 客户端仍持有有效的 Proof cookie（已通过密码/邮箱验证）
+2. 但 `_extractShare` 中 `IsValid()` 检查先于 Proof 匹配执行
+3. 因此即使 Proof cookie 有效，链接过期后也无法访问
+4. Proof cookie 不会被自动清除，会在浏览器中残留直到 30 天后自然过期
+
+### 11.7 过期边界问题总结
+
+| 操作类型 | 过期检查点 | 过期后行为 |
+|----------|------------|------------|
+| 短请求（ls/mkdir/rm/mv） | 每次请求入口 | 立即 410 |
+| 文件下载（cat） | 请求入口 | 已开始的下载可继续完成 |
+| ZIP 打包下载 | 请求入口 | 已开始的打包可继续，受 zip_timeout 限制 |
+| 分片上传（TUS） | 每次 PATCH 请求入口 | 过期后的 PATCH 会失败，已上传分片保留 |
+| WebDAV | 每个方法请求入口 | 过期后的新请求失败，已开始的 GET 可继续 |
+| 在线编辑（WOPI） | 每次回调请求入口 | 过期后无法保存，前端可能仍可查看 |
+| Proof 验证 | ShareVerifyProof 入口 | 过期后无法继续验证流程 |
+
+---
+
+## 十二、多个链接覆盖同一文件时的权限冲突规则
+
+### 12.1 数据模型层面——多对多关系
+
+数据库设计天然支持一个文件/目录被多个 Share 链接引用：
+
+```sql
+-- server/model/index.go:20-24
+CREATE TABLE IF NOT EXISTS Location(
+    backend VARCHAR(16),
+    path VARCHAR(512),
+    CONSTRAINT pk_location PRIMARY KEY(backend, path)
+);
+CREATE TABLE IF NOT EXISTS Share(
+    id VARCHAR(64) PRIMARY KEY,
+    related_backend VARCHAR(16),
+    related_path VARCHAR(512),
+    params JSON,
+    auth VARCHAR(4093) NOT NULL,
+    FOREIGN KEY (related_backend, related_path)
+        REFERENCES Location(backend, path)
+        ON UPDATE CASCADE ON DELETE CASCADE
+);
+```
+
+- `Location` 表记录所有被共享过的路径（唯一键：`backend + path`）
+- `Share` 表通过外键关联到 `Location`，允许多个 Share 指向同一个 Location
+- `ON DELETE CASCADE`：删除 Location 行会级联删除所有关联的 Share 行（但 Location 行不会主动删除）
+
+### 12.2 ShareList 查询——前缀匹配，返回全部
+
+```go
+// server/model/share.go:28-46
+func ShareList(backend string, path string) ([]Share, error) {
+    stmt, err := DB.Prepare(
+        "SELECT id, related_path, params FROM Share " +
+        "WHERE related_backend = ? AND related_path LIKE ? || '%' ")
+    // ...
+    rows, err := stmt.Query(backend, path)
+    // ...
+}
+```
+
+**查询逻辑**：`related_path LIKE ? || '%'` 是前缀匹配。
+
+当查询 `/a/b/` 时，返回：
+- `/a/b/`（自身被共享）
+- `/a/b/c/`（子目录被共享）
+- `/a/b/c/file.txt`（子文件被共享）
+
+这意味着：
+1. 同一文件可能出现在多个父目录的 ShareList 结果中
+2. 前端展示"已有共享链接"时，会显示所有覆盖该路径的链接（按前缀匹配）
+
+### 12.3 访问时的链接选择——URL 决定一切
+
+用户通过哪个共享链接访问，**完全由 URL 中的 `share_id` 决定**，这是最核心的规则：
+
+```
+/s/{share_id}/path/to/file
+    ↑
+    这个 share_id 决定了使用哪个 Share 记录的权限
+```
+
+```go
+// server/middleware/session.go:202-205
+func _extractShareId(req *http.Request) string {
+    share_id := req.URL.Query().Get("share")
+    if share_id == "" {
+        if mux.Vars(req)["share"] != "" {
+            share_id = mux.Vars(req)["share"]
+        }
+    }
+    return share_id
+}
+```
+
+优先级：
+1. URL query 参数 `?share=xxx`
+2. mux 路由变量 `/s/{share}`
+
+**无冲突**：请求只能携带一个 `share_id`，同一时刻只应用一个 Share 链接的权限。
+
+### 12.4 权限不合并——取当前链接的布尔值
+
+`CanRead/CanEdit/CanUpload/CanShare` 四个权限函数的逻辑是：
+
+```go
+// server/model/permissions.go:1-33
+func CanRead(ctx *App) bool {
+    if ctx.Share.Id != "" {
+        return ctx.Share.CanRead  // 只取当前 Share 的值，不与其他 Share 合并
+    }
+    return true
+}
+// CanEdit → ctx.Share.CanWrite
+// CanUpload → ctx.Share.CanUpload
+// CanShare → ctx.Share.CanShare
+```
+
+**核心规则**：权限只从 `ctx.Share`（当前 URL 指向的那个 Share 链接）读取，**永远不会**与其他覆盖同一文件的 Share 链接做合并（OR/AND）。
+
+示例场景：
+
+```
+文件 /data/report.pdf 同时被两个链接共享：
+  链接 A（id=abc123）: CanRead=true,  CanWrite=false, CanUpload=false, 密码保护
+  链接 B（id=xyz789）: CanRead=true,  CanWrite=true,  CanUpload=true,  无密码
+
+用户通过 /s/abc123/path/report.pdf 访问 → 使用链接 A 的权限（只读）
+用户通过 /s/xyz789/path/report.pdf 访问 → 使用链接 B 的权限（读写+上传）
+```
+
+### 12.5 元数据探测中的多链接交互
+
+在 `FileLs` 的细粒度权限计算中（`server/ctrl/files.go:79-191`），会通过 `AuthorisationMiddleware` 对每个操作做试调用探测。
+
+**关键发现**：`AuthorisationMiddleware` 的 `ctx` 中只包含当前 Share，因此探测结果只反映当前 Share 的权限，不会考虑其他 Share 链接。
+
+```
+FileLs(ctx)
+    ├── CanRead(ctx) → ctx.Share.CanRead
+    ├── AuthorisationMiddleware.Ls/Mkdir/Touch/Save(...)
+    │   └── 每个探测函数的 ctx 包含同一个 Share
+    └── 最后叠加 Share 权限清除不可用操作
+```
+
+### 12.6 链接创建时的冲突处理
+
+当对同一文件创建第二个共享链接时：
+
+```go
+// server/model/share.go:97-110
+stmt, err := DB.Prepare("INSERT INTO Location(backend, path) VALUES($1, $2)")
+_, err = stmt.Exec(p.Backend, p.Path)
+if err != nil {
+    throw := true
+    if sqlite.IsConstraint(err) {
+        throw = false  // 唯一键冲突 → 静默忽略
+    }
+    // ...
+}
+```
+
+- `Location` 表插入冲突（该路径已有记录）→ 静默忽略，不报错
+- `Share` 表使用 `ON CONFLICT(id) DO UPDATE`，若 `id` 相同则更新，若 `id` 不同则新增
+
+**无去重逻辑**：对同一文件可以创建任意多个不同 `id` 的 Share 链接，彼此独立。
+
+### 12.7 再分享（N 级分享）场景下的权限叠加
+
+若用户 A 分享 `/a/` 给用户 B（链接 A，CanShare=true），用户 B 再分享 `/a/b/` 给用户 C（链接 B）：
+
+| 维度 | 链接 A（原始分享） | 链接 B（再分享） |
+|------|------------------|----------------|
+| `Backend` | `GenerateID(A的session)` | `ctx.Share.Backend` = 链接 A 的 Backend（继承） |
+| `Auth` | A 的加密凭证 | `ctx.Share.Auth` = 链接 A 的 Auth（继承） |
+| `Path` | `/a/` | `/a/b/`（路径更窄） |
+| 权限 | A 设置的 CanRead/Write/Upload | B 设置的 CanRead/Write/Upload |
+| `CanShare` | true | B 可设置为 true 或 false |
+
+**权限传播规则**：
+- 后端身份链继承不变（都使用 A 的凭证）
+- 路径只能收窄，不能扩大（子目录/文件）
+- 再分享的权限可以比原始链接**更严**，但**不能更宽**——因为原始链接的 Share 仍在 `ctx.Share` 链中？
+
+**重要澄清**：再分享时，`CanManageShare` 中间件的检查（`middleware/session.go:142-158`）确保：
+- 请求者必须能访问到原始链接（即 Proof 验证通过）
+- 原始链接的 `CanShare` 必须为 true
+
+但创建出的新 Share 链接的权限**完全由创建者（B）在前端设置**，代码中没有强制"新权限必须是原权限的子集"的校验。这意味着存在一个**潜在的权限扩大风险**：B 可以将 A 分享的只读目录，以可写权限再次分享给 C。
+
+### 12.8 前端展示的多链接列表
+
+前端 `modal_share.js:130-185` 中，`ctrlListShares` 调用 `GET /api/share?path=xxx` 获取所有覆盖当前路径的共享链接，展示为列表供用户编辑/删除。
+
+```
+GET /api/share?path=/data/
+    │
+    ▼
+ShareList(backend, "/data/")
+    │
+    ▼
+SELECT ... WHERE related_path LIKE '/data/%'
+    │
+    ▼
+返回所有覆盖 /data/ 及其子路径的 Share 链接
+```
+
+用户可以对列表中的任一链接进行编辑或删除，操作独立，互不影响。
+
+### 12.9 多链接覆盖的权限冲突总结
+
+| 场景 | 规则 |
+|------|------|
+| 访问时使用哪个链接的权限 | URL 中的 share_id 决定，无合并 |
+| 多个链接权限如何合并 | 不合并，只使用当前 Share 的布尔值 |
+| 同一文件能否创建多个链接 | 可以，彼此独立 |
+| 再分享能否扩大权限 | 代码未强制限制，存在扩大风险 |
+| 链接删除对其他链接的影响 | 无影响，独立删除 |
+| FileLs 元数据探测 | 只基于当前 Share，不考虑其他链接 |
+| Location 表冲突处理 | 唯一键冲突静默忽略 |
+
+**设计哲学**：Share 链接是完全独立的访问令牌，每个链接有自己的权限配置和生命周期。访问时 URL 是唯一的权限来源，不存在"同一文件的多个链接权限取并集/交集"的逻辑。
